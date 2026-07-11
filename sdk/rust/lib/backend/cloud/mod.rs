@@ -9,9 +9,9 @@
 //! issues today. No OAuth or session credentials are honored here.
 
 mod http;
+pub(in crate::backend) mod sandbox;
+mod volume;
 mod ws_io;
-
-pub(in crate::backend) use self::http::CloudVolume;
 
 use std::sync::Arc;
 use std::time::Duration;

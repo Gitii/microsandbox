@@ -14,9 +14,8 @@ use reqwest::header::{ACCEPT, HeaderName, HeaderValue};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use super::CloudBackend;
-use crate::backend::sandbox::{CloudCreateBody, LogStream};
-use crate::backend::volume::{CloudVolumeKind, CloudVolumeStatus};
+use super::{CloudBackend, sandbox::CloudCreateBody, volume::CloudVolume};
+use crate::backend::sandbox::LogStream;
 use crate::error::{Operation, UnsupportedReason};
 use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
 use crate::{MicrosandboxError, MicrosandboxResult};
@@ -33,33 +32,6 @@ struct CloudLogPayload {
     source: String,
     ts: chrono::DateTime<chrono::Utc>,
     text: String,
-}
-
-/// Wire shape of the volume object returned by the cloud's volume routes.
-#[derive(Debug, Clone, Deserialize)]
-pub(in crate::backend) struct CloudVolume {
-    /// Server-side UUID.
-    pub id: String,
-    /// User-facing name; the org's shared default volume has none.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Whether this is the org's shared default volume or a named volume.
-    pub kind: CloudVolumeKind,
-    /// Lifecycle status at fetch time.
-    pub status: CloudVolumeStatus,
-    /// Bytes stored in the volume, when the cloud reports usage.
-    #[serde(default)]
-    pub used_bytes: Option<u64>,
-    /// Per-volume storage limit in bytes; absent when the volume has none.
-    #[serde(default)]
-    pub capacity_bytes: Option<u64>,
-    /// User-defined labels; empty when none are set.
-    #[serde(default)]
-    pub labels: std::collections::BTreeMap<String, String>,
-    /// Creation timestamp.
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Last modification timestamp.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Default)]
