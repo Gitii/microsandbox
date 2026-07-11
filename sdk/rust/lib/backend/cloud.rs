@@ -35,6 +35,7 @@ use super::{
     sandbox::{CloudCreateBody, LogStream},
     volume::{CloudVolumeKind, CloudVolumeStatus},
 };
+use crate::error::{Operation, UnsupportedReason};
 use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
 use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_types::{
@@ -324,8 +325,8 @@ impl CloudBackend {
     ) -> MicrosandboxResult<LogStream> {
         if !opts.follow {
             return Err(MicrosandboxError::unsupported(
-                "Sandbox::log_stream(follow=false)",
-                "use log_stream with follow=true",
+                Operation::SandboxLogStreamNoFollow,
+                UnsupportedReason::UseInstead(Operation::SandboxLogStreamFollow),
             ));
         }
 
@@ -336,8 +337,8 @@ impl CloudBackend {
     /// Read a bounded log snapshot.
     pub async fn logs(&self, _name: &str, _opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>> {
         Err(MicrosandboxError::unsupported(
-            "Sandbox::logs",
-            "use log_stream with follow=true",
+            Operation::SandboxLogs,
+            UnsupportedReason::UseInstead(Operation::SandboxLogStreamFollow),
         ))
     }
 
@@ -689,8 +690,8 @@ fn cloud_log_sources(requested: &[LogSource]) -> MicrosandboxResult<Vec<String>>
             LogSource::Stderr => Ok("stderr".to_string()),
             LogSource::System => Ok("system".to_string()),
             LogSource::Output => Err(MicrosandboxError::unsupported(
-                "the 'output' log source",
-                "use stdout, stderr, or system",
+                Operation::SandboxLogStream,
+                UnsupportedReason::ConfigField("LogSource::Output"),
             )),
         })
         .collect()

@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 
 use super::{Backend, CloudBackend, LocalBackend};
+use crate::error::{Operation, UnsupportedReason};
 use crate::sandbox::fs::{FsEntry, FsMetadata};
 use crate::volume::{
     Volume, VolumeConfig, VolumeFsReadStream, VolumeFsWriteSink, VolumeHandle, VolumeKind,
@@ -491,7 +492,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsRead)) })
     }
 
     fn fs_read_to_string<'a>(
@@ -499,7 +500,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<String>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read_to_string")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsReadToString)) })
     }
 
     fn fs_write<'a>(
@@ -508,7 +509,7 @@ impl VolumeBackend for CloudBackend {
         _path: &'a str,
         _data: Vec<u8>,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::write")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsWrite)) })
     }
 
     fn fs_list<'a>(
@@ -516,7 +517,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::list")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsList)) })
     }
 
     fn fs_stat<'a>(
@@ -524,7 +525,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::stat")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsStat)) })
     }
 
     fn fs_mkdir<'a>(
@@ -532,7 +533,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::mkdir")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsMkdir)) })
     }
 
     fn fs_remove<'a>(
@@ -541,7 +542,7 @@ impl VolumeBackend for CloudBackend {
         _path: &'a str,
         _recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::remove")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsRemove)) })
     }
 
     fn fs_copy<'a>(
@@ -550,7 +551,7 @@ impl VolumeBackend for CloudBackend {
         _from: &'a str,
         _to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::copy")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsCopy)) })
     }
 
     fn fs_rename<'a>(
@@ -559,7 +560,7 @@ impl VolumeBackend for CloudBackend {
         _from: &'a str,
         _to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::rename")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsRename)) })
     }
 
     fn fs_exists<'a>(
@@ -567,7 +568,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::exists")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsExists)) })
     }
 
     fn fs_read_stream<'a>(
@@ -575,7 +576,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeFsReadStream>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read_stream")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsReadStream)) })
     }
 
     fn fs_write_stream<'a>(
@@ -583,7 +584,7 @@ impl VolumeBackend for CloudBackend {
         _name: &'a str,
         _path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeFsWriteSink>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::write_stream")) })
+        Box::pin(async move { Err(unsupported(Operation::VolumeFsWriteStream)) })
     }
 }
 
@@ -632,14 +633,14 @@ impl CloudBackend {
     fn reject_unsupported_volume_options(&self, config: &VolumeConfig) -> MicrosandboxResult<()> {
         if config.kind != VolumeKind::Directory {
             return Err(MicrosandboxError::unsupported(
-                "VolumeBuilder::disk",
-                "cloud volumes are directory-backed",
+                Operation::VolumeCreate,
+                UnsupportedReason::ConfigField("disk"),
             ));
         }
         if config.capacity_mib.is_some() {
             return Err(MicrosandboxError::unsupported(
-                "disk volume capacity",
-                "use quota() for the storage cap",
+                Operation::VolumeCreate,
+                UnsupportedReason::ConfigField("capacity"),
             ));
         }
         Ok(())
@@ -667,8 +668,8 @@ impl CloudBackend {
 /// Build a uniform `Unsupported` error for cloud volume filesystem ops, which
 /// are not exposed by the cloud yet — volume contents are reached by mounting
 /// the volume into a sandbox.
-fn unsupported(feature: &str) -> MicrosandboxError {
-    MicrosandboxError::unsupported(feature, "mount the volume into a sandbox")
+fn unsupported(op: Operation) -> MicrosandboxError {
+    MicrosandboxError::unsupported(op, UnsupportedReason::MountIntoSandbox)
 }
 
 //--------------------------------------------------------------------------------------------------

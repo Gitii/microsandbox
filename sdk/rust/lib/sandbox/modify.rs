@@ -8,6 +8,9 @@ use sea_orm::{ActiveModelTrait, Set};
 use crate::MicrosandboxResult;
 use crate::backend::Backend;
 use crate::db::entity::sandbox as sandbox_entity;
+use crate::error::Operation;
+#[cfg(any(not(unix), not(feature = "net")))]
+use crate::error::UnsupportedReason;
 use crate::size::Mebibytes;
 
 use super::{SandboxConfig, SandboxStatus};
@@ -542,8 +545,8 @@ async fn control_capabilities(
     _name: &str,
 ) -> MicrosandboxResult<microsandbox_runtime::control::ControlCapabilities> {
     Err(crate::MicrosandboxError::unsupported(
-        "live sandbox control",
-        "unix hosts only",
+        Operation::SandboxModify,
+        UnsupportedReason::RequiresUnixHost,
     ))
 }
 
@@ -607,8 +610,8 @@ async fn control_secrets_update(
     _changes: Vec<microsandbox_runtime::control::SecretLiveChange>,
 ) -> MicrosandboxResult<()> {
     Err(crate::MicrosandboxError::unsupported(
-        "live secret reconfiguration",
-        "unix hosts only",
+        Operation::SandboxModify,
+        UnsupportedReason::RequiresUnixHost,
     ))
 }
 
@@ -651,8 +654,8 @@ async fn control_memory_target(
     _total_mib: u64,
 ) -> MicrosandboxResult<microsandbox_runtime::control::MemoryControlState> {
     Err(crate::MicrosandboxError::unsupported(
-        "live memory resize",
-        "unix hosts only",
+        Operation::SandboxModify,
+        UnsupportedReason::RequiresUnixHost,
     ))
 }
 
@@ -662,8 +665,8 @@ pub(crate) async fn control_cpu_target(
     _online: u32,
 ) -> MicrosandboxResult<microsandbox_runtime::control::CpuControlState> {
     Err(crate::MicrosandboxError::unsupported(
-        "live CPU resize",
-        "unix hosts only",
+        Operation::SandboxModify,
+        UnsupportedReason::RequiresUnixHost,
     ))
 }
 fn validate_apply_supported(plan: &SandboxModificationPlan) -> MicrosandboxResult<()> {
@@ -819,8 +822,8 @@ fn apply_secret_patch_to_config(
         return Ok(());
     }
     Err(crate::MicrosandboxError::unsupported(
-        "secret modification",
-        "enable the net feature",
+        Operation::SandboxModify,
+        UnsupportedReason::RequiresCrateFeature("net"),
     ))
 }
 
@@ -1039,10 +1042,10 @@ async fn persist_config(
 ) -> MicrosandboxResult<()> {
     let local = handle
         .local()
-        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
 
     let config_json = serde_json::to_string(config)?;
     sandbox_entity::ActiveModel {
@@ -1064,10 +1067,10 @@ async fn persist_active_config(
 ) -> MicrosandboxResult<()> {
     let local = handle
         .local()
-        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
 
     let active_json = serde_json::to_string(active)?;
     sandbox_entity::ActiveModel {

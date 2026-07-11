@@ -33,6 +33,7 @@ use crate::backend::{
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     db::entity::{sandbox as sandbox_entity, volume as volume_entity},
+    error::Operation,
     sandbox::{SandboxConfig, SandboxStatus, VolumeMount},
     size::Mebibytes,
 };
@@ -189,10 +190,7 @@ impl Volume {
     pub fn path(&self) -> MicrosandboxResult<&Path> {
         match &*self.inner {
             VolumeInner::Local(s) => Ok(&s.path),
-            VolumeInner::Cloud(_) => Err(MicrosandboxError::unsupported(
-                "Volume::path",
-                "cloud volumes don't live on the host",
-            )),
+            VolumeInner::Cloud(_) => Err(MicrosandboxError::local_only(Operation::VolumePath)),
         }
     }
 
@@ -546,7 +544,7 @@ pub(crate) async fn create_local(
 
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeCreate))?;
     let pools = local_backend.db().await?;
     let _name_lock = lock_volume_name(local_backend, &config.name)?;
 
@@ -614,7 +612,7 @@ pub(crate) async fn get_local(
 ) -> MicrosandboxResult<VolumeHandle> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeGet))?;
     let db = local_backend.db().await?.read();
 
     let model = volume_entity::Entity::find()
@@ -631,7 +629,7 @@ pub(crate) async fn get_local(
 pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<Vec<VolumeHandle>> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeList))?;
     let db = local_backend.db().await?.read();
 
     let models = volume_entity::Entity::find()
@@ -649,7 +647,7 @@ pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<
 pub(crate) async fn remove_local(backend: Arc<dyn Backend>, name: &str) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeRemove))?;
     let pools = local_backend.db().await?;
 
     let model = volume_entity::Entity::find()

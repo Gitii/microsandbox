@@ -56,6 +56,7 @@ use crate::{
     db::entity::{
         run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
     },
+    error::{Operation, UnsupportedReason},
     runtime::{
         ProcessHandle, SpawnMode, ensure_named_volumes, rollback_created_named_volumes,
         spawn_sandbox,
@@ -499,7 +500,7 @@ pub(crate) async fn create_local(
 
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::create"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxCreate))?;
 
     config.apply_rootfs_defaults(local_backend.config().sandbox_defaults.oci.upper_size_mib);
 
@@ -750,7 +751,7 @@ pub(crate) async fn start_local(
     tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::start"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxStart))?;
     let pools = local_backend.db().await?;
     let write_db = pools.write();
     let model = load_sandbox_record_reconciled(pools, name).await?;
@@ -897,7 +898,7 @@ pub(crate) async fn remove_local(
 ) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::remove"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxRemove))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     let handle = SandboxHandle::from_local_model(backend, model, pid);
     handle.remove().await
@@ -918,7 +919,7 @@ pub(crate) async fn stop_local(
 ) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::stop"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxStop))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -960,7 +961,7 @@ pub(crate) async fn kill_local(
 ) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::kill"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxKill))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -1006,7 +1007,7 @@ pub(crate) async fn drain_local(
 ) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::drain"))?;
+        .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxDrain))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -1108,9 +1109,12 @@ impl Sandbox {
     /// `Unsupported` error on cloud — the previous `self`-by-value
     /// signature consumed the sandbox even on the failing path.
     pub async fn remove_persisted(&self) -> MicrosandboxResult<()> {
-        let local = self.require_local("remove_persisted")?;
+        let local = self.require_local(Operation::SandboxRemovePersisted)?;
         let local_backend = self.backend.as_local().ok_or_else(|| {
-            crate::MicrosandboxError::unsupported("Sandbox::remove_persisted", "use remove()")
+            crate::MicrosandboxError::unsupported(
+                Operation::SandboxRemovePersisted,
+                UnsupportedReason::UseInstead(Operation::SandboxRemove),
+            )
         })?;
         let pools = local_backend.db().await?;
 
@@ -1177,10 +1181,10 @@ impl Sandbox {
     /// for cloud sandboxes. Used by methods that have no cloud equivalent yet.
     fn require_local(
         &self,
-        method: &'static str,
+        op: Operation,
     ) -> MicrosandboxResult<&crate::backend::SandboxLocalState> {
         self.local()
-            .ok_or_else(|| crate::MicrosandboxError::local_only(format!("Sandbox::{method}")))
+            .ok_or_else(|| crate::MicrosandboxError::local_only(op))
     }
 
     /// Live status from the backend. Always hits `backend.sandboxes().get(name)`
@@ -1249,7 +1253,7 @@ impl Sandbox {
     /// round-trip latency. If the sandbox runtime predates protocol generation 6,
     /// this fails before any bytes are sent with an unsupported-operation error.
     pub async fn ping(&self) -> MicrosandboxResult<SandboxPingResult> {
-        self.require_local("ping")?;
+        self.require_local(Operation::SandboxPing)?;
         ping_agent(&self.name, self.client()).await
     }
 
@@ -1258,7 +1262,7 @@ impl Sandbox {
     /// Local backend only. The request uses `core.touch`, so callers can keep a
     /// sandbox alive intentionally without relying on unrelated agent traffic.
     pub async fn touch(&self) -> MicrosandboxResult<SandboxTouchResult> {
-        self.require_local("touch")?;
+        self.require_local(Operation::SandboxTouch)?;
         touch_agent(&self.name, self.client()).await
     }
 
@@ -1368,7 +1372,7 @@ impl Sandbox {
     /// **Local backend only.** Cloud sandboxes have no host process to wait
     /// on; use [`stop`](Self::stop) and poll [`status`](Self::status) instead.
     pub async fn stop_and_wait(&self) -> MicrosandboxResult<ExitStatus> {
-        let local = self.require_local("stop_and_wait")?;
+        let local = self.require_local(Operation::SandboxStopAndWait)?;
         let stop_result = self.request_stop().await;
         if local.handle.is_none() {
             stop_result?;
@@ -1430,7 +1434,7 @@ impl Sandbox {
 
     /// Wait for the sandbox process to exit. **Local backend only.**
     pub async fn wait(&self) -> MicrosandboxResult<ExitStatus> {
-        let local = self.require_local("wait")?;
+        let local = self.require_local(Operation::SandboxWait)?;
         match &local.handle {
             Some(h) => h.lock().await.wait().await,
             None => Err(crate::MicrosandboxError::Runtime(

@@ -49,6 +49,7 @@ use std::{
 };
 
 use crate::MicrosandboxResult;
+use crate::error::Operation;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -104,9 +105,8 @@ pub trait Backend: Send + Sync + 'static {
         _timeout: Duration,
     ) -> BoxFuture<'a, MicrosandboxResult<crate::agent::AgentClient>> {
         Box::pin(async {
-            Err(crate::MicrosandboxError::unsupported(
-                "agent connections",
-                "this backend cannot reach sandbox agents",
+            Err(crate::MicrosandboxError::local_only(
+                Operation::AgentConnect,
             ))
         })
     }

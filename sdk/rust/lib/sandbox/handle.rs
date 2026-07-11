@@ -17,6 +17,7 @@ use crate::{
         SandboxHandleLocalState,
     },
     db::entity::sandbox as sandbox_entity,
+    error::Operation,
 };
 
 use super::{Sandbox, SandboxConfig, SandboxModificationBuilder, SandboxStatus, SandboxStopResult};
@@ -201,9 +202,9 @@ impl SandboxHandle {
     pub fn config(&self) -> MicrosandboxResult<SandboxConfig> {
         match &self.inner {
             SandboxHandleInner::Local(s) => Ok(serde_json::from_str(&s.config_json)?),
-            SandboxHandleInner::Cloud(_) => {
-                Err(MicrosandboxError::not_yet_on_cloud(crate::api_path!()))
-            }
+            SandboxHandleInner::Cloud(_) => Err(MicrosandboxError::local_only(
+                Operation::SandboxHandleConfig,
+            )),
         }
     }
 
@@ -301,7 +302,7 @@ impl SandboxHandle {
     pub async fn metrics(&self) -> MicrosandboxResult<super::SandboxMetrics> {
         let local = self
             .local()
-            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleMetrics))?;
 
         if local.status != SandboxStatus::Running && local.status != SandboxStatus::Draining {
             return Err(MicrosandboxError::SandboxNotRunning(format!(
@@ -318,7 +319,7 @@ impl SandboxHandle {
         let local_backend = self
             .backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleMetrics))?;
         let db = local_backend.db().await?.read();
         super::metrics::metrics_for_sandbox(db, local_backend, local.db_id, &config).await
     }
@@ -359,7 +360,7 @@ impl SandboxHandle {
     ) -> MicrosandboxResult<Sandbox> {
         let local = self
             .local()
-            .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleConnect))?;
         if local.status != SandboxStatus::Running && local.status != SandboxStatus::Draining {
             return Err(MicrosandboxError::SandboxNotRunning(format!(
                 "'{}' is not running (status: {:?})",
@@ -370,7 +371,7 @@ impl SandboxHandle {
         let local_backend = self
             .backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleConnect))?;
         let client = crate::sandbox::fs::agent::connect_agent_with_timeout(
             local_backend,
             &self.name,
@@ -421,8 +422,8 @@ impl SandboxHandle {
         name: &str,
     ) -> MicrosandboxResult<super::super::snapshot::Snapshot> {
         if self.local().is_none() {
-            return Err(MicrosandboxError::not_yet_on_cloud(
-                "SandboxHandle::snapshot",
+            return Err(MicrosandboxError::local_only(
+                Operation::SandboxHandleSnapshot,
             ));
         }
         use super::super::snapshot::{Snapshot, SnapshotDestination};
@@ -438,8 +439,8 @@ impl SandboxHandle {
         path: impl AsRef<std::path::Path>,
     ) -> MicrosandboxResult<super::super::snapshot::Snapshot> {
         if self.local().is_none() {
-            return Err(MicrosandboxError::not_yet_on_cloud(
-                "SandboxHandle::snapshot_to",
+            return Err(MicrosandboxError::local_only(
+                Operation::SandboxHandleSnapshotTo,
             ));
         }
         use super::super::snapshot::{Snapshot, SnapshotDestination};
@@ -598,7 +599,7 @@ impl SandboxHandle {
                 let refreshed = self.refresh().await?;
                 let local = refreshed
                     .local()
-                    .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+                    .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleRemove))?;
                 if matches!(
                     local.status,
                     SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused
@@ -612,7 +613,7 @@ impl SandboxHandle {
                 let local_backend = self
                     .backend
                     .as_local()
-                    .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+                    .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleRemove))?;
                 let pools = local_backend.db().await?;
 
                 super::remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;

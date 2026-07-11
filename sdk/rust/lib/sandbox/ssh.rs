@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::attach;
 use crate::sandbox::exec::{ExecControl, ExecEvent, ExecOptions, ExecSink, StdinMode};
-use crate::{MicrosandboxError, MicrosandboxResult, Sandbox, agent::AgentClient};
+use crate::{MicrosandboxError, MicrosandboxResult, Sandbox, agent::AgentClient, error::Operation};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -337,7 +337,7 @@ impl SandboxSshOps {
             .sandbox
             .backend()
             .as_local()
-            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxSshServer))?;
         let options = f(SshServerOptionsBuilder::default()).build();
         let authorized_keys = build_authorized_keys(&options, local_backend.config())?;
         let host_key = match options.host_key {
@@ -942,7 +942,7 @@ impl SshSession {
             .sandbox
             .backend()
             .as_local()
-            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SshServerServe))?;
         let client = Arc::new(
             crate::sandbox::fs::agent::connect_agent(local_backend, self.settings.sandbox.name())
                 .await?,
@@ -1010,7 +1010,7 @@ impl SshSession {
             .sandbox
             .backend()
             .as_local()
-            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::SshServerServe))?;
         let handle = crate::sandbox::exec::agent::exec_stream_with_pty_size(
             local_backend,
             self.settings.sandbox.name(),

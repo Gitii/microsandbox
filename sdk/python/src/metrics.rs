@@ -128,7 +128,7 @@ pub fn all_sandbox_metrics<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> 
         let backend = microsandbox::backend::default_backend();
         let local = backend.as_local().ok_or_else(|| {
             to_py_err(microsandbox::MicrosandboxError::local_only(
-                "all_sandbox_metrics",
+                microsandbox::Operation::AllSandboxMetrics,
             ))
         })?;
         let metrics = microsandbox::sandbox::all_sandbox_metrics_local(local)

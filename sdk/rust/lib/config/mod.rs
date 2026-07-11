@@ -23,6 +23,7 @@ use microsandbox_image::RegistryAuth;
 use microsandbox_runtime::logging::LogLevel;
 use serde::{Deserialize, Serialize};
 
+use crate::error::Operation;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -672,7 +673,7 @@ pub fn config() -> MicrosandboxResult<Arc<LocalConfig>> {
     let backend = crate::backend::default_backend();
     let local = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::Config))?;
     Ok(local.config_handle())
 }
 

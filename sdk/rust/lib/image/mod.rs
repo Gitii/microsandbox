@@ -24,6 +24,7 @@ use crate::{
         manifest as manifest_entity, manifest_layer as manifest_layer_entity,
         sandbox_rootfs as sandbox_rootfs_entity, snapshot as snapshot_entity,
     },
+    error::Operation,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -264,7 +265,7 @@ impl Image {
         let backend = crate::backend::default_backend();
         let local = backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only("Image::get"))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::ImageGet))?;
         Self::get_local(local, reference).await
     }
 
@@ -273,7 +274,7 @@ impl Image {
         let backend = crate::backend::default_backend();
         let local = backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only("Image::list"))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::ImageList))?;
         Self::list_local(local).await
     }
 
@@ -282,7 +283,7 @@ impl Image {
         let backend = crate::backend::default_backend();
         let local = backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only("Image::inspect"))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::ImageInspect))?;
         Self::inspect_local(local, reference).await
     }
 
@@ -294,7 +295,7 @@ impl Image {
         let backend = crate::backend::default_backend();
         let local = backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only("Image::remove"))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::ImageRemove))?;
         Self::remove_local(local, reference, force).await
     }
 
@@ -303,7 +304,7 @@ impl Image {
         let backend = crate::backend::default_backend();
         let local = backend
             .as_local()
-            .ok_or_else(|| MicrosandboxError::local_only("Image::prune"))?;
+            .ok_or_else(|| MicrosandboxError::local_only(Operation::ImagePrune))?;
         Self::prune_local(local).await
     }
 

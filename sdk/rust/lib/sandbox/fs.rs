@@ -16,7 +16,12 @@ use microsandbox_protocol::{
 };
 use tokio::sync::mpsc;
 
-use crate::{MicrosandboxError, MicrosandboxResult, agent::AgentClient, backend::Backend};
+use crate::{
+    MicrosandboxError, MicrosandboxResult,
+    agent::AgentClient,
+    backend::Backend,
+    error::{Operation, UnsupportedReason},
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -196,7 +201,7 @@ impl<'a> SandboxFsOps<'a> {
         offset: u64,
         len: Option<u64>,
     ) -> MicrosandboxResult<Bytes> {
-        let client = self.agent_client("SandboxFsOps::read_handle")?;
+        let client = self.agent_client(Operation::SandboxFsReadHandle)?;
         agent::read_handle(client, handle, offset, len).await
     }
 
@@ -207,7 +212,7 @@ impl<'a> SandboxFsOps<'a> {
         offset: u64,
         len: Option<u64>,
     ) -> MicrosandboxResult<FsReadStream> {
-        let client = self.agent_client("SandboxFsOps::read_handle_stream")?;
+        let client = self.agent_client(Operation::SandboxFsReadHandleStream)?;
         agent::read_handle_stream(client, handle, offset, len, None).await
     }
 
@@ -246,7 +251,7 @@ impl<'a> SandboxFsOps<'a> {
         offset: u64,
         data: impl AsRef<[u8]>,
     ) -> MicrosandboxResult<()> {
-        let client = self.agent_client("SandboxFsOps::write_handle")?;
+        let client = self.agent_client(Operation::SandboxFsWriteHandle)?;
         agent::write_handle(client, handle, offset, data.as_ref()).await
     }
 
@@ -257,7 +262,7 @@ impl<'a> SandboxFsOps<'a> {
         offset: u64,
         len: Option<u64>,
     ) -> MicrosandboxResult<FsWriteSink> {
-        let client = self.agent_client("SandboxFsOps::write_handle_stream")?;
+        let client = self.agent_client(Operation::SandboxFsWriteHandleStream)?;
         agent::write_handle_stream(client, handle, offset, len, None).await
     }
 
@@ -271,19 +276,19 @@ impl<'a> SandboxFsOps<'a> {
         path: &str,
         options: FsOpenOptions,
     ) -> MicrosandboxResult<FsHandle> {
-        let client = self.agent_client("SandboxFsOps::open_file")?;
+        let client = self.agent_client(Operation::SandboxFsOpenFile)?;
         agent::open_file(&client, path, options).await
     }
 
     /// Open a directory and return an agentd-side handle.
     pub async fn open_dir(&self, path: &str) -> MicrosandboxResult<FsHandle> {
-        let client = self.agent_client("SandboxFsOps::open_dir")?;
+        let client = self.agent_client(Operation::SandboxFsOpenDir)?;
         agent::open_dir(&client, path).await
     }
 
     /// Close an open file or directory handle.
     pub async fn close_handle(&self, handle: FsHandle) -> MicrosandboxResult<()> {
-        let client = self.agent_client("SandboxFsOps::close_handle")?;
+        let client = self.agent_client(Operation::SandboxFsCloseHandle)?;
         agent::close_handle(&client, handle).await
     }
 
@@ -305,7 +310,7 @@ impl<'a> SandboxFsOps<'a> {
         handle: FsHandle,
         limit: Option<u32>,
     ) -> MicrosandboxResult<Vec<FsEntry>> {
-        let client = self.agent_client("SandboxFsOps::read_dir_handle")?;
+        let client = self.agent_client(Operation::SandboxFsReadDirHandle)?;
         agent::read_dir_handle(&client, handle, limit).await
     }
 
@@ -417,7 +422,7 @@ impl<'a> SandboxFsOps<'a> {
 
     /// Get metadata for an open file or directory handle.
     pub async fn stat_handle(&self, handle: FsHandle) -> MicrosandboxResult<FsMetadata> {
-        let client = self.agent_client("SandboxFsOps::stat_handle")?;
+        let client = self.agent_client(Operation::SandboxFsStatHandle)?;
         agent::stat_handle(&client, handle).await
     }
 
@@ -434,7 +439,7 @@ impl<'a> SandboxFsOps<'a> {
         handle: FsHandle,
         attrs: FsSetAttrs,
     ) -> MicrosandboxResult<()> {
-        let client = self.agent_client("SandboxFsOps::set_stat_handle")?;
+        let client = self.agent_client(Operation::SandboxFsSetStatHandle)?;
         agent::set_stat_handle(&client, handle, attrs).await
     }
 
@@ -497,19 +502,21 @@ impl<'a> SandboxFsOps<'a> {
         self.backend.as_ref()
     }
 
-    fn agent_client(&self, method: &'static str) -> MicrosandboxResult<Arc<AgentClient>> {
+    fn agent_client(&self, op: Operation) -> MicrosandboxResult<Arc<AgentClient>> {
         self.client
             .as_ref()
             .map(Arc::clone)
-            .ok_or_else(|| MicrosandboxError::unsupported(method, self.handle_api_hint()))
+            .ok_or_else(|| MicrosandboxError::unsupported(op, self.unsupported_reason()))
     }
 
-    fn handle_api_hint(&self) -> &'static str {
+    /// Why handle-based fs operations are unavailable without a live agent
+    /// connection: local callers should go through `Sandbox::fs` on a live
+    /// sandbox; cloud backends do not expose them at all.
+    fn unsupported_reason(&self) -> UnsupportedReason {
         if self.backend.as_local().is_some() {
-            "use Sandbox::fs() on a live local sandbox"
-        } else {
-            "not yet available on cloud"
+            return UnsupportedReason::UseInstead(Operation::SandboxFs);
         }
+        UnsupportedReason::LocalOnly
     }
 }
 

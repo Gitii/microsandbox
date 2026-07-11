@@ -15,6 +15,7 @@ use crate::{
     MicrosandboxError, MicrosandboxResult,
     backend::{Backend, LocalBackend, sandbox::MetricsStream},
     db::entity::sandbox as sandbox_entity,
+    error::Operation,
 };
 
 use super::{Sandbox, SandboxConfig};
@@ -195,8 +196,8 @@ pub(crate) fn local_metrics_stream(
                     },
                     Err(err) => Err(err),
                 },
-                None => Err(MicrosandboxError::not_yet_on_cloud(
-                    "Sandbox::metrics_stream",
+                None => Err(MicrosandboxError::local_only(
+                    Operation::SandboxMetricsStream,
                 )),
             };
             Some((item, (ticker, backend, name, config)))
@@ -213,7 +214,7 @@ pub async fn all_sandbox_metrics() -> MicrosandboxResult<HashMap<String, Sandbox
     let backend = crate::backend::default_backend();
     let local = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::AllSandboxMetrics))?;
     all_sandbox_metrics_local(local).await
 }
 

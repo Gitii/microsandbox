@@ -22,6 +22,7 @@ mod verify;
 
 use std::path::{Path, PathBuf};
 
+use crate::error::Operation;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 /// A snapshot artifact on disk.
@@ -185,7 +186,7 @@ impl Snapshot {
 /// Build an `Unsupported` error for snapshot ops that aren't wired through
 /// the cloud trait yet. Snapshots are local-only today.
 fn snapshots_require_local() -> MicrosandboxError {
-    MicrosandboxError::not_yet_on_cloud("snapshot operations")
+    MicrosandboxError::local_only(Operation::SnapshotOps)
 }
 
 /// Lightweight handle backed by an index row.

@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 
 use super::{Backend, CloudBackend, LocalBackend};
 use crate::agent::AgentClient;
+use crate::error::{Operation, UnsupportedReason};
 use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::{ProcessHandle, SpawnMode};
 use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
@@ -740,8 +741,8 @@ impl SandboxBackend for CloudBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             Err(MicrosandboxError::unsupported(
-                "Sandbox::kill",
-                "use stop()",
+                Operation::SandboxKill,
+                UnsupportedReason::UseInstead(Operation::SandboxStop),
             ))
         })
     }
@@ -753,8 +754,8 @@ impl SandboxBackend for CloudBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             Err(MicrosandboxError::unsupported(
-                "Sandbox::drain",
-                "use stop()",
+                Operation::SandboxDrain,
+                UnsupportedReason::UseInstead(Operation::SandboxStop),
             ))
         })
     }
@@ -783,7 +784,7 @@ impl SandboxBackend for CloudBackend {
         _name: &'a str,
         _config: &'a SandboxConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxMetrics>> {
-        Box::pin(async move { Err(MicrosandboxError::not_yet_on_cloud("Sandbox::metrics")) })
+        Box::pin(async move { Err(MicrosandboxError::local_only(Operation::SandboxMetrics)) })
     }
 
     fn metrics_stream(
@@ -794,8 +795,8 @@ impl SandboxBackend for CloudBackend {
         _interval: Duration,
     ) -> MetricsStream {
         Box::pin(futures::stream::once(async {
-            Err(MicrosandboxError::not_yet_on_cloud(
-                "Sandbox::metrics_stream",
+            Err(MicrosandboxError::local_only(
+                Operation::SandboxMetricsStream,
             ))
         }))
     }
@@ -884,21 +885,24 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
     /// Build the cloud create body from an SDK config, rejecting the
     /// create-time options the cloud does not accept.
     fn try_from(config: SandboxConfig) -> MicrosandboxResult<Self> {
-        reject_cloud_deferred(
-            config.replace_existing,
-            "SandboxBuilder::replace",
-            "remove the existing sandbox first",
-        )?;
-        reject_cloud_deferred(
-            config.insecure,
-            "insecure registries",
-            "cloud registries are HTTPS-only",
-        )?;
-        reject_cloud_deferred(
-            !config.ca_certs.is_empty(),
-            "ca_certs",
-            "not yet available on cloud",
-        )?;
+        if config.replace_existing {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SandboxCreate,
+                UnsupportedReason::ConfigField("replace"),
+            ));
+        }
+        if config.insecure {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SandboxCreate,
+                UnsupportedReason::ConfigField("insecure"),
+            ));
+        }
+        if !config.ca_certs.is_empty() {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SandboxCreate,
+                UnsupportedReason::ConfigField("ca_certs"),
+            ));
+        }
         #[cfg(feature = "net")]
         {
             // Only flag user-set opt-in fields the cloud's create contract does
@@ -907,13 +911,12 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
             // default `NetworkConfig` ships with a baseline policy plus built-in
             // DNS settings, so comparing those would always trigger.
             let net = config.local_network_config()?;
-            let has_custom_network =
-                !net.ports.is_empty() || !net.dns.nameservers.is_empty() || net.trust_host_cas;
-            reject_cloud_deferred(
-                has_custom_network,
-                "network ports / custom DNS / host-CA trust",
-                "not configurable on cloud",
-            )?;
+            if !net.ports.is_empty() || !net.dns.nameservers.is_empty() || net.trust_host_cas {
+                return Err(MicrosandboxError::unsupported(
+                    Operation::SandboxCreate,
+                    UnsupportedReason::ConfigField("network ports / custom DNS / host-CA trust"),
+                ));
+            }
         }
 
         // Cloud only supports OCI rootfs; reject the local-only rootfs kinds before
@@ -922,14 +925,14 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
             RootfsSource::Oci(_) => {}
             RootfsSource::Bind(_) => {
                 return Err(MicrosandboxError::unsupported(
-                    "host-directory rootfs",
-                    "use an OCI image on cloud",
+                    Operation::SandboxCreate,
+                    UnsupportedReason::ConfigField("host-directory rootfs"),
                 ));
             }
             RootfsSource::DiskImage { .. } => {
                 return Err(MicrosandboxError::unsupported(
-                    "disk-image rootfs",
-                    "disk-image rootfs is local-only",
+                    Operation::SandboxCreate,
+                    UnsupportedReason::ConfigField("disk-image rootfs"),
                 ));
             }
         }
@@ -958,17 +961,6 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
             envelope: CloudCreateSandboxRequest::from(config.spec),
         })
     }
-}
-
-fn reject_cloud_deferred(
-    present: bool,
-    feature: &'static str,
-    hint: &'static str,
-) -> MicrosandboxResult<()> {
-    if present {
-        return Err(MicrosandboxError::unsupported(feature, hint));
-    }
-    Ok(())
 }
 
 //--------------------------------------------------------------------------------------------------
