@@ -7,8 +7,9 @@
 //! inside each backend's trait impl and wrapped with the `Arc<dyn Backend>`
 //! the caller passes in.
 //!
-//! Cloud-side volume ops route to `Unsupported` until Phase 6 — see the plan's
-//! D14 table.
+//! Cloud volumes support create / get / list / remove. Volume filesystem ops
+//! stay `Unsupported` on cloud — volume contents are reached by mounting the
+//! volume into a sandbox.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,21 +56,44 @@ pub struct VolumeLocalState {
 }
 
 /// Cloud msb-cloud-backed volume state held inside [`VolumeInner::Cloud`].
-///
-/// Placeholder shape — populated when cloud volumes ship in Phase 6.
 pub struct VolumeCloudState {
     /// Server-side UUID.
     pub id: String,
-    /// Owning org's UUID.
-    pub org_id: String,
-    /// Storage kind.
-    pub kind: VolumeKind,
-    /// Disk capacity in bytes for disk volumes.
+    /// Bytes stored in the volume, when the cloud reports usage.
+    pub used_bytes: Option<u64>,
+    /// Per-volume storage limit in bytes; absent when the volume has none.
     pub capacity_bytes: Option<u64>,
-    /// Disk image format for disk volumes.
-    pub disk_format: Option<String>,
-    /// Inner disk filesystem for disk volumes.
-    pub disk_fstype: Option<String>,
+    /// User-defined labels; empty when none are set.
+    pub labels: Vec<(String, String)>,
+    /// Whether this is the org's shared default volume or a named volume.
+    pub kind: CloudVolumeKind,
+    /// Lifecycle status at fetch time.
+    pub status: CloudVolumeStatus,
+    /// Creation timestamp returned by the cloud.
+    pub created_at: DateTime<Utc>,
+    /// Last modification timestamp returned by the cloud.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Kind of a cloud volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudVolumeKind {
+    /// The org's always-present shared volume. It has no name and cannot be
+    /// deleted.
+    Host,
+    /// A user-created named volume.
+    Managed,
+}
+
+/// Lifecycle status of a cloud volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudVolumeStatus {
+    /// Usable; mountable into sandboxes.
+    Active,
+    /// Scheduled for deletion.
+    Deleting,
 }
 
 /// Backend-private state behind [`VolumeHandle`] — the lightweight DB-row view.
@@ -107,30 +131,24 @@ pub struct VolumeHandleLocalState {
 }
 
 /// Cloud handle state. Captures the snapshot msb-cloud returned at fetch time.
-///
-/// Placeholder shape — populated when cloud volumes ship in Phase 6.
 #[derive(Clone)]
 pub struct VolumeHandleCloudState {
     /// Server-side UUID.
     pub id: String,
-    /// Owning org's UUID.
-    pub org_id: String,
-    /// Configured quota in MiB, when set.
-    pub quota_mib: Option<u32>,
-    /// Storage kind.
-    pub kind: VolumeKind,
-    /// Disk usage snapshot at handle-fetch time.
-    pub used_bytes: u64,
-    /// Disk capacity in bytes for disk volumes.
+    /// Bytes stored in the volume, when the cloud reports usage.
+    pub used_bytes: Option<u64>,
+    /// Per-volume storage limit in bytes; absent when the volume has none.
     pub capacity_bytes: Option<u64>,
-    /// Disk image format for disk volumes.
-    pub disk_format: Option<String>,
-    /// Inner disk filesystem for disk volumes.
-    pub disk_fstype: Option<String>,
-    /// Key-value labels associated with the volume.
+    /// User-defined labels; empty when none are set.
     pub labels: Vec<(String, String)>,
-    /// When this volume was first recorded, if known.
-    pub created_at: Option<DateTime<Utc>>,
+    /// Whether this is the org's shared default volume or a named volume.
+    pub kind: CloudVolumeKind,
+    /// Lifecycle status at fetch time.
+    pub status: CloudVolumeStatus,
+    /// Creation timestamp returned by the cloud.
+    pub created_at: DateTime<Utc>,
+    /// Last modification timestamp returned by the cloud.
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Resource-specific backend for volume lifecycle + host-side filesystem ops.
@@ -409,33 +427,63 @@ impl VolumeBackend for LocalBackend {
 impl VolumeBackend for CloudBackend {
     fn create<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
-        _config: VolumeConfig,
+        backend: Arc<dyn Backend>,
+        config: VolumeConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<Volume>> {
-        Box::pin(async move { Err(unsupported("Volume::create")) })
+        Box::pin(async move {
+            self.reject_unsupported_volume_options(&config)?;
+            let capacity_gib = self.volume_capacity_gib(&config)?;
+            let cloud =
+                CloudBackend::create_volume(self, &config.name, capacity_gib, &config.labels)
+                    .await?;
+            let name = cloud.name.clone().unwrap_or_default();
+            Ok(Volume::from_cloud(backend, cloud.into(), name))
+        })
     }
 
     fn get<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeHandle>> {
-        Box::pin(async move { Err(unsupported("Volume::get")) })
+        Box::pin(async move {
+            let cloud = CloudBackend::find_volume(self, name).await?;
+            Ok(VolumeHandle::from_cloud(
+                backend,
+                cloud.into(),
+                name.to_string(),
+            ))
+        })
     }
 
     fn list<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
+        backend: Arc<dyn Backend>,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<VolumeHandle>>> {
-        Box::pin(async move { Err(unsupported("Volume::list")) })
+        Box::pin(async move {
+            let volumes = CloudBackend::list_volumes(self).await?;
+            Ok(volumes
+                .into_iter()
+                .map(|cloud| {
+                    // The org's shared default volume has no name; it lists
+                    // with an empty one and is addressed by kind, not name.
+                    let name = cloud.name.clone().unwrap_or_default();
+                    VolumeHandle::from_cloud(backend.clone(), cloud.into(), name)
+                })
+                .collect())
+        })
     }
 
     fn remove<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("Volume::remove")) })
+        Box::pin(async move {
+            let cloud = CloudBackend::find_volume(self, name).await?;
+            CloudBackend::delete_volume(self, &cloud.id).await?;
+            Ok(())
+        })
     }
 
     fn fs_read<'a>(
@@ -540,16 +588,87 @@ impl VolumeBackend for CloudBackend {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations: cloud wire conversions
+//--------------------------------------------------------------------------------------------------
+
+impl From<super::cloud::CloudVolume> for VolumeCloudState {
+    fn from(cloud: super::cloud::CloudVolume) -> Self {
+        Self {
+            id: cloud.id,
+            used_bytes: cloud.used_bytes,
+            capacity_bytes: cloud.capacity_bytes,
+            labels: cloud.labels.clone().into_iter().collect(),
+            kind: cloud.kind,
+            status: cloud.status,
+            created_at: cloud.created_at,
+            updated_at: cloud.updated_at,
+        }
+    }
+}
+
+impl From<super::cloud::CloudVolume> for VolumeHandleCloudState {
+    fn from(cloud: super::cloud::CloudVolume) -> Self {
+        Self {
+            id: cloud.id,
+            used_bytes: cloud.used_bytes,
+            capacity_bytes: cloud.capacity_bytes,
+            labels: cloud.labels.clone().into_iter().collect(),
+            kind: cloud.kind,
+            status: cloud.status,
+            created_at: cloud.created_at,
+            updated_at: cloud.updated_at,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: CloudBackend (create-time validation)
+//--------------------------------------------------------------------------------------------------
+
+impl CloudBackend {
+    /// Reject volume options the cloud's create contract does not accept.
+    /// Cloud named volumes take only a name; storage sizing and placement
+    /// are managed for you.
+    fn reject_unsupported_volume_options(&self, config: &VolumeConfig) -> MicrosandboxResult<()> {
+        if config.kind != VolumeKind::Directory {
+            return Err(MicrosandboxError::unsupported(
+                "VolumeBuilder::disk",
+                "cloud volumes are directory-backed",
+            ));
+        }
+        if config.capacity_mib.is_some() {
+            return Err(MicrosandboxError::unsupported(
+                "disk volume capacity",
+                "use quota() for the storage cap",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert the config's storage cap to the whole-GiB unit the cloud
+    /// accepts. `None` when no cap is requested.
+    fn volume_capacity_gib(&self, config: &VolumeConfig) -> MicrosandboxResult<Option<u32>> {
+        let Some(quota_mib) = config.quota_mib else {
+            return Ok(None);
+        };
+        if quota_mib == 0 || quota_mib % 1024 != 0 {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cloud volume caps are whole GiB; got {quota_mib} MiB"
+            )));
+        }
+        Ok(Some(quota_mib / 1024))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Build a uniform `Unsupported` error for cloud volume ops — all of them are
-/// gated behind Phase 6.
+/// Build a uniform `Unsupported` error for cloud volume filesystem ops, which
+/// are not exposed by the cloud yet — volume contents are reached by mounting
+/// the volume into a sandbox.
 fn unsupported(feature: &str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud volumes ship".into(),
-    }
+    MicrosandboxError::unsupported(feature, "mount the volume into a sandbox")
 }
 
 //--------------------------------------------------------------------------------------------------

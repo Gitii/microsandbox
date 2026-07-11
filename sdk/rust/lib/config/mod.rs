@@ -672,10 +672,7 @@ pub fn config() -> MicrosandboxResult<Arc<LocalConfig>> {
     let backend = crate::backend::default_backend();
     let local = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "microsandbox::config::config".into(),
-            available_when: "with a local backend".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::local_only(crate::api_path!()))?;
     Ok(local.config_handle())
 }
 

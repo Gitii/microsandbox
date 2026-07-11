@@ -308,6 +308,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Request a globally-unique slug for the sandbox (cloud backends only).
+    ///
+    /// Lowercase letters, digits, and single hyphens. When unset, the cloud
+    /// assigns one; create fails when the slug is already taken. The local
+    /// backend has no slugs and ignores this with a warning.
+    pub fn slug(mut self, slug: impl Into<String>) -> Self {
+        self.config.slug = Some(slug.into());
+        self
+    }
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If a sandbox with this name is already active, microsandbox stops

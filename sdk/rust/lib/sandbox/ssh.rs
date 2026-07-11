@@ -333,14 +333,11 @@ impl SandboxSshOps {
         &self,
         f: impl FnOnce(SshServerOptionsBuilder) -> SshServerOptionsBuilder,
     ) -> MicrosandboxResult<SshServer> {
-        let local_backend =
-            self.sandbox
-                .backend()
-                .as_local()
-                .ok_or_else(|| MicrosandboxError::Unsupported {
-                    feature: "Sandbox::ssh on cloud".into(),
-                    available_when: "when cloud SSH proxying lands".into(),
-                })?;
+        let local_backend = self
+            .sandbox
+            .backend()
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
         let options = f(SshServerOptionsBuilder::default()).build();
         let authorized_keys = build_authorized_keys(&options, local_backend.config())?;
         let host_key = match options.host_key {
@@ -573,7 +570,7 @@ impl SshClient {
                 Some(spec) => attach::DetachKeys::parse(spec)?,
                 None => attach::DetachKeys::default_keys(),
             };
-            let (cols, rows) = attach::local::current_terminal_size().unwrap_or((80, 24));
+            let (cols, rows) = attach::agent::current_terminal_size().unwrap_or((80, 24));
             let mut channel = self
                 .handle
                 .channel_open_session()
@@ -598,9 +595,9 @@ impl SshClient {
                 .map_err(|e| ssh_error("request shell", e))?;
             wait_channel_success(&mut channel, "request shell").await?;
 
-            let terminal_guard = attach::local::WindowsTerminalGuard::enter()?;
+            let terminal_guard = attach::agent::WindowsTerminalGuard::enter()?;
             let mut terminal_events =
-                attach::local::WindowsTerminalEventPump::spawn_for_guard(&terminal_guard)?;
+                attach::agent::WindowsTerminalEventPump::spawn_for_guard(&terminal_guard)?;
             let detach_seq = detach_keys.sequence();
             let mut match_pos = 0usize;
             let mut exit_code = 0i32;
@@ -610,7 +607,7 @@ impl SshClient {
                 tokio::select! {
                     Some(event) = terminal_events.recv() => {
                         match event {
-                            attach::local::WindowsTerminalEvent::Input(data) => {
+                            attach::agent::WindowsTerminalEvent::Input(data) => {
                                 if attach::input_contains_detach_sequence(
                                     &data,
                                     detach_seq,
@@ -624,12 +621,12 @@ impl SshClient {
                                     .await
                                     .map_err(|e| ssh_error("write channel data", e))?;
                             }
-                            attach::local::WindowsTerminalEvent::Resize { cols, rows } => {
+                            attach::agent::WindowsTerminalEvent::Resize { cols, rows } => {
                                 let _ = channel_tx
                                     .window_change(u32::from(cols), u32::from(rows), 0, 0)
                                     .await;
                             }
-                            attach::local::WindowsTerminalEvent::Error(error) => {
+                            attach::agent::WindowsTerminalEvent::Error(error) => {
                                 return Err(MicrosandboxError::Terminal(error));
                             }
                         }
@@ -940,14 +937,14 @@ impl SshSession {
             return Ok(Arc::clone(client));
         }
 
-        let local_backend = self.settings.sandbox.backend().as_local().ok_or_else(|| {
-            MicrosandboxError::Unsupported {
-                feature: "Sandbox::ssh on cloud".into(),
-                available_when: "when cloud SSH proxying lands".into(),
-            }
-        })?;
+        let local_backend = self
+            .settings
+            .sandbox
+            .backend()
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
         let client = Arc::new(
-            crate::sandbox::fs::local::connect_agent(local_backend, self.settings.sandbox.name())
+            crate::sandbox::fs::agent::connect_agent(local_backend, self.settings.sandbox.name())
                 .await?,
         );
         self.client = Some(Arc::clone(&client));
@@ -1008,13 +1005,13 @@ impl SshSession {
         };
         let rows = pty.as_ref().map(|p| p.rows).unwrap_or(24);
         let cols = pty.as_ref().map(|p| p.cols).unwrap_or(80);
-        let local_backend = self.settings.sandbox.backend().as_local().ok_or_else(|| {
-            MicrosandboxError::Unsupported {
-                feature: "Sandbox::ssh exec on cloud".into(),
-                available_when: "when cloud SSH proxying lands".into(),
-            }
-        })?;
-        let handle = crate::sandbox::exec::local::exec_stream_with_pty_size(
+        let local_backend = self
+            .settings
+            .sandbox
+            .backend()
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
+        let handle = crate::sandbox::exec::agent::exec_stream_with_pty_size(
             local_backend,
             self.settings.sandbox.name(),
             self.settings.sandbox.config(),

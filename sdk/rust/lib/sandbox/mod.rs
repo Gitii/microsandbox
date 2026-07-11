@@ -497,13 +497,9 @@ pub(crate) async fn create_local(
         "create_local: starting"
     );
 
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "create_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::create"))?;
 
     config.apply_rootfs_defaults(local_backend.config().sandbox_defaults.oci.upper_size_mib);
 
@@ -752,13 +748,9 @@ pub(crate) async fn start_local(
     mode: SpawnMode,
 ) -> MicrosandboxResult<Sandbox> {
     tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "start_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::start"))?;
     let pools = local_backend.db().await?;
     let write_db = pools.write();
     let model = load_sandbox_record_reconciled(pools, name).await?;
@@ -903,13 +895,9 @@ pub(crate) async fn remove_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "remove_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::remove"))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     let handle = SandboxHandle::from_local_model(backend, model, pid);
     handle.remove().await
@@ -928,13 +916,9 @@ pub(crate) async fn stop_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "stop_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::stop"))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -974,13 +958,9 @@ pub(crate) async fn kill_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "kill_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::kill"))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -1024,13 +1004,9 @@ pub(crate) async fn drain_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "drain_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::local_only("Sandbox::drain"))?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
         return Ok(());
@@ -1066,7 +1042,7 @@ async fn request_agent_shutdown(
     name: &str,
 ) -> MicrosandboxResult<()> {
     let client =
-        fs::local::connect_agent_with_timeout(local_backend, name, AGENT_SHUTDOWN_CONNECT_TIMEOUT)
+        fs::agent::connect_agent_with_timeout(local_backend, name, AGENT_SHUTDOWN_CONNECT_TIMEOUT)
             .await?;
     client.send(0, MessageType::Shutdown, &()).await?;
     Ok(())
@@ -1133,13 +1109,9 @@ impl Sandbox {
     /// signature consumed the sandbox even on the failing path.
     pub async fn remove_persisted(&self) -> MicrosandboxResult<()> {
         let local = self.require_local("remove_persisted")?;
-        let local_backend =
-            self.backend
-                .as_local()
-                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                    feature: "Sandbox::remove_persisted on cloud".into(),
-                    available_when: "never — cloud sandboxes are removed via the API".into(),
-                })?;
+        let local_backend = self.backend.as_local().ok_or_else(|| {
+            crate::MicrosandboxError::unsupported("Sandbox::remove_persisted", "use remove()")
+        })?;
         let pools = local_backend.db().await?;
 
         remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
@@ -1208,10 +1180,7 @@ impl Sandbox {
         method: &'static str,
     ) -> MicrosandboxResult<&crate::backend::SandboxLocalState> {
         self.local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: format!("Sandbox::{method}"),
-                available_when: "when cloud exec/fs/logs/metrics land".into(),
-            })
+            .ok_or_else(|| crate::MicrosandboxError::local_only(format!("Sandbox::{method}")))
     }
 
     /// Live status from the backend. Always hits `backend.sandboxes().get(name)`
