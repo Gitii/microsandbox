@@ -17,11 +17,11 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use futures::future::BoxFuture;
 
-use super::{Backend, LocalBackend};
+use super::Backend;
 use crate::MicrosandboxResult;
 use crate::agent::AgentClient;
 use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
-use crate::runtime::{ProcessHandle, SpawnMode};
+use crate::runtime::ProcessHandle;
 use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
 use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
 use crate::sandbox::metrics::SandboxMetrics;
@@ -469,158 +469,5 @@ pub trait SandboxBackend: Send + Sync {
         Box::pin(async move {
             crate::sandbox::fs::agent::copy_to_host(backend.as_ref(), name, guest, host).await
         })
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations: LocalBackend
-//--------------------------------------------------------------------------------------------------
-
-impl SandboxBackend for LocalBackend {
-    fn create<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        config: SandboxConfig,
-        _start: bool,
-    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
-        Box::pin(async move {
-            self.warn_cloud_only(&config);
-            // Local backend always boots immediately — `start` only differs
-            // for cloud where create-without-start is a distinct state.
-            crate::sandbox::create_local(backend, config, SpawnMode::Attached, None).await
-        })
-    }
-
-    fn create_detached<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        config: SandboxConfig,
-    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
-        Box::pin(async move {
-            self.warn_cloud_only(&config);
-            crate::sandbox::create_local(backend, config, SpawnMode::Detached, None).await
-        })
-    }
-
-    fn start<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
-        Box::pin(
-            async move { crate::sandbox::start_local(backend, name, SpawnMode::Attached).await },
-        )
-    }
-
-    fn start_detached<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
-        Box::pin(
-            async move { crate::sandbox::start_local(backend, name, SpawnMode::Detached).await },
-        )
-    }
-
-    fn get<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<SandboxHandle>> {
-        Box::pin(async move {
-            let (model, pid) = crate::sandbox::get_local_handle_state(self, name).await?;
-            Ok(SandboxHandle::from_local_model(backend, model, pid))
-        })
-    }
-
-    fn list<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        _cursor: Option<&'a str>,
-        _limit: Option<u32>,
-    ) -> BoxFuture<'a, MicrosandboxResult<SandboxList>> {
-        Box::pin(async move {
-            let rows = crate::sandbox::list_local_handle_state(self).await?;
-            let sandboxes = rows
-                .into_iter()
-                .map(|(model, pid)| SandboxHandle::from_local_model(backend.clone(), model, pid))
-                .collect();
-            Ok(SandboxList {
-                sandboxes,
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn remove<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::remove_local(backend, name).await })
-    }
-
-    fn stop<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::stop_local(backend, name).await })
-    }
-
-    fn kill<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::kill_local(backend, name).await })
-    }
-
-    fn drain<'a>(
-        &'a self,
-        backend: Arc<dyn Backend>,
-        name: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::drain_local(backend, name).await })
-    }
-
-    fn logs<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        opts: &'a LogOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<Vec<LogEntry>>> {
-        Box::pin(async move { crate::logs::read_logs_local(self, name, opts).await })
-    }
-
-    fn log_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        opts: &'a LogStreamOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
-        Box::pin(async move {
-            let stream = crate::logs::log_stream_local(self, name, opts).await?;
-            Ok(Box::pin(stream) as LogStream)
-        })
-    }
-
-    fn metrics<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        config: &'a SandboxConfig,
-    ) -> BoxFuture<'a, MicrosandboxResult<SandboxMetrics>> {
-        Box::pin(async move { crate::sandbox::metrics::local_metrics(self, name, config).await })
-    }
-
-    fn metrics_stream(
-        &self,
-        backend: Arc<dyn Backend>,
-        name: String,
-        config: SandboxConfig,
-        interval: Duration,
-    ) -> MetricsStream {
-        crate::sandbox::metrics::local_metrics_stream(backend, name, config, interval)
     }
 }

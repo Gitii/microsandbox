@@ -344,7 +344,7 @@ pub(super) async fn metrics_for_sandbox(
     sandbox_id: i32,
     config: &SandboxConfig,
 ) -> MicrosandboxResult<SandboxMetrics> {
-    let run = super::load_active_run(db, sandbox_id)
+    let run = LocalBackend::load_active_run(db, sandbox_id)
         .await?
         .ok_or_else(|| {
             MicrosandboxError::Custom(format!(

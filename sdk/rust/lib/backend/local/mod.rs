@@ -15,6 +15,8 @@
 //! the bulk of the old global config singleton plus the SQLite pool, so multiple
 //! backends can hold different configurations for tests / migrations.
 
+mod sandbox;
+
 use std::{
     collections::HashMap,
     num::NonZero,
