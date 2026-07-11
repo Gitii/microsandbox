@@ -24,7 +24,6 @@ mod local;
 mod profile;
 pub(crate) mod sandbox;
 pub(crate) mod volume;
-mod ws_io;
 
 pub use cloud::{CloudBackend, CloudBackendBuilder};
 use futures::future::BoxFuture;

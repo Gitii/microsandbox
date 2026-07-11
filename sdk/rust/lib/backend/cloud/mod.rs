@@ -8,6 +8,8 @@
 //! Auth is API-key-only — the same `msb_live_*` / `msb_test_*` tokens msb-cloud
 //! issues today. No OAuth or session credentials are honored here.
 
+mod ws_io;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -888,7 +890,7 @@ impl Backend for CloudBackend {
                 .map_err(|e| MicrosandboxError::Runtime(format!("cloud agent websocket: {e}")))?;
 
             crate::agent::AgentClient::connect_stream_with_timeout(
-                super::ws_io::WsByteStream::new(socket),
+                self::ws_io::WsByteStream::new(socket),
                 timeout,
             )
             .await
