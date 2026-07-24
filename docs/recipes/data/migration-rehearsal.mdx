@@ -21,8 +21,7 @@ msb run -d --name migration-base --replace \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB=recipes \
   -e DOCKER_PG_LLVM_DEPS= \
-  --entrypoint docker-entrypoint.sh \
-  postgres:17-alpine -- postgres
+  postgres:17-alpine
 ```
 
 Wait for initialization, then stop the database cleanly:
@@ -54,8 +53,7 @@ msb run -d --name migration-test --replace \
   -p 127.0.0.1:55432:5432 \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB=recipes \
-  -e DOCKER_PG_LLVM_DEPS= \
-  --entrypoint docker-entrypoint.sh -- postgres
+  -e DOCKER_PG_LLVM_DEPS=
 
 msb exec migration-test -- sh -lc '
   until pg_isready -h 127.0.0.1 -d recipes -U postgres; do sleep 1; done
@@ -87,8 +85,7 @@ msb run -d --name migration-test --replace \
   -p 127.0.0.1:55432:5432 \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB=recipes \
-  -e DOCKER_PG_LLVM_DEPS= \
-  --entrypoint docker-entrypoint.sh -- postgres
+  -e DOCKER_PG_LLVM_DEPS=
 
 msb exec migration-test -- sh -lc '
   until pg_isready -h 127.0.0.1 -d recipes -U postgres; do sleep 1; done

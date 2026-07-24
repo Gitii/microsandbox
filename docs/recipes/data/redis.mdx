@@ -15,8 +15,7 @@ msb run -d --name redis-demo --replace \
   --cpus 1 --memory 512M --root-disk 1G \
   -p 127.0.0.1:56379:6379 \
   --mount-named redis-data:/data \
-  --entrypoint redis-server \
-  redis:7-alpine -- \
+  redis:7-alpine -- redis-server \
     --bind 0.0.0.0 \
     --protected-mode yes \
     --appendonly yes \

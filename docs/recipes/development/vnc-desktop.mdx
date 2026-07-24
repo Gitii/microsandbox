@@ -26,7 +26,8 @@ msb run -d --name vnc-desktop --replace \
     DISPLAY=:1 openbox >/tmp/openbox.log 2>&1 &
     DISPLAY=:1 xterm -geometry 100x30+40+40 >/tmp/xterm.log 2>&1 &
     exec websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5901' \
-  debian:bookworm-slim -- start-desktop
+  --entrypoint start-desktop \
+  debian:bookworm-slim
 ```
 
 Detached mode returns as soon as the VM starts, before the desktop packages are ready. The first install downloads approximately 128 MB, uses roughly 560 MB of guest disk, and can take a few minutes. Wait for noVNC to respond:
