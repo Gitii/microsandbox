@@ -197,33 +197,6 @@
         "tab": "Recipes",
         "groups": [
           {
-            "group": "Docker",
-            "icon": "docker",
-            "pages": [
-              "recipes/docker/docker-in-sandbox",
-              "recipes/docker/docker",
-              "recipes/docker/local-images"
-            ]
-          },
-          {
-            "group": "Guests",
-            "icon": "server",
-            "pages": [
-              "recipes/guest/systemd-services"
-            ]
-          },
-          {
-            "group": "Metrics",
-            "icon": "paper-plane",
-            "pages": [
-              "recipes/metrics-backends/grafana-cloud",
-              "recipes/metrics-backends/grafana-alloy",
-              "recipes/metrics-backends/otel-collector",
-              "recipes/metrics-backends/prometheus",
-              "recipes/metrics-backends/datadog"
-            ]
-          },
-          {
             "group": "Agents",
             "icon": "robot",
             "pages": [
@@ -237,6 +210,15 @@
             ]
           },
           {
+            "group": "Docker",
+            "icon": "docker",
+            "pages": [
+              "recipes/docker/docker-in-sandbox",
+              "recipes/docker/docker",
+              "recipes/docker/local-images"
+            ]
+          },
+          {
             "group": "Sandboxing",
             "icon": "shield-halved",
             "pages": [
@@ -245,19 +227,14 @@
             ]
           },
           {
-            "group": "Browser",
-            "icon": "globe",
-            "pages": [
-              "recipes/browser-automation/playwright"
-            ]
-          },
-          {
             "group": "Development",
             "icon": "code",
             "pages": [
               "recipes/development/code-server",
               "recipes/development/jupyterlab",
-              "recipes/development/vnc-desktop"
+              "recipes/browser-automation/playwright",
+              "recipes/development/vnc-desktop",
+              "recipes/guest/systemd-services"
             ]
           },
           {
@@ -275,6 +252,17 @@
             "pages": [
               "recipes/file-processing/libreoffice-pdf",
               "recipes/file-processing/ffmpeg"
+            ]
+          },
+          {
+            "group": "Metrics",
+            "icon": "paper-plane",
+            "pages": [
+              "recipes/metrics-backends/grafana-cloud",
+              "recipes/metrics-backends/grafana-alloy",
+              "recipes/metrics-backends/otel-collector",
+              "recipes/metrics-backends/prometheus",
+              "recipes/metrics-backends/datadog"
             ]
           }
         ]
