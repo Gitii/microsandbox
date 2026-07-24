@@ -26,11 +26,17 @@ msb run -d --name vnc-desktop --replace \
     DISPLAY=:1 openbox >/tmp/openbox.log 2>&1 &
     DISPLAY=:1 xterm -geometry 100x30+40+40 >/tmp/xterm.log 2>&1 &
     exec websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5901' \
-  --entrypoint start-desktop \
-  debian:bookworm-slim
+  debian:bookworm-slim -- start-desktop
 ```
 
-The first install downloads approximately 128 MB and uses roughly 560 MB of guest disk.
+Detached mode returns as soon as the VM starts, before the desktop packages are ready. The first install downloads approximately 128 MB, uses roughly 560 MB of guest disk, and can take a few minutes. Wait for noVNC to respond:
+
+```sh
+until curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null; do
+  echo "Waiting for noVNC..."
+  sleep 5
+done
+```
 
 Open [http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale](http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale). You should see an Openbox desktop with an xterm window.
 
