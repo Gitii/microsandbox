@@ -197,6 +197,60 @@
         "tab": "Recipes",
         "groups": [
           {
+            "group": "Agents",
+            "icon": "robot",
+            "pages": [
+              "recipes/use-cases/ai-coding-agent",
+              "recipes/agents/opencode",
+              "recipes/agents/openclaw",
+              "recipes/agents/goose",
+              "recipes/agents/gemini-cli",
+              "recipes/agents/hermes-agent",
+              "recipes/agents/pi"
+            ]
+          },
+          {
+            "group": "Sandboxing",
+            "icon": "shield-halved",
+            "pages": [
+              "recipes/use-cases/run-untrusted-code",
+              "recipes/sandboxing/warm-workers"
+            ]
+          },
+          {
+            "group": "Browser automation",
+            "icon": "globe",
+            "pages": [
+              "recipes/browser-automation/playwright"
+            ]
+          },
+          {
+            "group": "Development environments",
+            "icon": "code",
+            "pages": [
+              "recipes/development/code-server",
+              "recipes/development/jupyterlab",
+              "recipes/development/vnc-desktop"
+            ]
+          },
+          {
+            "group": "Data services",
+            "icon": "database",
+            "pages": [
+              "recipes/data/postgresql",
+              "recipes/data/migration-rehearsal",
+              "recipes/data/redis"
+            ]
+          },
+          {
+            "group": "File processing",
+            "icon": "file",
+            "pages": [
+              "recipes/file-processing/libreoffice-pdf",
+              "recipes/file-processing/ffmpeg"
+            ]
+          },
+          {
             "group": "Docker",
             "icon": "docker",
             "pages": [
@@ -206,7 +260,7 @@
             ]
           },
           {
-            "group": "Guest",
+            "group": "Guest systems",
             "icon": "server",
             "pages": [
               "recipes/guest/systemd-services"

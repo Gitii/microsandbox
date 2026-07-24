@@ -342,6 +342,25 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 
 <br />
 
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/light-bulb/ffffff" alt="light-bulb-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/light-bulb/000000" alt="light-bulb"></a>&nbsp;&nbsp;Recipes
+
+- **[Run untrusted user code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)** with CPU, memory, time, process, file, and network limits.
+- **[Give an AI coding agent an isolated workspace](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)** and review its patch before copying anything back to the host.
+- **[Run OpenCode in a microVM](https://docs.microsandbox.dev/recipes/agents/opencode)** against an isolated copy of your project.
+- **[Automate Chromium with Playwright](https://docs.microsandbox.dev/recipes/browser-automation/playwright)** without requiring GPU acceleration.
+- **[Rehearse a database migration](https://docs.microsandbox.dev/recipes/data/migration-rehearsal)** and restore the pre-migration disk state from a snapshot.
+- **[Run Docker inside a sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)** without touching the host's Docker daemon.
+
+<br />
+
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/ffffff" alt="people-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/000000" alt="people"></a>&nbsp;&nbsp;Who Uses microsandbox
+
+- <img height="16" src="./assets/eve.svg" alt="Eve"> **[Eve by Vercel](https://eve.dev/docs/sandbox#microsandbox)** uses microsandbox as a local microVM backend for its AI agents, describing it as the closest local match to hosted Vercel Sandbox.
+
+Using microsandbox in your product? Tell us in [Discord](https://discord.gg/T95Y3XnEAK)—we would love to feature what you are building.
+
+<br />
+
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/book/ffffff" alt="docs-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/book/000000" alt="docs"></a>&nbsp;&nbsp;Documentation
 
 For guides, API references, and examples, visit the [microsandbox documentation](https://docs.microsandbox.dev).

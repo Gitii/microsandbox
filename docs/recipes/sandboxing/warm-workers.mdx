@@ -1,0 +1,74 @@
+---
+title: Warm workers from a snapshot
+description: Install a toolchain once and launch clean workers from the captured disk state
+icon: "code-branch"
+---
+
+Package installation often costs more than sandbox boot. This recipe installs OpenCode once, records the stopped sandbox as an integrity-checked snapshot, and launches fresh workers from that prepared filesystem.
+
+## Prepare the baseline
+
+```sh
+msb run --name agent-base --replace \
+  --cpus 2 --memory 2G --root-disk 4G \
+  node:24-bookworm-slim -- sh -lc '
+    apt-get update &&
+    apt-get install -y --no-install-recommends ca-certificates git &&
+    npm install -g opencode-ai@1.18.4 &&
+    opencode --version
+  '
+```
+
+When the command exits, `agent-base` is stopped and ready to snapshot.
+
+## Create and verify the snapshot
+
+```sh
+msb snapshot create coding-agent-base \
+  --from agent-base \
+  --integrity
+
+msb snapshot verify coding-agent-base
+```
+
+The snapshot captures the writable disk changes and pins the source image. It does not capture memory, running processes, network state, environment variables, or named volumes.
+
+## Launch a clean worker
+
+```sh
+msb run -t --name coding-worker-1 --replace \
+  --from-snapshot coding-agent-base \
+  --cpus 2 --memory 2G \
+  --copy-dir ./my-project:/workspace \
+  --workdir /workspace \
+  -- opencode
+```
+
+Each `--from-snapshot` launch receives its own writable layer. Changes made by one worker do not modify the snapshot or another worker.
+
+Create more workers by changing the sandbox name:
+
+```sh
+msb run --name coding-worker-2 --replace \
+  --from-snapshot coding-agent-base \
+  --copy-dir ./another-project:/workspace \
+  --workdir /workspace \
+  -- opencode --version
+```
+
+## Refresh the baseline
+
+Snapshots are immutable. To update packages, recreate `agent-base`, then overwrite the named snapshot intentionally:
+
+```sh
+msb snapshot create coding-agent-base --from agent-base --integrity --force
+```
+
+## Cleanup
+
+```sh
+msb rm -f agent-base coding-worker-1 coding-worker-2
+msb snapshot rm coding-agent-base
+```
+
+See [Snapshots](/sandboxes/snapshots) for archive, integrity, and portability details.

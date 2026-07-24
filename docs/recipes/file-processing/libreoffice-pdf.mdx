@@ -1,0 +1,66 @@
+---
+title: Convert documents and render PDFs
+description: Prepare LibreOffice once, then convert untrusted documents without network access
+icon: "file-pdf"
+---
+
+Document parsers process complex, attacker-controlled file formats. This recipe installs LibreOffice and Poppler once, snapshots the toolchain, and performs each conversion in a fresh worker with networking disabled.
+
+## Prepare the converter
+
+```sh
+msb run --name office-base --replace \
+  --cpus 2 --memory 2G --root-disk 5G \
+  debian:bookworm-slim -- sh -lc '
+    apt-get update &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libreoffice-writer poppler-utils &&
+    rm -rf /var/lib/apt/lists/* &&
+    libreoffice --version &&
+    pdftoppm -v
+  '
+
+msb snapshot create office-tools --from office-base --integrity
+```
+
+The package installation downloads approximately 102 MB and adds roughly 354 MB to the guest. The snapshot lets later workers skip it.
+
+## Convert a document offline
+
+The example accepts a Word document named `input.docx`:
+
+```sh
+msb run --name document-worker --replace \
+  --from-snapshot office-tools \
+  --cpus 2 --memory 2G \
+  --no-net --max-duration 2m \
+  --mkdir /work \
+  --copy-file ./input.docx:/work/input.docx \
+  -- sh -lc '
+    libreoffice --headless --convert-to pdf --outdir /work /work/input.docx &&
+    pdftoppm -png -singlefile -r 96 /work/input.pdf /work/preview &&
+    test -s /work/input.pdf &&
+    test -s /work/preview.png &&
+    stat -c "%n: %s bytes" /work/input.pdf /work/preview.png
+  '
+```
+
+Copy out only the generated artifacts:
+
+```sh
+msb cp document-worker:/work/input.pdf ./output.pdf
+msb cp document-worker:/work/preview.png ./preview.png
+```
+
+<Warning>
+  A VM boundary reduces host exposure but does not make every document safe to publish or trust. Enforce input and output size limits before boot, cap concurrent conversions, reject unexpected file types, and scan retained artifacts according to your threat model.
+</Warning>
+
+## Cleanup
+
+```sh
+msb rm -f office-base document-worker
+msb snapshot rm office-tools
+```
+
+The copied `output.pdf` and `preview.png` remain on the host.

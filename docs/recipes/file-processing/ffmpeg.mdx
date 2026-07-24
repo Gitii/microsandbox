@@ -1,0 +1,67 @@
+---
+title: Transcode media with FFmpeg
+description: Prepare FFmpeg once and process untrusted media in an offline worker
+icon: "film"
+---
+
+Media parsers are a natural fit for disposable microVMs. This recipe snapshots a prepared FFmpeg toolchain, copies one input file into a networkless worker, and exports only the transcoded result.
+
+## Prepare FFmpeg
+
+```sh
+msb run --name ffmpeg-base --replace \
+  --cpus 2 --memory 2G --root-disk 4G \
+  debian:bookworm-slim -- sh -lc '
+    apt-get update &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg &&
+    rm -rf /var/lib/apt/lists/* &&
+    ffmpeg -version | head -1
+  '
+
+msb snapshot create ffmpeg-tools --from ffmpeg-base --integrity
+```
+
+## Transcode offline
+
+```sh
+msb run --name ffmpeg-worker --replace \
+  --from-snapshot ffmpeg-tools \
+  --cpus 2 --memory 2G \
+  --no-net --max-duration 10m \
+  --mkdir /work \
+  --copy-file ./input.mov:/work/input.mov \
+  -- sh -lc '
+    ffmpeg -nostdin -hide_banner -y \
+      -i /work/input.mov \
+      -c:v libx264 -preset medium -crf 23 \
+      -c:a aac -b:a 128k \
+      /work/output.mp4 &&
+    ffprobe -v error \
+      -show_entries format=duration,size \
+      -of default=noprint_wrappers=1 \
+      /work/output.mp4
+  '
+```
+
+Copy the result to the host:
+
+```sh
+msb cp ffmpeg-worker:/work/output.mp4 ./output.mp4
+```
+
+The laboratory smoke test generated a two-second H.264 video and `ffprobe` verified its duration and size.
+
+## Bound the workload
+
+- Validate the input size before creating the sandbox.
+- Set `--max-duration` according to the longest media you accept.
+- Limit concurrent workers at the application layer so users cannot exhaust host CPU.
+- Keep `--no-net` unless the worker must retrieve remote media; copy or stream validated input through a controlled host service instead.
+- Export only known output paths rather than the worker's entire filesystem.
+
+## Cleanup
+
+```sh
+msb rm -f ffmpeg-base ffmpeg-worker
+msb snapshot rm ffmpeg-tools
+```
