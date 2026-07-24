@@ -197,6 +197,33 @@
         "tab": "Recipes",
         "groups": [
           {
+            "group": "Docker",
+            "icon": "docker",
+            "pages": [
+              "recipes/docker/docker-in-sandbox",
+              "recipes/docker/docker",
+              "recipes/docker/local-images"
+            ]
+          },
+          {
+            "group": "Guests",
+            "icon": "server",
+            "pages": [
+              "recipes/guest/systemd-services"
+            ]
+          },
+          {
+            "group": "Metrics",
+            "icon": "paper-plane",
+            "pages": [
+              "recipes/metrics-backends/grafana-cloud",
+              "recipes/metrics-backends/grafana-alloy",
+              "recipes/metrics-backends/otel-collector",
+              "recipes/metrics-backends/prometheus",
+              "recipes/metrics-backends/datadog"
+            ]
+          },
+          {
             "group": "Agents",
             "icon": "robot",
             "pages": [
@@ -218,14 +245,14 @@
             ]
           },
           {
-            "group": "Browser automation",
+            "group": "Browser",
             "icon": "globe",
             "pages": [
               "recipes/browser-automation/playwright"
             ]
           },
           {
-            "group": "Development environments",
+            "group": "Development",
             "icon": "code",
             "pages": [
               "recipes/development/code-server",
@@ -234,7 +261,7 @@
             ]
           },
           {
-            "group": "Data services",
+            "group": "Data",
             "icon": "database",
             "pages": [
               "recipes/data/postgresql",
@@ -243,38 +270,11 @@
             ]
           },
           {
-            "group": "File processing",
+            "group": "Files",
             "icon": "file",
             "pages": [
               "recipes/file-processing/libreoffice-pdf",
               "recipes/file-processing/ffmpeg"
-            ]
-          },
-          {
-            "group": "Docker",
-            "icon": "docker",
-            "pages": [
-              "recipes/docker/docker-in-sandbox",
-              "recipes/docker/docker",
-              "recipes/docker/local-images"
-            ]
-          },
-          {
-            "group": "Guest systems",
-            "icon": "server",
-            "pages": [
-              "recipes/guest/systemd-services"
-            ]
-          },
-          {
-            "group": "Metrics backends",
-            "icon": "paper-plane",
-            "pages": [
-              "recipes/metrics-backends/grafana-cloud",
-              "recipes/metrics-backends/grafana-alloy",
-              "recipes/metrics-backends/otel-collector",
-              "recipes/metrics-backends/prometheus",
-              "recipes/metrics-backends/datadog"
             ]
           }
         ]
