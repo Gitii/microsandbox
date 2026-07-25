@@ -1,8 +1,8 @@
 //! Cloud backend implementation — talks to an msb-cloud control plane over HTTP.
 //!
-//! Holds the (url, api_key) tuple and a `reqwest::Client`. Sub-trait
-//! implementations (sandbox lifecycle, exec, volumes, …) land alongside the
-//! `Backend` trait's sub-trait surface as that surface is filled in.
+//! Holds the (url, api_key) tuple and a `reqwest::Client`. Lifecycle ops are
+//! plain HTTP; logs stream over SSE; exec, attach, and guest-fs ride the agent
+//! WebSocket route through the shared agent client (see the `DialAgent` impl).
 //!
 //! Construction is URL + API key first; `from_env` and `from_profile` are sugar.
 //! Auth is API-key-only — the same `msb_live_*` / `msb_test_*` tokens msb-cloud
@@ -13,12 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, stream};
-use microsandbox_protocol::{
-    codec,
-    exec::{ExecExited, ExecFailed, ExecStarted, ExecStderr, ExecStdin, ExecStdout},
-    message::{Message, MessageType},
-};
+use futures::future::BoxFuture;
+use futures::{StreamExt, stream};
 use reqwest::Response;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -29,25 +25,20 @@ use tokio_tungstenite::{
         client::IntoClientRequest,
         http::{
             HeaderValue as WsHeaderValue,
-            header::{
-                AUTHORIZATION as WS_AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL,
-                USER_AGENT as WS_USER_AGENT,
-            },
+            header::{AUTHORIZATION as WS_AUTHORIZATION, USER_AGENT as WS_USER_AGENT},
         },
-        protocol::Message as WsMessage,
     },
 };
 
-use super::{Backend, BackendKind, SandboxBackend, VolumeBackend, sandbox::LogStream};
-use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
-use crate::sandbox::{
-    SandboxConfig, build_exec_request,
-    exec::{ExecOptions, ExecOutput, ExitStatus, StdinMode},
+use super::{
+    Backend, BackendKind, SandboxBackend, VolumeBackend,
+    sandbox::{CloudCreateBody, LogStream},
+    volume::{CloudVolumeKind, CloudVolumeStatus},
 };
+use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
 use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_types::{
-    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudErrorBody, CloudMessageResponse,
-    CloudPaginated,
+    CloudCreateSandboxResponse, CloudErrorBody, CloudMessageResponse, CloudPaginated,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -55,8 +46,6 @@ use microsandbox_types::{
 //--------------------------------------------------------------------------------------------------
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOUD_EXEC_ID: u32 = 1;
-const CLOUD_EXEC_SUBPROTOCOL: &str = "msb.cbor";
 
 /// Default User-Agent header value.
 fn default_user_agent() -> String {
@@ -108,6 +97,33 @@ struct CloudLogPayload {
     source: String,
     ts: chrono::DateTime<chrono::Utc>,
     text: String,
+}
+
+/// Wire shape of the volume object returned by the cloud's volume routes.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct CloudVolume {
+    /// Server-side UUID.
+    pub id: String,
+    /// User-facing name; the org's shared default volume has none.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Whether this is the org's shared default volume or a named volume.
+    pub kind: CloudVolumeKind,
+    /// Lifecycle status at fetch time.
+    pub status: CloudVolumeStatus,
+    /// Bytes stored in the volume, when the cloud reports usage.
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    /// Per-volume storage limit in bytes; absent when the volume has none.
+    #[serde(default)]
+    pub capacity_bytes: Option<u64>,
+    /// User-defined labels; empty when none are set.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Creation timestamp.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last modification timestamp.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Default)]
@@ -185,9 +201,9 @@ impl CloudBackend {
     ///
     /// Pass `start=true` to atomically create-and-start in a single round-trip
     /// — mirrors the `POST /v1/sandboxes?start=true` shorthand on msb-cloud.
-    pub async fn create_sandbox(
+    pub(super) async fn create_sandbox(
         &self,
-        req: &CloudCreateSandboxRequest,
+        req: &CloudCreateBody,
         start: bool,
     ) -> MicrosandboxResult<CloudCreateSandboxResponse> {
         let path = if start {
@@ -307,10 +323,10 @@ impl CloudBackend {
         opts: &LogStreamOptions,
     ) -> MicrosandboxResult<LogStream> {
         if !opts.follow {
-            return Err(MicrosandboxError::Unsupported {
-                feature: "Sandbox::log_stream(follow=false) on cloud".into(),
-                available_when: "when msb-cloud exposes bounded log snapshots".into(),
-            });
+            return Err(MicrosandboxError::unsupported(
+                "Sandbox::log_stream(follow=false)",
+                "use log_stream with follow=true",
+            ));
         }
 
         let sandbox = self.get_sandbox(name).await?;
@@ -319,139 +335,9 @@ impl CloudBackend {
 
     /// Read a bounded log snapshot.
     pub async fn logs(&self, _name: &str, _opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>> {
-        Err(MicrosandboxError::Unsupported {
-            feature: "Sandbox::logs on cloud".into(),
-            available_when: "when msb-cloud exposes bounded log snapshots; use Sandbox::log_stream with follow=true for live logs".into(),
-        })
-    }
-
-    /// Run a command via `GET /v1/sandboxes/:id/exec.cbor`.
-    pub async fn exec(
-        &self,
-        name: &str,
-        config: &SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-    ) -> MicrosandboxResult<ExecOutput> {
-        let timeout_duration = opts.timeout;
-        let exec = self.exec_without_timeout(name, config, cmd, opts);
-
-        match timeout_duration {
-            Some(duration) => match tokio::time::timeout(duration, exec).await {
-                Ok(result) => result,
-                Err(_) => Err(MicrosandboxError::ExecTimeout(duration)),
-            },
-            None => exec.await,
-        }
-    }
-
-    async fn exec_without_timeout(
-        &self,
-        name: &str,
-        config: &SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-    ) -> MicrosandboxResult<ExecOutput> {
-        let sandbox = self.get_sandbox(name).await?;
-        let url = cloud_exec_ws_url(&self.url, &sandbox.id)?;
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec request: {e}")))?;
-        let bearer = format!("Bearer {}", self.api_key);
-        let mut auth_value = WsHeaderValue::from_str(&bearer).map_err(|e| {
-            MicrosandboxError::InvalidConfig(format!("invalid API key header value: {e}"))
-        })?;
-        auth_value.set_sensitive(true);
-        request.headers_mut().insert(WS_AUTHORIZATION, auth_value);
-        request.headers_mut().insert(
-            WS_USER_AGENT,
-            WsHeaderValue::from_str(&default_user_agent()).map_err(|e| {
-                MicrosandboxError::InvalidConfig(format!("invalid user-agent value: {e}"))
-            })?,
-        );
-        request.headers_mut().insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            WsHeaderValue::from_static(CLOUD_EXEC_SUBPROTOCOL),
-        );
-
-        let (socket, _) = connect_async(request)
-            .await
-            .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec websocket: {e}")))?;
-        let (mut writer, mut reader) = socket.split();
-
-        let ExecOptions {
-            args,
-            cwd,
-            user,
-            env,
-            rlimits,
-            timeout: _,
-            stdin: stdin_mode,
-            tty,
-        } = opts;
-        let req = build_exec_request(config, cmd, args, cwd, user, &env, &rlimits, tty, 24, 80);
-        send_cloud_exec_message(&mut writer, MessageType::ExecRequest, &req).await?;
-
-        if let StdinMode::Bytes(data) = stdin_mode {
-            let stdin = ExecStdin { data };
-            send_cloud_exec_message(&mut writer, MessageType::ExecStdin, &stdin).await?;
-            let close = ExecStdin { data: Vec::new() };
-            send_cloud_exec_message(&mut writer, MessageType::ExecStdin, &close).await?;
-        }
-
-        let mut frame_buf = Vec::new();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        while let Some(frame) = reader.next().await {
-            match frame {
-                Ok(WsMessage::Binary(bytes)) => {
-                    frame_buf.extend_from_slice(&bytes);
-                    while let Some(msg) = codec::try_decode_from_buf(&mut frame_buf)? {
-                        match msg.t {
-                            MessageType::ExecStarted => {
-                                let _ = msg.payload::<ExecStarted>()?;
-                            }
-                            MessageType::ExecStdout => {
-                                stdout.extend_from_slice(&msg.payload::<ExecStdout>()?.data);
-                            }
-                            MessageType::ExecStderr => {
-                                stderr.extend_from_slice(&msg.payload::<ExecStderr>()?.data);
-                            }
-                            MessageType::ExecExited => {
-                                let exited = msg.payload::<ExecExited>()?;
-                                let _ = writer.close().await;
-                                return Ok(ExecOutput::from_parts(
-                                    ExitStatus {
-                                        code: exited.code,
-                                        success: exited.code == 0,
-                                    },
-                                    Bytes::from(stdout),
-                                    Bytes::from(stderr),
-                                ));
-                            }
-                            MessageType::ExecFailed => {
-                                let failed = msg.payload::<ExecFailed>()?;
-                                let _ = writer.close().await;
-                                return Err(MicrosandboxError::ExecFailed(failed));
-                            }
-                            MessageType::ExecStdinError => {}
-                            _ => {}
-                        }
-                    }
-                }
-                Ok(WsMessage::Close(_)) => break,
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(MicrosandboxError::Runtime(format!(
-                        "cloud exec websocket read: {error}"
-                    )));
-                }
-            }
-        }
-
-        Err(MicrosandboxError::Runtime(
-            "cloud exec websocket closed before exit event".into(),
+        Err(MicrosandboxError::unsupported(
+            "Sandbox::logs",
+            "use log_stream with follow=true",
         ))
     }
 
@@ -505,6 +391,164 @@ impl CloudBackend {
         Ok(Box::pin(stream::unfold(rx, |mut rx| async {
             rx.recv().await.map(|item| (item, rx))
         })))
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Methods: Volumes
+    //--------------------------------------------------------------------------------------------------
+
+    /// `GET /v1/volumes`.
+    pub(super) async fn list_volumes(&self) -> MicrosandboxResult<Vec<CloudVolume>> {
+        let url = format!("{}/v1/volumes", self.url);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes", e))?;
+        decode_json(resp, "GET /v1/volumes").await
+    }
+
+    /// `POST /v1/volumes`.
+    pub(super) async fn create_volume(
+        &self,
+        name: &str,
+        capacity_gib: Option<u32>,
+        labels: &[(String, String)],
+    ) -> MicrosandboxResult<CloudVolume> {
+        let labels: std::collections::BTreeMap<&str, &str> = labels
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let mut body = serde_json::json!({ "name": name, "labels": labels });
+        if let Some(gib) = capacity_gib {
+            body["capacity_gib"] = gib.into();
+        }
+        let url = format!("{}/v1/volumes", self.url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/volumes", e))?;
+        decode_json(resp, "POST /v1/volumes").await
+    }
+
+    /// `DELETE /v1/volumes/:id`.
+    pub(super) async fn delete_volume(&self, id: &str) -> MicrosandboxResult<CloudMessageResponse> {
+        let url = format!("{}/v1/volumes/{}", self.url, urlencoding(id));
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("DELETE /v1/volumes/:id", e))?;
+        decode_json(resp, "DELETE /v1/volumes/:id").await
+    }
+
+    /// Resolve a named volume. The cloud addresses volumes by id, so the SDK's
+    /// name-based calls list and match on the user-facing name.
+    pub(super) async fn find_volume(&self, name: &str) -> MicrosandboxResult<CloudVolume> {
+        let volumes = self.list_volumes().await?;
+        volumes
+            .into_iter()
+            .find(|volume| volume.name.as_deref() == Some(name))
+            .ok_or_else(|| MicrosandboxError::VolumeNotFound(name.to_string()))
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Methods: Agent relay
+    //--------------------------------------------------------------------------------------------------
+
+    /// WebSocket URL of the sandbox's agent route, derived from the backend's
+    /// HTTP endpoint (`http` → `ws`, `https` → `wss`).
+    fn agent_ws_url(&self, sandbox_id: &str) -> MicrosandboxResult<String> {
+        let ws_base = if let Some(rest) = self.url.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else if let Some(rest) = self.url.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cloud backend URL must start with http:// or https://: {}",
+                self.url
+            )));
+        };
+
+        let id = urlencoding(sandbox_id);
+        Ok(format!("{ws_base}/v1/sandboxes/{id}/agent"))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: HTTP helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Parse a JSON response into `T`, mapping HTTP errors to typed
+/// `MicrosandboxError` variants. Tries to decode msb-cloud's typed error body
+/// for richer messages on 4xx/5xx.
+async fn decode_json<T: serde::de::DeserializeOwned>(
+    resp: Response,
+    op: &str,
+) -> MicrosandboxResult<T> {
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json::<T>()
+            .await
+            .map_err(|e| MicrosandboxError::Custom(format!("{op}: failed to decode body: {e}")));
+    }
+    let body_text = resp.text().await.unwrap_or_default();
+    let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
+    Err(cloud_http_error(
+        status.as_u16(),
+        typed.as_ref(),
+        &body_text,
+        op,
+    ))
+}
+
+fn cloud_io_error(op: &str, e: reqwest::Error) -> MicrosandboxError {
+    tracing::debug!(operation = op, error = %e, "cloud backend transport error");
+    MicrosandboxError::Http(e)
+}
+
+fn cloud_http_error(
+    status: u16,
+    body: Option<&CloudErrorBody>,
+    raw_body: &str,
+    op: &str,
+) -> MicrosandboxError {
+    let code = cloud_error_code(body).map(ToOwned::to_owned);
+    let summary = cloud_error_message(body)
+        .or_else(|| (!raw_body.trim().is_empty()).then_some(raw_body.trim()))
+        .unwrap_or("no response body");
+    let message = format!("{op}: {summary}");
+
+    match code.as_deref() {
+        Some("sandbox_not_found") => return MicrosandboxError::SandboxNotFound(message),
+        Some("name_already_exists") => return MicrosandboxError::SandboxAlreadyExists(message),
+        Some("invalid_request") | Some("invalid_sandbox_config") => {
+            return MicrosandboxError::InvalidConfig(message);
+        }
+        Some("orchestrator_unreachable") | Some("nomad_job_failed") => {
+            return MicrosandboxError::Runtime(message);
+        }
+        _ => {}
+    }
+
+    match status {
+        400 | 422 => MicrosandboxError::InvalidConfig(message),
+        404 if op.contains("/v1/volumes") => MicrosandboxError::VolumeNotFound(message),
+        404 => MicrosandboxError::SandboxNotFound(message),
+        409 if op == "POST /v1/sandboxes" => MicrosandboxError::SandboxAlreadyExists(message),
+        409 if op == "POST /v1/volumes" => MicrosandboxError::VolumeAlreadyExists(message),
+        502 => MicrosandboxError::Runtime(message),
+        _ => MicrosandboxError::CloudHttp {
+            status,
+            code,
+            message,
+        },
     }
 }
 
@@ -644,10 +688,10 @@ fn cloud_log_sources(requested: &[LogSource]) -> MicrosandboxResult<Vec<String>>
             LogSource::Stdout => Ok("stdout".to_string()),
             LogSource::Stderr => Ok("stderr".to_string()),
             LogSource::System => Ok("system".to_string()),
-            LogSource::Output => Err(MicrosandboxError::Unsupported {
-                feature: "cloud log source 'output'".into(),
-                available_when: "when msb-cloud accepts the output log source".into(),
-            }),
+            LogSource::Output => Err(MicrosandboxError::unsupported(
+                "the 'output' log source",
+                "use stdout, stderr, or system",
+            )),
         })
         .collect()
 }
@@ -661,116 +705,6 @@ fn parse_cloud_log_source(source: &str) -> MicrosandboxResult<LogSource> {
         other => Err(MicrosandboxError::Custom(format!(
             "unknown cloud log source: {other}"
         ))),
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions: Exec
-//--------------------------------------------------------------------------------------------------
-
-async fn send_cloud_exec_message<S, T>(
-    writer: &mut S,
-    t: MessageType,
-    payload: &T,
-) -> MicrosandboxResult<()>
-where
-    S: futures::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-    T: serde::Serialize,
-{
-    let msg = Message::with_payload(t, CLOUD_EXEC_ID, payload)?;
-    let mut buf = Vec::new();
-    codec::encode_to_buf(&msg, &mut buf)?;
-    writer
-        .send(WsMessage::Binary(buf.into()))
-        .await
-        .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec websocket write: {e}")))
-}
-
-fn cloud_exec_ws_url(base: &str, sandbox_id: &str) -> MicrosandboxResult<String> {
-    let ws_base = if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else {
-        return Err(MicrosandboxError::InvalidConfig(format!(
-            "cloud backend URL must start with http:// or https://: {base}"
-        )));
-    };
-
-    Ok(format!(
-        "{}/v1/sandboxes/{}/exec.cbor",
-        ws_base,
-        urlencoding(sandbox_id)
-    ))
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions: HTTP helpers
-//--------------------------------------------------------------------------------------------------
-
-/// Parse a JSON response into `T`, mapping HTTP errors to typed
-/// `MicrosandboxError` variants. Tries to decode msb-cloud's typed error body
-/// for richer messages on 4xx/5xx.
-async fn decode_json<T: serde::de::DeserializeOwned>(
-    resp: Response,
-    op: &str,
-) -> MicrosandboxResult<T> {
-    let status = resp.status();
-    if status.is_success() {
-        return resp
-            .json::<T>()
-            .await
-            .map_err(|e| MicrosandboxError::Custom(format!("{op}: failed to decode body: {e}")));
-    }
-    let body_text = resp.text().await.unwrap_or_default();
-    let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
-    Err(cloud_http_error(
-        status.as_u16(),
-        typed.as_ref(),
-        &body_text,
-        op,
-    ))
-}
-
-fn cloud_io_error(op: &str, e: reqwest::Error) -> MicrosandboxError {
-    tracing::debug!(operation = op, error = %e, "cloud backend transport error");
-    MicrosandboxError::Http(e)
-}
-
-fn cloud_http_error(
-    status: u16,
-    body: Option<&CloudErrorBody>,
-    raw_body: &str,
-    op: &str,
-) -> MicrosandboxError {
-    let code = cloud_error_code(body).map(ToOwned::to_owned);
-    let summary = cloud_error_message(body)
-        .or_else(|| (!raw_body.trim().is_empty()).then_some(raw_body.trim()))
-        .unwrap_or("no response body");
-    let message = format!("{op}: {summary}");
-
-    match code.as_deref() {
-        Some("sandbox_not_found") => return MicrosandboxError::SandboxNotFound(message),
-        Some("name_already_exists") => return MicrosandboxError::SandboxAlreadyExists(message),
-        Some("invalid_request") | Some("invalid_sandbox_config") => {
-            return MicrosandboxError::InvalidConfig(message);
-        }
-        Some("orchestrator_unreachable") | Some("nomad_job_failed") => {
-            return MicrosandboxError::Runtime(message);
-        }
-        _ => {}
-    }
-
-    match status {
-        400 | 422 => MicrosandboxError::InvalidConfig(message),
-        404 => MicrosandboxError::SandboxNotFound(message),
-        409 if op == "POST /v1/sandboxes" => MicrosandboxError::SandboxAlreadyExists(message),
-        502 => MicrosandboxError::Runtime(message),
-        _ => MicrosandboxError::CloudHttp {
-            status,
-            code,
-            message,
-        },
     }
 }
 
@@ -919,6 +853,47 @@ impl Backend for CloudBackend {
     fn volumes(&self) -> &dyn VolumeBackend {
         self
     }
+
+    /// Open an agent connection over `GET /v1/sandboxes/:id/agent`.
+    ///
+    /// The route upgrades to a WebSocket that pipes bytes to and from the
+    /// sandbox's agent, so the standard agent client runs over it unchanged.
+    fn dial_agent<'a>(
+        &'a self,
+        name: &'a str,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'a, MicrosandboxResult<crate::agent::AgentClient>> {
+        Box::pin(async move {
+            let sandbox = self.get_sandbox(name).await?;
+            let url = self.agent_ws_url(&sandbox.id)?;
+            let mut request = url
+                .into_client_request()
+                .map_err(|e| MicrosandboxError::Runtime(format!("cloud agent request: {e}")))?;
+            let bearer = format!("Bearer {}", self.api_key);
+            let mut auth_value = WsHeaderValue::from_str(&bearer).map_err(|e| {
+                MicrosandboxError::InvalidConfig(format!("invalid API key header value: {e}"))
+            })?;
+            auth_value.set_sensitive(true);
+            request.headers_mut().insert(WS_AUTHORIZATION, auth_value);
+            request.headers_mut().insert(
+                WS_USER_AGENT,
+                WsHeaderValue::from_str(&default_user_agent()).map_err(|e| {
+                    MicrosandboxError::InvalidConfig(format!("invalid user-agent value: {e}"))
+                })?,
+            );
+
+            let (socket, _) = connect_async(request)
+                .await
+                .map_err(|e| MicrosandboxError::Runtime(format!("cloud agent websocket: {e}")))?;
+
+            crate::agent::AgentClient::connect_stream_with_timeout(
+                super::ws_io::WsByteStream::new(socket),
+                timeout,
+            )
+            .await
+            .map_err(Into::into)
+        })
+    }
 }
 
 impl Default for CloudBackendBuilder {
@@ -1029,20 +1004,24 @@ mod tests {
     }
 
     #[test]
-    fn cloud_exec_ws_url_maps_http_schemes() {
+    fn agent_ws_url_maps_http_schemes() {
+        let plain = CloudBackend::new("http://127.0.0.1:8080", "msb_test_abc").unwrap();
         assert_eq!(
-            cloud_exec_ws_url("http://127.0.0.1:8080", "sandbox id").unwrap(),
-            "ws://127.0.0.1:8080/v1/sandboxes/sandbox%20id/exec.cbor"
+            plain.agent_ws_url("sandbox id").unwrap(),
+            "ws://127.0.0.1:8080/v1/sandboxes/sandbox%20id/agent"
         );
+
+        let tls = CloudBackend::new("https://cloud.example.com", "msb_test_abc").unwrap();
         assert_eq!(
-            cloud_exec_ws_url("https://cloud.example.com", "abc").unwrap(),
-            "wss://cloud.example.com/v1/sandboxes/abc/exec.cbor"
+            tls.agent_ws_url("abc").unwrap(),
+            "wss://cloud.example.com/v1/sandboxes/abc/agent"
         );
     }
 
     #[test]
-    fn cloud_exec_ws_url_rejects_non_http_url() {
-        let err = cloud_exec_ws_url("file:///tmp/api", "abc").unwrap_err();
+    fn agent_ws_url_rejects_non_http_url() {
+        let backend = CloudBackend::new("file:///tmp/api", "msb_test_abc").unwrap();
+        let err = backend.agent_ws_url("abc").unwrap_err();
 
         assert!(matches!(err, MicrosandboxError::InvalidConfig(_)));
     }

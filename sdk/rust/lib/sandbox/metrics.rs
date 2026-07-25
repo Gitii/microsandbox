@@ -195,10 +195,9 @@ pub(crate) fn local_metrics_stream(
                     },
                     Err(err) => Err(err),
                 },
-                None => Err(MicrosandboxError::Unsupported {
-                    feature: "Sandbox::metrics_stream on cloud".into(),
-                    available_when: "when cloud metrics land".into(),
-                }),
+                None => Err(MicrosandboxError::not_yet_on_cloud(
+                    "Sandbox::metrics_stream",
+                )),
             };
             Some((item, (ticker, backend, name, config)))
         },
@@ -214,10 +213,7 @@ pub async fn all_sandbox_metrics() -> MicrosandboxResult<HashMap<String, Sandbox
     let backend = crate::backend::default_backend();
     let local = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "all_sandbox_metrics on cloud".into(),
-            available_when: "when cloud metrics land".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::not_yet_on_cloud(crate::api_path!()))?;
     all_sandbox_metrics_local(local).await
 }
 

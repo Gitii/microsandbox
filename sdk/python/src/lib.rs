@@ -163,10 +163,9 @@ fn default_backend_kind() -> &'static str {
 fn resolved_msb_path() -> PyResult<String> {
     let backend = microsandbox::backend::default_backend();
     let local = backend.as_local().ok_or_else(|| {
-        error::to_py_err(microsandbox::MicrosandboxError::Unsupported {
-            feature: "resolved_msb_path requires a local backend".into(),
-            available_when: "with a local backend".into(),
-        })
+        error::to_py_err(microsandbox::MicrosandboxError::local_only(
+            "resolved_msb_path",
+        ))
     })?;
     local
         .config()

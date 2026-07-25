@@ -185,10 +185,7 @@ impl Snapshot {
 /// Build an `Unsupported` error for snapshot ops that aren't wired through
 /// the cloud trait yet. Snapshots are local-only today.
 fn snapshots_require_local() -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: "Snapshot operations".into(),
-        available_when: "when cloud snapshots land".into(),
-    }
+    MicrosandboxError::not_yet_on_cloud("snapshot operations")
 }
 
 /// Lightweight handle backed by an index row.

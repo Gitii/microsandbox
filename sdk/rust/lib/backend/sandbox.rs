@@ -26,6 +26,7 @@ use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
 use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus};
 use crate::{MicrosandboxError, MicrosandboxResult};
+use microsandbox_image::RegistryAuth;
 use microsandbox_types::{
     CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudSandboxStatus,
 };
@@ -231,7 +232,11 @@ pub trait SandboxBackend: Send + Sync {
         config: &'a SandboxConfig,
         cmd: String,
         opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecOutput>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<ExecOutput>> {
+        Box::pin(async move {
+            crate::sandbox::exec::agent::exec(backend.as_ref(), name, config, cmd, opts).await
+        })
+    }
 
     /// Execute a command and return a streaming [`ExecHandle`].
     fn exec_stream<'a>(
@@ -241,12 +246,17 @@ pub trait SandboxBackend: Send + Sync {
         config: &'a SandboxConfig,
         cmd: String,
         opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>> {
+        Box::pin(async move {
+            crate::sandbox::exec::agent::exec_stream(backend.as_ref(), name, config, cmd, opts)
+                .await
+        })
+    }
 
     /// Attach the host terminal to a PTY session in the named sandbox.
     ///
     /// Returns the exit code. Local routes through libkrun + agentd; cloud
-    /// returns [`MicrosandboxError::Unsupported`] until cloud attach lands.
+    /// routes the same session over the sandbox's agent WebSocket route.
     fn attach<'a>(
         &'a self,
         backend: Arc<dyn Backend>,
@@ -254,7 +264,11 @@ pub trait SandboxBackend: Send + Sync {
         config: &'a SandboxConfig,
         cmd: String,
         opts: crate::sandbox::AttachOptionsBuilder,
-    ) -> BoxFuture<'a, MicrosandboxResult<i32>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<i32>> {
+        Box::pin(async move {
+            crate::sandbox::attach::agent::attach(backend.as_ref(), name, config, cmd, opts).await
+        })
+    }
 
     // ============================================================
     // Logs / metrics
@@ -304,7 +318,9 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Bytes>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
+        Box::pin(async move { crate::sandbox::fs::agent::read(backend.as_ref(), name, path).await })
+    }
 
     /// Stream a guest file. Returns a [`FsReadStream`] yielding chunks.
     fn fs_read_stream<'a>(
@@ -312,7 +328,11 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::read_stream(backend.as_ref(), name, path).await
+        })
+    }
 
     /// Write `data` to a guest file (overwriting if it exists).
     fn fs_write<'a>(
@@ -321,7 +341,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         path: &'a str,
         data: Vec<u8>,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::write(backend.as_ref(), name, path, data).await
+        })
+    }
 
     /// Open a streaming writer for a guest file.
     fn fs_write_stream<'a>(
@@ -329,7 +353,11 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsWriteSink>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<FsWriteSink>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::write_stream(backend.as_ref(), name, path).await
+        })
+    }
 
     /// List immediate children of a guest directory.
     fn fs_list<'a>(
@@ -337,7 +365,9 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
+        Box::pin(async move { crate::sandbox::fs::agent::list(backend.as_ref(), name, path).await })
+    }
 
     /// Get file/directory metadata.
     fn fs_stat<'a>(
@@ -345,7 +375,9 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
+        Box::pin(async move { crate::sandbox::fs::agent::stat(backend.as_ref(), name, path).await })
+    }
 
     /// Create a directory (and parents).
     fn fs_mkdir<'a>(
@@ -353,7 +385,11 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(
+            async move { crate::sandbox::fs::agent::mkdir(backend.as_ref(), name, path).await },
+        )
+    }
 
     /// Remove a file or (when `recursive`) directory.
     fn fs_remove<'a>(
@@ -362,7 +398,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         path: &'a str,
         recursive: bool,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::remove(backend.as_ref(), name, path, recursive).await
+        })
+    }
 
     /// Copy a guest file from `from` to `to`.
     fn fs_copy<'a>(
@@ -371,7 +411,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         from: &'a str,
         to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(
+            async move { crate::sandbox::fs::agent::copy(backend.as_ref(), name, from, to).await },
+        )
+    }
 
     /// Rename/move a guest file or directory.
     fn fs_rename<'a>(
@@ -380,7 +424,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         from: &'a str,
         to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::rename(backend.as_ref(), name, from, to).await
+        })
+    }
 
     /// Check whether a guest path exists.
     fn fs_exists<'a>(
@@ -388,7 +436,11 @@ pub trait SandboxBackend: Send + Sync {
         backend: Arc<dyn Backend>,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<bool>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
+        Box::pin(
+            async move { crate::sandbox::fs::agent::exists(backend.as_ref(), name, path).await },
+        )
+    }
 
     /// Copy a host file into the guest sandbox.
     fn fs_copy_from_host<'a>(
@@ -397,7 +449,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         host: &'a Path,
         guest: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::copy_from_host(backend.as_ref(), name, host, guest).await
+        })
+    }
 
     /// Copy a guest file out to the host.
     fn fs_copy_to_host<'a>(
@@ -406,7 +462,11 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         guest: &'a str,
         host: &'a Path,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::copy_to_host(backend.as_ref(), name, guest, host).await
+        })
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -421,6 +481,7 @@ impl SandboxBackend for LocalBackend {
         _start: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
+            self.warn_cloud_only(&config);
             // Local backend always boots immediately — `start` only differs
             // for cloud where create-without-start is a distinct state.
             crate::sandbox::create_local(backend, config, SpawnMode::Attached, None).await
@@ -433,6 +494,7 @@ impl SandboxBackend for LocalBackend {
         config: SandboxConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
+            self.warn_cloud_only(&config);
             crate::sandbox::create_local(backend, config, SpawnMode::Detached, None).await
         })
     }
@@ -519,45 +581,6 @@ impl SandboxBackend for LocalBackend {
         Box::pin(async move { crate::sandbox::drain_local(backend, name).await })
     }
 
-    fn exec<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        config: &'a SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecOutput>> {
-        Box::pin(
-            async move { crate::sandbox::exec::local::exec(self, name, config, cmd, opts).await },
-        )
-    }
-
-    fn exec_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        config: &'a SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>> {
-        Box::pin(async move {
-            crate::sandbox::exec::local::exec_stream(self, name, config, cmd, opts).await
-        })
-    }
-
-    fn attach<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        config: &'a SandboxConfig,
-        cmd: String,
-        opts: crate::sandbox::AttachOptionsBuilder,
-    ) -> BoxFuture<'a, MicrosandboxResult<i32>> {
-        Box::pin(async move {
-            crate::sandbox::attach::local::attach(self, name, config, cmd, opts).await
-        })
-    }
-
     fn logs<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
@@ -597,135 +620,6 @@ impl SandboxBackend for LocalBackend {
     ) -> MetricsStream {
         crate::sandbox::metrics::local_metrics_stream(backend, name, config, interval)
     }
-
-    fn fs_read<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { crate::sandbox::fs::local::read(self, name, path).await })
-    }
-
-    fn fs_read_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>> {
-        Box::pin(async move { crate::sandbox::fs::local::read_stream(self, name, path).await })
-    }
-
-    fn fs_write<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-        data: Vec<u8>,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::fs::local::write(self, name, path, data).await })
-    }
-
-    fn fs_write_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsWriteSink>> {
-        Box::pin(async move { crate::sandbox::fs::local::write_stream(self, name, path).await })
-    }
-
-    fn fs_list<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { crate::sandbox::fs::local::list(self, name, path).await })
-    }
-
-    fn fs_stat<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { crate::sandbox::fs::local::stat(self, name, path).await })
-    }
-
-    fn fs_mkdir<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::fs::local::mkdir(self, name, path).await })
-    }
-
-    fn fs_remove<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-        recursive: bool,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(
-            async move { crate::sandbox::fs::local::remove(self, name, path, recursive).await },
-        )
-    }
-
-    fn fs_copy<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        from: &'a str,
-        to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::fs::local::copy(self, name, from, to).await })
-    }
-
-    fn fs_rename<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        from: &'a str,
-        to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::fs::local::rename(self, name, from, to).await })
-    }
-
-    fn fs_exists<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { crate::sandbox::fs::local::exists(self, name, path).await })
-    }
-
-    fn fs_copy_from_host<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        host: &'a Path,
-        guest: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(
-            async move { crate::sandbox::fs::local::copy_from_host(self, name, host, guest).await },
-        )
-    }
-
-    fn fs_copy_to_host<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        guest: &'a str,
-        host: &'a Path,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(
-            async move { crate::sandbox::fs::local::copy_to_host(self, name, guest, host).await },
-        )
-    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -740,7 +634,7 @@ impl SandboxBackend for CloudBackend {
         start: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
-            let req = cloud_create_request_from_config(config.clone())?;
+            let req = CloudCreateBody::try_from(config.clone())?;
             let cloud = CloudBackend::create_sandbox(self, &req, start).await?;
             Ok(Sandbox::from_cloud(backend, cloud, config))
         })
@@ -754,7 +648,7 @@ impl SandboxBackend for CloudBackend {
         // Cloud has no notion of "detached" — the sandbox lifecycle is owned
         // by msb-cloud, not by this process. Reuse the eager-start path.
         Box::pin(async move {
-            let req = cloud_create_request_from_config(config.clone())?;
+            let req = CloudCreateBody::try_from(config.clone())?;
             let cloud = CloudBackend::create_sandbox(self, &req, true).await?;
             Ok(Sandbox::from_cloud(backend, cloud, config))
         })
@@ -845,9 +739,9 @@ impl SandboxBackend for CloudBackend {
         _name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
-            Err(unsupported(
-                "cloud sandbox kill",
-                "when cloud forced-stop lands",
+            Err(MicrosandboxError::unsupported(
+                "Sandbox::kill",
+                "use stop()",
             ))
         })
     }
@@ -858,44 +752,11 @@ impl SandboxBackend for CloudBackend {
         _name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
-            Err(unsupported(
-                "cloud sandbox drain",
-                "when cloud graceful-drain lands",
+            Err(MicrosandboxError::unsupported(
+                "Sandbox::drain",
+                "use stop()",
             ))
         })
-    }
-
-    fn exec<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        name: &'a str,
-        config: &'a SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecOutput>> {
-        Box::pin(async move { CloudBackend::exec(self, name, config, cmd, opts).await })
-    }
-
-    fn exec_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _config: &'a SandboxConfig,
-        _cmd: String,
-        _opts: ExecOptions,
-    ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>> {
-        Box::pin(async move { Err(unsupported_exec("Sandbox::exec_stream")) })
-    }
-
-    fn attach<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _config: &'a SandboxConfig,
-        _cmd: String,
-        _opts: crate::sandbox::AttachOptionsBuilder,
-    ) -> BoxFuture<'a, MicrosandboxResult<i32>> {
-        Box::pin(async move { Err(unsupported_exec("Sandbox::attach")) })
     }
 
     fn logs<'a>(
@@ -922,7 +783,7 @@ impl SandboxBackend for CloudBackend {
         _name: &'a str,
         _config: &'a SandboxConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxMetrics>> {
-        Box::pin(async move { Err(unsupported_metrics("Sandbox::metrics")) })
+        Box::pin(async move { Err(MicrosandboxError::not_yet_on_cloud("Sandbox::metrics")) })
     }
 
     fn metrics_stream(
@@ -933,131 +794,10 @@ impl SandboxBackend for CloudBackend {
         _interval: Duration,
     ) -> MetricsStream {
         Box::pin(futures::stream::once(async {
-            Err(unsupported_metrics("Sandbox::metrics_stream"))
+            Err(MicrosandboxError::not_yet_on_cloud(
+                "Sandbox::metrics_stream",
+            ))
         }))
-    }
-
-    fn fs_read<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::read")) })
-    }
-
-    fn fs_read_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::read_stream")) })
-    }
-
-    fn fs_write<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-        _data: Vec<u8>,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::write")) })
-    }
-
-    fn fs_write_stream<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsWriteSink>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::write_stream")) })
-    }
-
-    fn fs_list<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::list")) })
-    }
-
-    fn fs_stat<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::stat")) })
-    }
-
-    fn fs_mkdir<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::mkdir")) })
-    }
-
-    fn fs_remove<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-        _recursive: bool,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::remove")) })
-    }
-
-    fn fs_copy<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::copy")) })
-    }
-
-    fn fs_rename<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::rename")) })
-    }
-
-    fn fs_exists<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::exists")) })
-    }
-
-    fn fs_copy_from_host<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _host: &'a Path,
-        _guest: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::copy_from_host")) })
-    }
-
-    fn fs_copy_to_host<'a>(
-        &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _guest: &'a str,
-        _host: &'a Path,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFsOps::copy_to_host")) })
     }
 }
 
@@ -1102,136 +842,133 @@ fn sandbox_config_from_cloud(
     })
 }
 
-pub(super) fn cloud_create_request_from_config(
-    config: SandboxConfig,
-) -> MicrosandboxResult<CloudCreateSandboxRequest> {
-    reject_cloud_deferred(
-        !config.spec.mounts.is_empty(),
-        "mounts",
-        "when cloud volumes ship",
-    )?;
-    reject_cloud_deferred(
-        !config.spec.patches.is_empty(),
-        "patches",
-        "when cloud volumes ship",
-    )?;
-    reject_cloud_deferred(
-        !config.spec.rlimits.is_empty(),
-        "rlimits",
-        "when rlimits land on the cloud API",
-    )?;
-    reject_cloud_deferred(
-        config.spec.runtime.cmd.is_some(),
-        "cmd",
-        "when cmd lands on the cloud API",
-    )?;
-    reject_cloud_deferred(
-        config.replace_existing,
-        ".replace()",
-        "when cloud sandbox replace semantics land",
-    )?;
-    reject_cloud_deferred(
-        config.spec.init.is_some(),
-        "init",
-        "when cloud init wrapper lands",
-    )?;
-    reject_cloud_deferred(
-        config.spec.pull_policy != crate::sandbox::PullPolicy::IfMissing,
-        "pull_policy",
-        "when cloud pull policy lands",
-    )?;
-    reject_cloud_deferred(
-        config.registry_auth.is_some(),
-        "registry_auth",
-        "when cloud registry auth lands",
-    )?;
-    reject_cloud_deferred(
-        config.insecure,
-        "insecure registries",
-        "when cloud insecure-registry support lands",
-    )?;
-    reject_cloud_deferred(
-        !config.ca_certs.is_empty(),
-        "ca_certs",
-        "when cloud custom CA certs land",
-    )?;
-    #[cfg(feature = "net")]
-    {
-        // Only flag user-set opt-in fields. The default `NetworkConfig`
-        // ships with a baseline policy (`public_only`) and built-in DNS
-        // settings, so comparing those would always trigger; instead we
-        // catch the explicit-add fields (ports, secrets, custom DNS
-        // resolvers, host-CA trust).
-        let net = config.local_network_config()?;
-        let has_custom_network = !net.ports.is_empty()
-            || !net.secrets.entries.is_empty()
-            || !net.dns.nameservers.is_empty()
-            || net.trust_host_cas;
+/// Wire body for the cloud's create route: the shared create envelope with
+/// the cloud-only fields that ride beside it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(super) struct CloudCreateBody {
+    /// The shared sandbox spec, flattened onto the body.
+    #[serde(flatten)]
+    pub envelope: CloudCreateSandboxRequest,
+    /// Requested globally-unique slug; the cloud assigns one when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// Registry-credential selection for the image pull, derived from the
+    /// config's [`RegistryAuth`]. Omitted (`None`) lets the cloud pick the
+    /// stored credential configured for the image's registry host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<CloudRegistrySelection>,
+}
+
+/// Wire shape of the cloud's registry-credential selection.
+///
+/// `auto` is expressed by omitting the field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(super) enum CloudRegistrySelection {
+    /// Pull anonymously, even when a stored credential matches the registry.
+    Anonymous,
+    /// Credentials for this sandbox's image pull only; the cloud applies them
+    /// to the registry host derived from the image reference and never stores
+    /// them with the org's registry credentials.
+    Inline {
+        /// Registry username.
+        username: String,
+        /// Registry password or access token.
+        password: String,
+    },
+}
+
+impl TryFrom<SandboxConfig> for CloudCreateBody {
+    type Error = MicrosandboxError;
+
+    /// Build the cloud create body from an SDK config, rejecting the
+    /// create-time options the cloud does not accept.
+    fn try_from(config: SandboxConfig) -> MicrosandboxResult<Self> {
         reject_cloud_deferred(
-            has_custom_network,
-            "network policy / ports / secrets",
-            "when cloud networking ships",
+            config.replace_existing,
+            "SandboxBuilder::replace",
+            "remove the existing sandbox first",
         )?;
-    }
-
-    // Cloud only supports OCI rootfs; reject the local-only rootfs kinds before
-    // handing the spec to the control plane. Borrow so the spec isn't moved.
-    match &config.spec.image {
-        RootfsSource::Oci(_) => {}
-        RootfsSource::Bind(_) => {
-            return Err(unsupported(
-                "image-from-host-dir",
-                "when cloud volumes ship",
-            ));
+        reject_cloud_deferred(
+            config.insecure,
+            "insecure registries",
+            "cloud registries are HTTPS-only",
+        )?;
+        reject_cloud_deferred(
+            !config.ca_certs.is_empty(),
+            "ca_certs",
+            "not yet available on cloud",
+        )?;
+        #[cfg(feature = "net")]
+        {
+            // Only flag user-set opt-in fields the cloud's create contract does
+            // not accept (published ports, custom DNS resolvers, host-CA trust).
+            // Policy and secrets ride in the request's network section, and the
+            // default `NetworkConfig` ships with a baseline policy plus built-in
+            // DNS settings, so comparing those would always trigger.
+            let net = config.local_network_config()?;
+            let has_custom_network =
+                !net.ports.is_empty() || !net.dns.nameservers.is_empty() || net.trust_host_cas;
+            reject_cloud_deferred(
+                has_custom_network,
+                "network ports / custom DNS / host-CA trust",
+                "not configurable on cloud",
+            )?;
         }
-        RootfsSource::DiskImage { .. } => {
-            return Err(unsupported("disk-image rootfs", "never on cloud"));
-        }
-    }
 
-    // The cloud request composes the shared spec verbatim plus cloud-only fields.
-    // The SDK has no local source for `slug`/`registry` today (registry auth is
-    // rejected above), so default them; the control plane assigns a slug.
-    Ok(CloudCreateSandboxRequest::from(config.spec))
+        // Cloud only supports OCI rootfs; reject the local-only rootfs kinds before
+        // handing the spec to the control plane. Borrow so the spec isn't moved.
+        match &config.spec.image {
+            RootfsSource::Oci(_) => {}
+            RootfsSource::Bind(_) => {
+                return Err(MicrosandboxError::unsupported(
+                    "host-directory rootfs",
+                    "use an OCI image on cloud",
+                ));
+            }
+            RootfsSource::DiskImage { .. } => {
+                return Err(MicrosandboxError::unsupported(
+                    "disk-image rootfs",
+                    "disk-image rootfs is local-only",
+                ));
+            }
+        }
+
+        // registry_auth converts into the cloud's credential selection: absent
+        // means the cloud picks the stored credential configured for the
+        // image's registry host (mirroring the local fallback to configured
+        // registries), Anonymous forces an unauthenticated pull, and Basic
+        // credentials ride as sandbox-scoped inline credentials.
+        let registry = match &config.registry_auth {
+            None => None,
+            Some(RegistryAuth::Anonymous) => Some(CloudRegistrySelection::Anonymous),
+            Some(RegistryAuth::Basic { username, password }) => {
+                Some(CloudRegistrySelection::Inline {
+                    username: username.clone(),
+                    password: password.clone(),
+                })
+            }
+        };
+
+        // The cloud request composes the shared spec verbatim plus the cloud-only
+        // fields that have no place in it (slug, registry-credential selection).
+        Ok(Self {
+            slug: config.slug,
+            registry,
+            envelope: CloudCreateSandboxRequest::from(config.spec),
+        })
+    }
 }
 
 fn reject_cloud_deferred(
     present: bool,
     feature: &'static str,
-    available_when: &'static str,
+    hint: &'static str,
 ) -> MicrosandboxResult<()> {
     if present {
-        return Err(unsupported(feature, available_when));
+        return Err(MicrosandboxError::unsupported(feature, hint));
     }
     Ok(())
-}
-
-fn unsupported(feature: &'static str, available_when: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: available_when.into(),
-    }
-}
-
-fn unsupported_exec(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud exec lands".into(),
-    }
-}
-
-fn unsupported_fs(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud guest fs lands".into(),
-    }
-}
-
-fn unsupported_metrics(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud metrics land".into(),
-    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1259,22 +996,50 @@ mod tests {
             .await
             .unwrap();
 
-        let req = cloud_create_request_from_config(config).unwrap();
+        let req = CloudCreateBody::try_from(config).unwrap();
 
-        // The request now carries the cloud wire spec, so assert on `spec`.
-        assert_eq!(req.spec.name, "agent-1");
+        // The request carries the cloud wire spec, so assert on `envelope.spec`.
+        let spec = &req.envelope.spec;
+        assert_eq!(spec.name, "agent-1");
         assert!(
-            matches!(req.spec.image, microsandbox_types::CloudRootfsSource::Oci { ref reference } if reference == "python:3.12")
+            matches!(spec.image, microsandbox_types::CloudRootfsSource::Oci { ref reference } if reference == "python:3.12")
         );
-        assert_eq!(req.spec.resources.vcpus, 2);
-        assert_eq!(req.spec.resources.memory_mib, 1024);
-        assert_eq!(req.spec.env, vec![EnvVar::new("A", "B")]);
-        assert_eq!(req.spec.runtime.workdir.as_deref(), Some("/app"));
-        assert_eq!(req.spec.runtime.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(spec.resources.vcpus, 2);
+        assert_eq!(spec.resources.memory_mib, 1024);
+        assert_eq!(spec.env, vec![EnvVar::new("A", "B")]);
+        assert_eq!(spec.runtime.workdir.as_deref(), Some("/app"));
+        assert_eq!(spec.runtime.shell.as_deref(), Some("/bin/bash"));
         assert_eq!(
-            req.spec.runtime.entrypoint,
+            spec.runtime.entrypoint,
             Some(vec!["python".to_string(), "-u".to_string()])
         );
+        assert_eq!(req.slug, None);
+        assert_eq!(req.registry, None);
+    }
+
+    #[test]
+    fn cloud_create_body_serializes_slug_and_registry_beside_spec() {
+        let mut config = base_cloud_config();
+        config.slug = Some("brave-otter".into());
+        config.registry_auth = Some(microsandbox_image::RegistryAuth::Anonymous);
+
+        let req = CloudCreateBody::try_from(config).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+
+        // The envelope flattens onto the body; slug/registry ride beside it.
+        // An anonymous registry_auth converts to the anonymous selection.
+        assert_eq!(json["name"], "agent-1");
+        assert_eq!(json["slug"], "brave-otter");
+        assert_eq!(json["registry"]["mode"], "anonymous");
+    }
+
+    #[test]
+    fn cloud_create_body_omits_unset_slug_and_registry() {
+        let req = CloudCreateBody::try_from(base_cloud_config()).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert!(json.get("slug").is_none());
+        assert!(json.get("registry").is_none());
     }
 
     #[tokio::test]
@@ -1292,7 +1057,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = cloud_create_request_from_config(config).unwrap_err();
+        let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 
@@ -1317,46 +1082,67 @@ mod tests {
     fn cloud_create_request_rejects_replace_existing() {
         let mut config = base_cloud_config();
         config.replace_existing = true;
-        let err = cloud_create_request_from_config(config).unwrap_err();
+        let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 
     #[test]
-    fn cloud_create_request_rejects_init() {
+    fn cloud_create_request_maps_previously_deferred_spec_fields() {
+        // These spec fields ride in the create body now; assert they map
+        // instead of erroring.
         let mut config = base_cloud_config();
         config.spec.init = Some(crate::sandbox::HandoffInit {
             cmd: "/sbin/init".into(),
             args: Vec::new(),
             env: Vec::new(),
         });
-        let err = cloud_create_request_from_config(config).unwrap_err();
-        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
-    }
-
-    #[test]
-    fn cloud_create_request_rejects_non_default_pull_policy() {
-        let mut config = base_cloud_config();
         config.spec.pull_policy = crate::sandbox::PullPolicy::Always;
-        let err = cloud_create_request_from_config(config).unwrap_err();
-        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+        config.spec.runtime.cmd = Some(vec!["python".into(), "app.py".into()]);
+        config.spec.rlimits.push(crate::sandbox::exec::Rlimit {
+            resource: crate::sandbox::exec::RlimitResource::Nofile,
+            soft: 1024,
+            hard: 2048,
+        });
+        if let RootfsSource::Oci(oci) = &mut config.spec.image {
+            oci.upper_size_mib = Some(8192);
+        }
+
+        let req = CloudCreateBody::try_from(config).unwrap();
+
+        let spec = &req.envelope.spec;
+        assert!(spec.init.is_some());
+        assert_eq!(spec.pull_policy, crate::sandbox::PullPolicy::Always);
+        assert_eq!(
+            spec.runtime.cmd,
+            Some(vec!["python".to_string(), "app.py".to_string()])
+        );
+        assert_eq!(spec.rlimits.len(), 1);
+        assert_eq!(spec.resources.disk_size_mib, Some(8192));
     }
 
     #[test]
-    fn cloud_create_request_rejects_registry_auth() {
+    fn cloud_create_body_maps_basic_registry_auth_to_inline() {
         let mut config = base_cloud_config();
         config.registry_auth = Some(microsandbox_image::RegistryAuth::Basic {
             username: "u".into(),
             password: "p".into(),
         });
-        let err = cloud_create_request_from_config(config).unwrap_err();
-        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+        let req = CloudCreateBody::try_from(config).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["registry"]["mode"], "inline");
+        assert_eq!(json["registry"]["username"], "u");
+        assert_eq!(json["registry"]["password"], "p");
+        // The credentials ride only in the registry section of the body.
+        let body = serde_json::to_string(&json).unwrap();
+        assert_eq!(body.matches("\"p\"").count(), 1);
     }
 
     #[test]
     fn cloud_create_request_rejects_insecure() {
         let mut config = base_cloud_config();
         config.insecure = true;
-        let err = cloud_create_request_from_config(config).unwrap_err();
+        let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 
@@ -1366,7 +1152,7 @@ mod tests {
         config
             .ca_certs
             .push(b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----".to_vec());
-        let err = cloud_create_request_from_config(config).unwrap_err();
+        let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 
@@ -1384,7 +1170,7 @@ mod tests {
                 protocol: microsandbox_types::PortProtocol::Tcp,
                 host_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).to_string(),
             });
-        let err = cloud_create_request_from_config(config).unwrap_err();
+        let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 

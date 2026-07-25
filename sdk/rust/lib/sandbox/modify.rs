@@ -541,10 +541,10 @@ async fn control_capabilities(
 async fn control_capabilities(
     _name: &str,
 ) -> MicrosandboxResult<microsandbox_runtime::control::ControlCapabilities> {
-    Err(crate::MicrosandboxError::Unsupported {
-        feature: "live sandbox control".into(),
-        available_when: "on unix hosts".into(),
-    })
+    Err(crate::MicrosandboxError::unsupported(
+        "live sandbox control",
+        "unix hosts only",
+    ))
 }
 
 /// Send one control request line and parse the reply.
@@ -606,10 +606,10 @@ async fn control_secrets_update(
     _name: &str,
     _changes: Vec<microsandbox_runtime::control::SecretLiveChange>,
 ) -> MicrosandboxResult<()> {
-    Err(crate::MicrosandboxError::Unsupported {
-        feature: "live secret reconfiguration".into(),
-        available_when: "on unix hosts".into(),
-    })
+    Err(crate::MicrosandboxError::unsupported(
+        "live secret reconfiguration",
+        "unix hosts only",
+    ))
 }
 
 /// Ask the sandbox process to converge on `total_mib` of usable guest memory.
@@ -650,10 +650,10 @@ async fn control_memory_target(
     _name: &str,
     _total_mib: u64,
 ) -> MicrosandboxResult<microsandbox_runtime::control::MemoryControlState> {
-    Err(crate::MicrosandboxError::Unsupported {
-        feature: "live memory resize".into(),
-        available_when: "on unix hosts".into(),
-    })
+    Err(crate::MicrosandboxError::unsupported(
+        "live memory resize",
+        "unix hosts only",
+    ))
 }
 
 #[cfg(not(unix))]
@@ -661,10 +661,10 @@ pub(crate) async fn control_cpu_target(
     _name: &str,
     _online: u32,
 ) -> MicrosandboxResult<microsandbox_runtime::control::CpuControlState> {
-    Err(crate::MicrosandboxError::Unsupported {
-        feature: "live CPU resize".into(),
-        available_when: "on unix hosts".into(),
-    })
+    Err(crate::MicrosandboxError::unsupported(
+        "live CPU resize",
+        "unix hosts only",
+    ))
 }
 fn validate_apply_supported(plan: &SandboxModificationPlan) -> MicrosandboxResult<()> {
     if let Some(conflict) = plan.conflicts.first() {
@@ -818,10 +818,10 @@ fn apply_secret_patch_to_config(
     if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
         return Ok(());
     }
-    Err(crate::MicrosandboxError::Unsupported {
-        feature: "secret modification".into(),
-        available_when: "in builds with the net feature".into(),
-    })
+    Err(crate::MicrosandboxError::unsupported(
+        "secret modification",
+        "enable the net feature",
+    ))
 }
 
 /// Secret material carried by one spec: a raw value or a source reference.
@@ -1039,17 +1039,10 @@ async fn persist_config(
 ) -> MicrosandboxResult<()> {
     let local = handle
         .local()
-        .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-            feature: "modify apply on cloud".into(),
-            available_when: "when cloud modify lands".into(),
-        })?;
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "modify apply on cloud".into(),
-                available_when: "when cloud modify lands".into(),
-            })?;
+        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
 
     let config_json = serde_json::to_string(config)?;
     sandbox_entity::ActiveModel {
@@ -1071,17 +1064,10 @@ async fn persist_active_config(
 ) -> MicrosandboxResult<()> {
     let local = handle
         .local()
-        .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-            feature: "modify apply on cloud".into(),
-            available_when: "when cloud modify lands".into(),
-        })?;
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "modify apply on cloud".into(),
-                available_when: "when cloud modify lands".into(),
-            })?;
+        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| crate::MicrosandboxError::not_yet_on_cloud("sandbox modification"))?;
 
     let active_json = serde_json::to_string(active)?;
     sandbox_entity::ActiveModel {
