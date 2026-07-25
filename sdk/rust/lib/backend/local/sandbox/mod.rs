@@ -1,9 +1,11 @@
 //! Local sandbox lifecycle: the [`SandboxBackend`] impl for [`LocalBackend`]
 //! plus the inherent lifecycle and runtime-state helpers it dispatches to.
 //!
-//! The local create flow (image pull, rootfs preparation, record insertion,
-//! process spawn) still lives in [`crate::sandbox`]; the trait impl's
-//! `create`/`create_detached` delegate there.
+//! The create flow (image pull, rootfs preparation, record insertion,
+//! process spawn) lives in the `create` submodule as further inherent
+//! methods; [`LocalBackend::create_sandbox`] is its entry point.
+
+mod create;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,9 +34,8 @@ use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::SpawnMode;
 use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{
-    RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus, create_inner_local,
-    load_sandbox_record, validate_env, validate_hostname, validate_labels, validate_rootfs_source,
-    validate_sandbox_name_for_runtime_with_backend, validate_volume_mounts,
+    RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus, load_sandbox_record,
+    validate_env, validate_hostname, validate_labels, validate_volume_mounts,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -82,16 +83,16 @@ impl LocalBackend {
 
         let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
         config.apply_runtime_defaults();
-        validate_sandbox_name_for_runtime_with_backend(self, &config.spec.name)?;
+        self.validate_sandbox_name_for_runtime(&config.spec.name)?;
         validate_hostname(config.spec.runtime.hostname.as_deref())?;
-        validate_rootfs_source(&config.spec.image)?;
+        Self::validate_rootfs_source(&config.spec.image)?;
         validate_env(&config.spec.env)?;
         validate_labels(&config.spec.labels)?;
         validate_volume_mounts(&config.spec.mounts)?;
         self.validate_start_state(&config, &self.sandboxes_dir().join(name))?;
         Self::update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
 
-        match create_inner_local(self, config, model.id, mode).await {
+        match self.create_sandbox_inner(config, model.id, mode).await {
             Ok((local_state, returned_config)) => {
                 let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
                 if let Err(err) = Self::update_sandbox_active_config(
@@ -362,7 +363,7 @@ impl LocalBackend {
 
     /// Reconcile a Running/Draining row against the owning process's
     /// liveness, marking it terminal when the runtime is gone.
-    pub(crate) async fn reconcile_sandbox_runtime_state(
+    async fn reconcile_sandbox_runtime_state(
         pools: &DbPools,
         sandbox: sandbox_entity::Model,
     ) -> MicrosandboxResult<sandbox_entity::Model> {
@@ -535,7 +536,7 @@ impl LocalBackend {
     }
 
     /// Update the sandbox status in the database.
-    pub(crate) async fn update_sandbox_status(
+    async fn update_sandbox_status(
         db: &DbWriteConnection,
         sandbox_id: i32,
         status: SandboxStatus,
@@ -563,7 +564,7 @@ impl LocalBackend {
     }
 
     /// Persist the config used by the active VM for a running sandbox.
-    pub(crate) async fn update_sandbox_active_config(
+    async fn update_sandbox_active_config(
         db: &DbWriteConnection,
         sandbox_id: i32,
         config: &SandboxConfig,
@@ -616,7 +617,7 @@ impl LocalBackend {
     }
 
     /// Whether `pid` refers to a live process.
-    pub(crate) fn pid_is_alive(pid: i32) -> bool {
+    fn pid_is_alive(pid: i32) -> bool {
         microsandbox_utils::process::pid_is_alive(pid)
     }
 
@@ -640,7 +641,7 @@ impl LocalBackend {
 
     /// Request graceful termination (SIGTERM).
     #[cfg(unix)]
-    pub(crate) fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
+    fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGTERM,
@@ -650,13 +651,13 @@ impl LocalBackend {
 
     /// Request termination (Windows has no graceful signal equivalent).
     #[cfg(windows)]
-    pub(crate) fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
+    fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
         Self::terminate_pid(pid)
     }
 
     /// Force-kill a process (SIGKILL).
     #[cfg(unix)]
-    pub(crate) fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
+    fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGKILL,
@@ -666,7 +667,7 @@ impl LocalBackend {
 
     /// Force-kill a process.
     #[cfg(windows)]
-    pub(crate) fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
+    fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
         Self::terminate_pid(pid)
     }
 
@@ -718,7 +719,8 @@ impl SandboxBackend for LocalBackend {
             self.warn_cloud_only(&config);
             // Local backend always boots immediately — `start` only differs
             // for cloud where create-without-start is a distinct state.
-            crate::sandbox::create_local(backend, config, SpawnMode::Attached, None).await
+            self.create_sandbox(backend, config, SpawnMode::Attached, None)
+                .await
         })
     }
 
@@ -729,7 +731,8 @@ impl SandboxBackend for LocalBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
             self.warn_cloud_only(&config);
-            crate::sandbox::create_local(backend, config, SpawnMode::Detached, None).await
+            self.create_sandbox(backend, config, SpawnMode::Detached, None)
+                .await
         })
     }
 
@@ -872,9 +875,7 @@ mod tests {
 
     use super::sandbox_entity;
     use crate::backend::LocalBackend;
-    use crate::sandbox::{
-        OciRootfsSource, RootfsSource, SandboxConfig, SandboxStatus, insert_sandbox_record,
-    };
+    use crate::sandbox::{OciRootfsSource, RootfsSource, SandboxConfig, SandboxStatus};
 
     /// Open both pools at `db_path` for tests, with migrations applied.
     async fn open_test_pools(db_path: &std::path::Path) -> DbPools {
@@ -929,7 +930,7 @@ mod tests {
         let pools = open_test_pools(&db_path).await;
 
         let config = test_config("stale");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config).await.unwrap();
         let dead_run_pid = dead_pid();
 
         let run = run_entity::ActiveModel {
@@ -974,7 +975,7 @@ mod tests {
         let pools = open_test_pools(&db_path).await;
 
         let config = test_config("draining-stale");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config).await.unwrap();
         LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
             .await
             .unwrap();
@@ -1021,7 +1022,7 @@ mod tests {
         let pools = open_test_pools(&db_path).await;
 
         let config = test_config("draining-no-run");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config).await.unwrap();
         LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
             .await
             .unwrap();
@@ -1089,7 +1090,7 @@ mod tests {
 
         // --- Sandbox A: Running + dead PID → should become Crashed ---
         let cfg_a = test_config("running-dead");
-        let id_a = insert_sandbox_record(pools.write(), &cfg_a).await.unwrap();
+        let id_a = LocalBackend::insert_sandbox_record(pools.write(), &cfg_a).await.unwrap();
         run_entity::Entity::insert(run_entity::ActiveModel {
             sandbox_id: Set(id_a),
             pid: Set(Some(dead)),
@@ -1109,7 +1110,7 @@ mod tests {
         });
 
         let cfg_b = test_config("running-alive");
-        let id_b = insert_sandbox_record(pools.write(), &cfg_b).await.unwrap();
+        let id_b = LocalBackend::insert_sandbox_record(pools.write(), &cfg_b).await.unwrap();
         run_entity::Entity::insert(run_entity::ActiveModel {
             sandbox_id: Set(id_b),
             pid: Set(Some(live_pid)),
@@ -1122,7 +1123,7 @@ mod tests {
 
         // --- Sandbox C: Draining + dead PID → should become Stopped ---
         let cfg_c = test_config("draining-dead");
-        let id_c = insert_sandbox_record(pools.write(), &cfg_c).await.unwrap();
+        let id_c = LocalBackend::insert_sandbox_record(pools.write(), &cfg_c).await.unwrap();
         LocalBackend::update_sandbox_status(pools.write(), id_c, SandboxStatus::Draining)
             .await
             .unwrap();
@@ -1138,21 +1139,21 @@ mod tests {
 
         // --- Sandbox C2: Draining + no active run → should become Stopped ---
         let cfg_c2 = test_config("draining-no-run");
-        let id_c2 = insert_sandbox_record(pools.write(), &cfg_c2).await.unwrap();
+        let id_c2 = LocalBackend::insert_sandbox_record(pools.write(), &cfg_c2).await.unwrap();
         LocalBackend::update_sandbox_status(pools.write(), id_c2, SandboxStatus::Draining)
             .await
             .unwrap();
 
         // --- Sandbox D: Stopped → should stay Stopped ---
         let cfg_d = test_config("stopped");
-        let id_d = insert_sandbox_record(pools.write(), &cfg_d).await.unwrap();
+        let id_d = LocalBackend::insert_sandbox_record(pools.write(), &cfg_d).await.unwrap();
         LocalBackend::update_sandbox_status(pools.write(), id_d, SandboxStatus::Stopped)
             .await
             .unwrap();
 
         // --- Sandbox E: Running + no run record (still starting) → should stay Running ---
         let cfg_e = test_config("starting");
-        let id_e = insert_sandbox_record(pools.write(), &cfg_e).await.unwrap();
+        let id_e = LocalBackend::insert_sandbox_record(pools.write(), &cfg_e).await.unwrap();
 
         // --- Reap: query all Running/Draining, reconcile each ---
         let stale = sandbox_entity::Entity::find()
