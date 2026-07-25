@@ -231,3 +231,205 @@ async fn count_decodes_the_paginator_alias() {
         .await
         .expect("count all");
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Server Restart
+//--------------------------------------------------------------------------------------------------
+
+/// A sqld instance owned by the test, so it can be killed and restarted.
+struct TestServer {
+    bin: String,
+    db_dir: std::path::PathBuf,
+    port: u16,
+    child: std::process::Child,
+}
+
+impl TestServer {
+    /// Spawn sqld from `MSB_TEST_SQLD_BIN` and wait until it answers queries.
+    async fn spawn(db_dir: std::path::PathBuf, port: u16) -> Self {
+        let bin = std::env::var("MSB_TEST_SQLD_BIN")
+            .expect("MSB_TEST_SQLD_BIN must point at a sqld binary");
+        let child = Self::launch(&bin, &db_dir, port);
+
+        let server = Self {
+            bin,
+            db_dir,
+            port,
+            child,
+        };
+        server.wait_ready().await;
+        server
+    }
+
+    fn launch(bin: &str, db_dir: &std::path::Path, port: u16) -> std::process::Child {
+        std::process::Command::new(bin)
+            .arg("--db-path")
+            .arg(db_dir)
+            .arg("--http-listen-addr")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--no-welcome")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sqld")
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// SIGKILL the server, then bring it back on the same database.
+    async fn kill_and_restart(&mut self) {
+        self.child.kill().expect("kill sqld");
+        self.child.wait().expect("reap sqld");
+
+        self.child = Self::launch(&self.bin, &self.db_dir, self.port);
+        self.wait_ready().await;
+    }
+
+    /// Poll with fresh throwaway connections until a real query answers.
+    async fn wait_ready(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let probe = DbWriteConnection::open_url(
+                &self.url(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+            if probe.is_ok() {
+                return;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sqld not ready within 30s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a sqld binary (MSB_TEST_SQLD_BIN)"]
+async fn connections_reconnect_after_server_restart() {
+    use sea_orm::ConnectionTrait;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = TestServer::spawn(dir.path().to_owned(), 18901).await;
+
+    let write = DbWriteConnection::open_url(&server.url(), ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
+        .await
+        .expect("open write proxy");
+    write
+        .inner()
+        .execute_unprepared("CREATE TABLE t (name TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    write
+        .inner()
+        .execute_unprepared("INSERT INTO t (name) VALUES ('before')")
+        .await
+        .expect("insert before restart");
+
+    let read = DbReadConnection::open_url(&server.url(), 2, ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
+        .await
+        .expect("open read proxy");
+
+    server.kill_and_restart().await;
+
+    // Both held connections lost their stream; the next request must
+    // transparently reconnect and succeed.
+    write
+        .inner()
+        .execute_unprepared("INSERT INTO t (name) VALUES ('after')")
+        .await
+        .expect("insert after restart reconnects");
+
+    let stmt = sea_orm::Statement::from_string(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT count(*) AS n FROM t".to_owned(),
+    );
+    let row = read
+        .inner()
+        .query_one(stmt)
+        .await
+        .expect("query after restart reconnects")
+        .expect("count row");
+    let n: i64 = row.try_get("", "n").expect("decode count");
+    assert_eq!(n, 2, "both writes durable across the restart");
+}
+
+#[tokio::test]
+#[ignore = "requires a sqld binary (MSB_TEST_SQLD_BIN)"]
+async fn transaction_interrupted_by_restart_retries_whole() {
+    use sea_orm::ConnectionTrait;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(dir.path().to_owned(), 18902).await;
+
+    let write = DbWriteConnection::open_url(&server.url(), ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
+        .await
+        .expect("open write proxy");
+    write
+        .inner()
+        .execute_unprepared("CREATE TABLE t (name TEXT NOT NULL)")
+        .await
+        .expect("create table");
+
+    let server = std::sync::Arc::new(tokio::sync::Mutex::new(server));
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+
+    write
+        .transaction(|txn| {
+            let server = server.clone();
+            let attempts = attempts.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+
+                txn.execute_unprepared("INSERT INTO t (name) VALUES ('one')")
+                    .await?;
+
+                // First attempt: the server dies (and comes back) under the
+                // open transaction. Its next statement hits the dead stream,
+                // poisons the transaction, and the whole closure re-runs.
+                if attempt == 1 {
+                    server.lock().await.kill_and_restart().await;
+                }
+
+                txn.execute_unprepared("INSERT INTO t (name) VALUES ('two')")
+                    .await?;
+                Ok::<_, sea_orm::DbErr>((txn, ()))
+            }
+        })
+        .await
+        .expect("transaction succeeds on the retried attempt");
+
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "first attempt lost its stream and was retried"
+    );
+
+    // Exactly one committed transaction: no rows leaked from the aborted
+    // attempt, both rows from the successful one.
+    let stmt = sea_orm::Statement::from_string(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT count(*) AS n FROM t".to_owned(),
+    );
+    let row = write
+        .inner()
+        .query_one(stmt)
+        .await
+        .expect("count")
+        .expect("count row");
+    let n: i64 = row.try_get("", "n").expect("decode count");
+    assert_eq!(n, 2, "only the committed attempt's rows are present");
+}

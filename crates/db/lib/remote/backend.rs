@@ -28,11 +28,26 @@ use super::convert;
 /// classifies on it (see [`crate::retry::is_sqlite_busy`]).
 pub(crate) const BUSY_SENTINEL: &str = "SQLITE_BUSY";
 
+/// Server messages meaning a request was rejected because its hrana stream
+/// no longer exists — typically after a server restart. The statement did
+/// NOT execute, so retrying it on a fresh connection cannot double-apply.
+const STREAM_DEAD_MARKERS: &[&str] = &[
+    "invalid baton",
+    "stream closed",
+    "stream not found",
+    "stream expired",
+];
+
 tokio::task_local! {
     /// Set while a write transaction drives statements through the proxy;
     /// those statements already hold the admission permit and must not
     /// re-acquire it (that would deadlock a single-permit writer).
-    static IN_WRITE_TXN: ();
+    ///
+    /// The cell is the transaction's poison flag: once a statement loses
+    /// its server stream, every later statement in the same transaction
+    /// fails fast instead of executing non-transactionally on a fresh
+    /// connection.
+    static IN_WRITE_TXN: std::cell::Cell<bool>;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -40,15 +55,21 @@ tokio::task_local! {
 //--------------------------------------------------------------------------------------------------
 
 /// Write-side proxy: one server connection, one admission permit.
+///
+/// Keeps the database handle so a connection whose server stream died
+/// (e.g. across a server restart) can be replaced with a fresh one.
 pub(crate) struct WriteProxy {
+    database: libsql::Database,
     conn: Mutex<libsql::Connection>,
     control: WriteControl,
     request_timeout: Duration,
+    stale: AtomicBool,
 }
 
 /// Read-side proxy: a fixed set of server connections handed out under a
 /// semaphore sized to match.
 pub(crate) struct ReadProxy {
+    database: libsql::Database,
     conns: Mutex<Vec<libsql::Connection>>,
     admission: Arc<Semaphore>,
     acquire_timeout: Duration,
@@ -83,11 +104,13 @@ pub(crate) struct TxnPermit {
 impl WriteProxy {
     /// Build a write proxy over one server connection.
     pub(crate) fn new(
+        database: libsql::Database,
         conn: libsql::Connection,
         acquire_timeout: Duration,
         request_timeout: Duration,
     ) -> Self {
         Self {
+            database,
             conn: Mutex::new(conn),
             control: WriteControl {
                 admission: Arc::new(Semaphore::new(1)),
@@ -95,6 +118,7 @@ impl WriteProxy {
                 dirty: Arc::new(AtomicBool::new(false)),
             },
             request_timeout,
+            stale: AtomicBool::new(false),
         }
     }
 
@@ -105,12 +129,23 @@ impl WriteProxy {
 
     /// Run `op` on the write connection, respecting admission unless the
     /// calling task is inside a transaction scope (which holds the permit).
+    ///
+    /// A connection whose server stream died is replaced with a fresh one:
+    /// immediately (with a single retry of `op`) outside a transaction —
+    /// stream-dead requests were rejected before executing, so the retry
+    /// cannot double-apply — or at the next checkout when the death happened
+    /// mid-transaction, where the transaction itself is poisoned instead.
     async fn with_conn<T, F, Fut>(&self, op_name: &'static str, op: F) -> Result<T, DbErr>
     where
-        F: FnOnce(libsql::Connection) -> Fut,
+        F: Fn(libsql::Connection) -> Fut,
         Fut: Future<Output = Result<T, libsql::Error>>,
     {
         let in_txn = IN_WRITE_TXN.try_with(|_| ()).is_ok();
+        let poisoned = IN_WRITE_TXN.try_with(|cell| cell.get()).unwrap_or(false);
+
+        if poisoned {
+            return Err(poisoned_txn_err(op_name));
+        }
 
         let _permit = if in_txn {
             None
@@ -118,26 +153,60 @@ impl WriteProxy {
             Some(acquire(&self.control.admission, self.control.acquire_timeout).await?)
         };
 
-        let conn = self.conn.lock().await;
-        if self.control.dirty.swap(false, Ordering::AcqRel) {
-            // Best effort: clears a transaction abandoned by a cancelled
-            // caller; errors ("no transaction is active") are expected.
-            let _ = conn.execute("ROLLBACK", ()).await;
+        let conn = {
+            let mut guard = self.conn.lock().await;
+
+            if self.stale.swap(false, Ordering::AcqRel) {
+                *guard = self.database.connect().map_err(reconnect_err)?;
+            }
+
+            if self.control.dirty.swap(false, Ordering::AcqRel) {
+                // Best effort: clears a transaction abandoned by a cancelled
+                // caller; errors ("no transaction is active") are expected.
+                let _ = guard.execute("ROLLBACK", ()).await;
+            }
+
+            guard.clone()
+        };
+
+        let result = bounded(op_name, self.request_timeout, op(conn)).await;
+
+        let Err(err) = &result else { return result };
+        if !is_stream_dead_db(err) {
+            return result;
         }
 
-        bounded(op_name, self.request_timeout, op(conn.clone())).await
+        if in_txn {
+            // The server-side transaction died with the stream. Poison the
+            // scope so later statements (including COMMIT) fail fast, and
+            // replace the connection at the next checkout. Tagged as busy:
+            // the transaction rolled back atomically, so retrying the whole
+            // transaction on a fresh connection is the correct recovery.
+            let _ = IN_WRITE_TXN.try_with(|cell| cell.set(true));
+            self.stale.store(true, Ordering::Release);
+            return Err(DbErr::Exec(RuntimeErr::Internal(format!(
+                "{BUSY_SENTINEL}: catalog stream reset mid-transaction \
+                 (server restarted); transaction rolled back"
+            ))));
+        }
+
+        let fresh = self.database.connect().map_err(reconnect_err)?;
+        *self.conn.lock().await = fresh.clone();
+        bounded(op_name, self.request_timeout, op(fresh)).await
     }
 }
 
 impl ReadProxy {
     /// Build a read proxy over a fixed set of server connections.
     pub(crate) fn new(
+        database: libsql::Database,
         conns: Vec<libsql::Connection>,
         acquire_timeout: Duration,
         request_timeout: Duration,
     ) -> Self {
         let admission = Arc::new(Semaphore::new(conns.len()));
         Self {
+            database,
             conns: Mutex::new(conns),
             admission,
             acquire_timeout,
@@ -146,20 +215,34 @@ impl ReadProxy {
     }
 
     /// Run `op` on a checked-out read connection.
+    ///
+    /// A connection whose server stream died is dropped and replaced with a
+    /// fresh one, retrying `op` once — reads are idempotent, so the retry
+    /// is always safe.
     async fn with_conn<T, F, Fut>(&self, op_name: &'static str, op: F) -> Result<T, DbErr>
     where
-        F: FnOnce(libsql::Connection) -> Fut,
+        F: Fn(libsql::Connection) -> Fut,
         Fut: Future<Output = Result<T, libsql::Error>>,
     {
         let _permit = acquire(&self.admission, self.acquire_timeout).await?;
 
         // A permit guarantees a connection is available.
-        let conn = {
+        let mut conn = {
             let mut conns = self.conns.lock().await;
             conns.pop().expect("read connection available per permit")
         };
 
-        let result = bounded(op_name, self.request_timeout, op(conn.clone())).await;
+        let mut result = bounded(op_name, self.request_timeout, op(conn.clone())).await;
+
+        if result.as_ref().is_err_and(is_stream_dead_db) {
+            match self.database.connect().map_err(reconnect_err) {
+                Ok(fresh) => {
+                    conn = fresh;
+                    result = bounded(op_name, self.request_timeout, op(conn.clone())).await;
+                }
+                Err(err) => result = Err(err),
+            }
+        }
 
         self.conns.lock().await.push(conn);
         result
@@ -212,12 +295,12 @@ impl fmt::Debug for ReadProxy {
 #[async_trait::async_trait]
 impl ProxyDatabaseTrait for WriteProxy {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
-        self.with_conn("query", |conn| run_query(conn, statement))
+        self.with_conn("query", |conn| run_query(conn, statement.clone()))
             .await
     }
 
     async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
-        self.with_conn("execute", |conn| run_execute(conn, statement))
+        self.with_conn("execute", |conn| run_execute(conn, statement.clone()))
             .await
     }
 
@@ -239,12 +322,12 @@ impl ProxyDatabaseTrait for WriteProxy {
 #[async_trait::async_trait]
 impl ProxyDatabaseTrait for ReadProxy {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
-        self.with_conn("query", |conn| run_query(conn, statement))
+        self.with_conn("query", |conn| run_query(conn, statement.clone()))
             .await
     }
 
     async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
-        self.with_conn("execute", |conn| run_execute(conn, statement))
+        self.with_conn("execute", |conn| run_execute(conn, statement.clone()))
             .await
     }
 
@@ -262,7 +345,7 @@ impl ProxyDatabaseTrait for ReadProxy {
 
 /// Enter the write-transaction statement scope for `fut`.
 pub(crate) async fn with_txn_scope<T>(fut: impl Future<Output = T>) -> T {
-    IN_WRITE_TXN.scope((), fut).await
+    IN_WRITE_TXN.scope(std::cell::Cell::new(false), fut).await
 }
 
 /// Acquire an admission permit within `acquire_timeout`, mapping expiry to
@@ -348,6 +431,29 @@ fn bind_params(statement: &Statement) -> Result<libsql::params::Params, libsql::
     Ok(libsql::params::Params::Positional(converted))
 }
 
+/// Whether a mapped error reports a dead server stream (see
+/// [`STREAM_DEAD_MARKERS`]).
+fn is_stream_dead_db(err: &DbErr) -> bool {
+    let DbErr::Custom(message) = err else {
+        return false;
+    };
+
+    let lower = message.to_ascii_lowercase();
+    STREAM_DEAD_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Contextual error for a failed replacement of a dead server connection.
+fn reconnect_err(err: libsql::Error) -> DbErr {
+    DbErr::Custom(format!("catalog reconnect: {err}"))
+}
+
+/// Error for statements attempted after their transaction lost its stream.
+fn poisoned_txn_err(op_name: &'static str) -> DbErr {
+    DbErr::Custom(format!(
+        "catalog {op_name} skipped: transaction lost its server stream"
+    ))
+}
+
 /// Map a libsql error into `DbErr`, tagging server-side busy conditions
 /// with [`BUSY_SENTINEL`] so the retry layer treats them as transient.
 fn map_libsql_err(op_name: &'static str, err: libsql::Error) -> DbErr {
@@ -365,4 +471,34 @@ fn map_libsql_err(op_name: &'static str, err: libsql::Error) -> DbErr {
     }
 
     DbErr::Custom(format!("catalog {op_name}: {err}"))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_dead_classification_matches_rejected_stream_errors() {
+        let baton = DbErr::Custom("catalog execute: Hrana: `api error: `Invalid baton``".into());
+        let closed = DbErr::Custom("catalog query: Hrana: `stream closed: `gone``".into());
+
+        assert!(is_stream_dead_db(&baton));
+        assert!(is_stream_dead_db(&closed));
+    }
+
+    #[test]
+    fn stream_dead_classification_ignores_statement_and_busy_errors() {
+        let sql =
+            DbErr::Custom("catalog execute: Hrana: `api error: `no such table: runs``".into());
+        let busy = DbErr::Exec(RuntimeErr::Internal(format!(
+            "{BUSY_SENTINEL}: database is locked"
+        )));
+
+        assert!(!is_stream_dead_db(&sql));
+        assert!(!is_stream_dead_db(&busy));
+    }
 }

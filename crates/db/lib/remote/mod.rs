@@ -41,7 +41,7 @@ pub(crate) async fn open_read(
         conns.push(database.connect().map_err(connect_err)?);
     }
 
-    let proxy = backend::ReadProxy::new(conns, acquire_timeout, request_timeout);
+    let proxy = backend::ReadProxy::new(database, conns, acquire_timeout, request_timeout);
     let conn = into_proxy_connection(Box::new(proxy)).await?;
 
     // A read consumer must find an existing catalog, mirroring the file
@@ -64,7 +64,7 @@ pub(crate) async fn open_write(
     let database = connect_database(url).await?;
     let server_conn = database.connect().map_err(connect_err)?;
 
-    let proxy = backend::WriteProxy::new(server_conn, acquire_timeout, request_timeout);
+    let proxy = backend::WriteProxy::new(database, server_conn, acquire_timeout, request_timeout);
     let control = proxy.control();
     let conn = into_proxy_connection(Box::new(proxy)).await?;
 
