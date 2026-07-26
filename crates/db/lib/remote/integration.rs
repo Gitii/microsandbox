@@ -5,8 +5,7 @@
 //!
 //! ```text
 //! sqld --db-path /tmp/msb-libsql-test --http-listen-addr 127.0.0.1:8890
-//! MSB_TEST_LIBSQL_URL=http://127.0.0.1:8890 cargo test -p microsandbox-db \
-//!     --features libsql -- --ignored
+//! MSB_TEST_LIBSQL_URL=http://127.0.0.1:8890 cargo test -p microsandbox-db -- --ignored
 //! ```
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

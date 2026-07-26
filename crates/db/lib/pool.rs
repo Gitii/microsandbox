@@ -52,9 +52,8 @@ impl DbPools {
         Ok(Self { read, write })
     }
 
-    /// Open both pools for a catalog target: a SQLite file path, or — with
-    /// the `libsql` feature — a remote server URL (`http://`, `https://`,
-    /// `libsql://`).
+    /// Open both pools for a database target: a SQLite file path, or a remote
+    /// server URL (`http://`, `https://`, `libsql://`).
     ///
     /// The remote backend reuses `connect_timeout` as its admission timeout
     /// and derives a per-request bound from `busy_timeout` (see
@@ -65,7 +64,11 @@ impl DbPools {
         connect_timeout: Duration,
         busy_timeout: Duration,
     ) -> Result<Self, sea_orm::DbErr> {
-        if !crate::is_remote_url(target) {
+        let is_url = target.starts_with("http://")
+            || target.starts_with("https://")
+            || target.starts_with("libsql://");
+
+        if !is_url {
             return Self::open(
                 Path::new(target),
                 max_read_connections,
@@ -76,23 +79,11 @@ impl DbPools {
             .map_err(|e| sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(e)));
         }
 
-        #[cfg(feature = "libsql")]
-        {
-            let write = DbWriteConnection::open_url(target, connect_timeout, busy_timeout).await?;
-            let read = DbReadConnection::open_url(
-                target,
-                max_read_connections,
-                connect_timeout,
-                busy_timeout,
-            )
-            .await?;
-            Ok(Self { read, write })
-        }
-
-        #[cfg(not(feature = "libsql"))]
-        Err(sea_orm::DbErr::Custom(format!(
-            "catalog target '{target}' is a server URL, but this build lacks the `libsql` feature"
-        )))
+        let write = DbWriteConnection::open_url(target, connect_timeout, busy_timeout).await?;
+        let read =
+            DbReadConnection::open_url(target, max_read_connections, connect_timeout, busy_timeout)
+                .await?;
+        Ok(Self { read, write })
     }
 
     /// Borrow the read pool (multi-connection).
@@ -117,7 +108,7 @@ impl DbPools {
 /// volume at the cost of higher tail latency on contention.
 ///
 /// `create_if_missing` controls whether opening a non-existent DB file creates
-/// it. The write side (owned by `msb`) creates the catalog; read-only consumers
+/// it. The write side (owned by `msb`) creates the database; read-only consumers
 /// (e.g. `msb-metrics`) pass `false` so they never author or pre-empt it.
 ///
 /// Returns the sea-orm connection plus the underlying sqlx pool handle, so

@@ -1,6 +1,6 @@
-//! Remote catalog backend over a self-hosted libSQL server (`sqld`).
+//! Remote database backend over a self-hosted libSQL server (`sqld`).
 //!
-//! Deployments where several host processes share one catalog can run one
+//! Deployments where several host processes share one database can run one
 //! server process that exclusively owns the SQLite file; every process then
 //! talks to it over the libSQL remote protocol, which centralizes write
 //! serialization and admission instead of coordinating through file locks.
@@ -44,7 +44,7 @@ pub(crate) async fn open_read(
     let proxy = backend::ReadProxy::new(database, conns, acquire_timeout, request_timeout);
     let conn = into_proxy_connection(Box::new(proxy)).await?;
 
-    // A read consumer must find an existing catalog, mirroring the file
+    // A read consumer must find an existing database, mirroring the file
     // backend's refusal to create one: probe the schema, not just the port.
     let probe = Statement::from_string(
         DbBackend::Sqlite,
@@ -93,6 +93,6 @@ async fn into_proxy_connection(
 /// Contextual error for connection establishment failures.
 fn connect_err(err: libsql::Error) -> DbErr {
     DbErr::Conn(sea_orm::RuntimeErr::Internal(format!(
-        "connect to catalog server: {err}"
+        "connect to database server: {err}"
     )))
 }

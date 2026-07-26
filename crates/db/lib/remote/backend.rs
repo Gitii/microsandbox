@@ -185,7 +185,7 @@ impl WriteProxy {
             let _ = IN_WRITE_TXN.try_with(|cell| cell.set(true));
             self.stale.store(true, Ordering::Release);
             return Err(DbErr::Exec(RuntimeErr::Internal(format!(
-                "{BUSY_SENTINEL}: catalog stream reset mid-transaction \
+                "{BUSY_SENTINEL}: db stream reset mid-transaction \
                  (server restarted); transaction rolled back"
             ))));
         }
@@ -370,7 +370,7 @@ async fn bounded<T>(
     match timeout(request_timeout, fut).await {
         Ok(result) => result.map_err(|e| map_libsql_err(op_name, e)),
         Err(_) => Err(DbErr::Custom(format!(
-            "catalog {op_name} timed out after {}s",
+            "db {op_name} timed out after {}s",
             request_timeout.as_secs()
         ))),
     }
@@ -444,13 +444,13 @@ fn is_stream_dead_db(err: &DbErr) -> bool {
 
 /// Contextual error for a failed replacement of a dead server connection.
 fn reconnect_err(err: libsql::Error) -> DbErr {
-    DbErr::Custom(format!("catalog reconnect: {err}"))
+    DbErr::Custom(format!("db reconnect: {err}"))
 }
 
 /// Error for statements attempted after their transaction lost its stream.
 fn poisoned_txn_err(op_name: &'static str) -> DbErr {
     DbErr::Custom(format!(
-        "catalog {op_name} skipped: transaction lost its server stream"
+        "db {op_name} skipped: transaction lost its server stream"
     ))
 }
 
@@ -470,7 +470,7 @@ fn map_libsql_err(op_name: &'static str, err: libsql::Error) -> DbErr {
         return DbErr::Exec(RuntimeErr::Internal(format!("{BUSY_SENTINEL}: {err}")));
     }
 
-    DbErr::Custom(format!("catalog {op_name}: {err}"))
+    DbErr::Custom(format!("db {op_name}: {err}"))
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -483,8 +483,8 @@ mod tests {
 
     #[test]
     fn stream_dead_classification_matches_rejected_stream_errors() {
-        let baton = DbErr::Custom("catalog execute: Hrana: `api error: `Invalid baton``".into());
-        let closed = DbErr::Custom("catalog query: Hrana: `stream closed: `gone``".into());
+        let baton = DbErr::Custom("db execute: Hrana: `api error: `Invalid baton``".into());
+        let closed = DbErr::Custom("db query: Hrana: `stream closed: `gone``".into());
 
         assert!(is_stream_dead_db(&baton));
         assert!(is_stream_dead_db(&closed));
@@ -492,8 +492,7 @@ mod tests {
 
     #[test]
     fn stream_dead_classification_ignores_statement_and_busy_errors() {
-        let sql =
-            DbErr::Custom("catalog execute: Hrana: `api error: `no such table: runs``".into());
+        let sql = DbErr::Custom("db execute: Hrana: `api error: `no such table: runs``".into());
         let busy = DbErr::Exec(RuntimeErr::Internal(format!(
             "{BUSY_SENTINEL}: database is locked"
         )));

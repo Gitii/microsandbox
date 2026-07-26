@@ -24,7 +24,7 @@ const MAX_DELAY: Duration = Duration::from_millis(500);
 
 /// Returns `true` if `err` is a SQLite `BUSY` / `BUSY_SNAPSHOT` error
 /// from any of the sea-orm variants that wrap a sqlx database error, or a
-/// busy condition reported by a remote catalog server (tagged with an
+/// busy condition reported by a remote database server (tagged with an
 /// `SQLITE_BUSY` prefix by the libsql backend's error mapping).
 pub fn is_sqlite_busy(err: &DbErr) -> bool {
     let runtime_err = match err {

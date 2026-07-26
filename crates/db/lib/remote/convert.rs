@@ -31,7 +31,7 @@ const DATETIME_FORMAT_T: &str = "%Y-%m-%dT%H:%M:%S%.f";
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// The Rust-side shape a catalog column converts to.
+/// The Rust-side shape a database column converts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnKind {
     /// 32-bit integer columns (`i32` model fields).
@@ -56,7 +56,7 @@ pub(crate) enum ColumnKind {
 
 /// Column-name → kind table derived from every entity in this crate.
 ///
-/// Names are unambiguous across the catalog schema today (enforced by a
+/// Names are unambiguous across the database schema today (enforced by a
 /// test below); a future column reusing an existing name with a different
 /// type must extend the lookup with a table qualifier.
 pub(crate) fn column_kinds() -> &'static HashMap<String, ColumnKind> {
@@ -80,7 +80,7 @@ pub(crate) fn column_kinds() -> &'static HashMap<String, ColumnKind> {
     })
 }
 
-/// Every (column name, kind) pair across the catalog schema, one entry per
+/// Every (column name, kind) pair across the database schema, one entry per
 /// entity column.
 fn all_entity_kinds() -> Vec<(String, ColumnKind)> {
     let mut all = Vec::new();
@@ -228,7 +228,7 @@ fn parse_datetime(name: &str, text: String) -> Value {
     match parsed {
         Ok(dt) => Value::ChronoDateTime(Some(Box::new(dt))),
         Err(_) => {
-            tracing::warn!(column = name, "unparseable timestamp from catalog server");
+            tracing::warn!(column = name, "unparseable timestamp from database server");
             Value::String(Some(Box::new(text)))
         }
     }
@@ -274,10 +274,10 @@ mod tests {
         let mut conflicts = Vec::new();
 
         for (name, kind) in all_entity_kinds() {
-            if let Some(previous) = seen.insert(name.clone(), kind) {
-                if previous != kind {
-                    conflicts.push(name);
-                }
+            if let Some(previous) = seen.insert(name.clone(), kind)
+                && previous != kind
+            {
+                conflicts.push(name);
             }
         }
 
