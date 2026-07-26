@@ -51,7 +51,6 @@ pub struct DbWriteConnection {
     inner: DatabaseConnection,
     pool: Option<SqlitePool>,
     stats: DbStats,
-    remote: Option<crate::remote::WriteControl>,
 }
 
 /// How long a single remote database request may run, derived from the
@@ -168,7 +167,6 @@ impl DbWriteConnection {
             inner,
             pool: None,
             stats: DbStats::new(),
-            remote: None,
         }
     }
 
@@ -182,13 +180,11 @@ impl DbWriteConnection {
         busy_timeout: Duration,
     ) -> Result<Self, DbErr> {
         let request_timeout = remote_request_timeout(busy_timeout);
-        let (inner, control) =
-            crate::remote::open_write(url, connect_timeout, request_timeout).await?;
+        let inner = crate::remote::open_write(url, connect_timeout, request_timeout).await?;
         Ok(Self {
             inner,
             pool: None,
             stats: DbStats::new(),
-            remote: Some(control),
         })
     }
 
@@ -207,7 +203,6 @@ impl DbWriteConnection {
             inner,
             pool: Some(pool),
             stats: DbStats::new(),
-            remote: None,
         })
     }
 
@@ -243,7 +238,10 @@ impl DbWriteConnection {
         T: Send,
         E: From<DbErr> + IsSqliteBusy,
     {
-        if self.remote.is_some() {
+        if matches!(
+            self.inner,
+            sea_orm::DatabaseConnection::ProxyDatabaseConnection(_)
+        ) {
             return self.remote_transaction(f).await;
         }
 
@@ -273,40 +271,28 @@ impl DbWriteConnection {
         T: Send,
         E: From<DbErr> + IsSqliteBusy,
     {
-        let control = self.remote.as_ref().expect("remote transaction control");
-
         retry::retry_on_busy_with_stats(
             || async {
-                let permit = control.begin_txn().await.map_err(E::from)?;
+                self.inner
+                    .execute_unprepared("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(E::from)?;
 
-                let result = crate::remote::with_txn_scope(async {
-                    self.inner
-                        .execute_unprepared("BEGIN IMMEDIATE")
-                        .await
-                        .map_err(E::from)?;
-
-                    let txn = self.inner.begin().await.map_err(E::from)?;
-                    match f(txn).await {
-                        Ok((txn, value)) => {
-                            txn.commit().await.map_err(E::from)?;
-                            if let Err(err) = self.inner.execute_unprepared("COMMIT").await {
-                                let _ = self.inner.execute_unprepared("ROLLBACK").await;
-                                return Err(E::from(err));
-                            }
-                            Ok(value)
-                        }
-                        Err(err) => {
+                let txn = self.inner.begin().await.map_err(E::from)?;
+                match f(txn).await {
+                    Ok((txn, value)) => {
+                        txn.commit().await.map_err(E::from)?;
+                        if let Err(err) = self.inner.execute_unprepared("COMMIT").await {
                             let _ = self.inner.execute_unprepared("ROLLBACK").await;
-                            Err(err)
+                            return Err(E::from(err));
                         }
+                        Ok(value)
                     }
-                })
-                .await;
-
-                if result.is_ok() {
-                    permit.disarm();
+                    Err(err) => {
+                        let _ = self.inner.execute_unprepared("ROLLBACK").await;
+                        Err(err)
+                    }
                 }
-                result
             },
             Some(&self.stats),
         )

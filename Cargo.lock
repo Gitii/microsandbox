@@ -3651,7 +3651,7 @@ version = "0.6.7"
 dependencies = [
  "async-trait",
  "chrono",
- "libsql",
+ "microsandbox-libsql",
  "microsandbox-migration",
  "sea-orm",
  "sqlx",
@@ -3716,6 +3716,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "microsandbox-libsql"
+version = "0.6.7"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "libsql",
+ "sea-orm",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
