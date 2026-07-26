@@ -82,10 +82,9 @@ mod tests {
             })
             .await;
 
-        let read =
-            DbReadConnection::open(&url, READ_CONNECTIONS, ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
-                .await
-                .expect("open read proxy");
+        let read = DbReadConnection::open(&url, READ_CONNECTIONS, ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
+            .await
+            .expect("open read proxy");
 
         (read, write)
     }

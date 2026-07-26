@@ -221,7 +221,6 @@ impl DbWriteConnection {
             inner,
             pool: Some(pool),
             stats: DbStats::new(),
-            remote: None,
         })
     }
 
