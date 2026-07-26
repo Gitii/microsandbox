@@ -432,3 +432,71 @@ async fn transaction_interrupted_by_restart_retries_whole() {
     let n: i64 = row.try_get("", "n").expect("decode count");
     assert_eq!(n, 2, "only the committed attempt's rows are present");
 }
+
+#[tokio::test]
+#[ignore = "requires a sqld binary (MSB_TEST_SQLD_BIN)"]
+async fn cancelled_transaction_releases_write_permit() {
+    // Regression test: if a write transaction future is cancelled before
+    // COMMIT/ROLLBACK, `WriteProxy::start_rollback` must release the permit
+    // synchronously so the next transaction can acquire it.
+    use sea_orm::ConnectionTrait;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(dir.path().to_owned(), 18903).await;
+
+    let write = DbWriteConnection::open_url(&server.url(), ACQUIRE_TIMEOUT, BUSY_TIMEOUT)
+        .await
+        .expect("open write proxy");
+    write
+        .inner()
+        .execute_unprepared("CREATE TABLE t (name TEXT NOT NULL)")
+        .await
+        .expect("create table");
+
+    let write = Arc::new(write);
+    let write2 = write.clone();
+
+    // Spawn a task that opens a transaction and then sleeps long inside it.
+    // Aborting the task cancels the future, which drops the DatabaseTransaction
+    // without COMMIT/ROLLBACK — exactly the bug scenario.
+    let handle = tokio::spawn(async move {
+        write2
+            .transaction(|txn| async move {
+                txn.execute_unprepared("INSERT INTO t (name) VALUES ('cancelled')")
+                    .await?;
+                // Long sleep so the abort hits mid-transaction.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<_, sea_orm::DbErr>((txn, ()))
+            })
+            .await
+    });
+
+    // Give the spawned task a moment to open its transaction and reach the sleep.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Abort the task — this cancels the transaction future mid-flight.
+    handle.abort();
+    let _ = handle.await; // reap (will be Err(Cancelled))
+
+    // The permit must now be free. A subsequent write transaction must succeed
+    // within ACQUIRE_TIMEOUT, not block forever.
+    let result = tokio::time::timeout(
+        ACQUIRE_TIMEOUT,
+        write.transaction(|txn| async move {
+            txn.execute_unprepared("INSERT INTO t (name) VALUES ('after-cancel')")
+                .await?;
+            Ok::<_, sea_orm::DbErr>((txn, ()))
+        }),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "write after cancelled transaction timed out — permit was not released"
+    );
+    assert!(
+        result.unwrap().is_ok(),
+        "write transaction after cancel must succeed"
+    );
+}

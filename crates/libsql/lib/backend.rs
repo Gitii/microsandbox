@@ -52,7 +52,10 @@ pub(crate) struct WriteProxy {
     /// Whether a transaction is currently open (permit held).
     in_transaction: AtomicBool,
     /// The held admission permit while a transaction is in progress.
-    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    ///
+    /// Uses a std mutex (not tokio) so it can be locked synchronously
+    /// from `start_rollback`, which sea-orm calls from `Drop`.
+    permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
     /// Dirty flag: an abandoned transaction needs a defensive ROLLBACK on
     /// the next checkout.
     dirty: Arc<AtomicBool>,
@@ -91,7 +94,7 @@ impl WriteProxy {
             request_timeout,
             stale: AtomicBool::new(false),
             in_transaction: AtomicBool::new(false),
-            permit: Mutex::new(None),
+            permit: std::sync::Mutex::new(None),
             dirty: Arc::new(AtomicBool::new(false)),
             column_kinds,
         }
@@ -136,7 +139,7 @@ impl WriteProxy {
             self.dirty.store(true, Ordering::Release);
             self.in_transaction.store(false, Ordering::Release);
             // Release the permit so the retry attempt can re-acquire.
-            *self.permit.lock().await = None;
+            *self.permit.lock().expect("permit mutex poisoned") = None;
             return Err(DbErr::Exec(RuntimeErr::Internal(format!(
                 "{BUSY_SENTINEL}: db stream reset mid-transaction \
                  (server restarted); transaction rolled back"
@@ -243,7 +246,9 @@ impl ProxyDatabaseTrait for WriteProxy {
         if Self::is_begin(sql) {
             // Acquire the single-writer permit before issuing BEGIN.
             let permit = acquire(&self.admission, self.acquire_timeout).await?;
-            *self.permit.lock().await = Some(permit);
+            {
+                *self.permit.lock().expect("permit mutex poisoned") = Some(permit);
+            }
             self.in_transaction.store(true, Ordering::Release);
         }
 
@@ -257,7 +262,7 @@ impl ProxyDatabaseTrait for WriteProxy {
             if Self::is_end(sql) {
                 self.in_transaction.store(false, Ordering::Release);
             }
-            *self.permit.lock().await = None;
+            *self.permit.lock().expect("permit mutex poisoned") = None;
         }
 
         result
@@ -268,6 +273,18 @@ impl ProxyDatabaseTrait for WriteProxy {
             conn.query("SELECT 1", ()).await.map(|_| ())
         })
         .await
+    }
+
+    fn start_rollback(&self) {
+        // A `DatabaseTransaction` is being dropped. If we still hold the write
+        // permit, no COMMIT/ROLLBACK ran (the transaction was cancelled or
+        // panicked mid-flight): release the permit synchronously and mark
+        // dirty so the next checkout issues a defensive server-side ROLLBACK.
+        let mut permit = self.permit.lock().expect("permit mutex poisoned");
+        if permit.take().is_some() {
+            self.in_transaction.store(false, Ordering::Release);
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 }
 
