@@ -321,6 +321,32 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 
 <br />
 
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/ffffff" alt="beaker-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/000000" alt="beaker"></a>&nbsp;&nbsp;Examples
+
+Practical ways to put microsandbox to work:
+
+#### <img height="14" src="https://octicons-col.vercel.app/dependabot/A770EF">&nbsp;&nbsp;[Isolate an AI Coding Agent](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)
+
+> Let an agent edit and test a copied repository, then review its patch before anything crosses back to the host.
+
+#### <img height="14" src="https://octicons-col.vercel.app/shield-lock/A770EF">&nbsp;&nbsp;[Run Untrusted Code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)
+
+> Bound CPU, memory, time, processes, files, and network access for user-submitted programs.
+
+#### <img height="14" src="https://octicons-col.vercel.app/container/A770EF">&nbsp;&nbsp;[Run Docker in a Sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)
+
+> Start nested containers without exposing the host Docker daemon or its socket.
+
+#### <img height="14" src="https://octicons-col.vercel.app/cache/A770EF">&nbsp;&nbsp;[Launch Warm Workers](https://docs.microsandbox.dev/recipes/sandboxing/warm-workers)
+
+> Install a toolchain once, snapshot it, and launch clean workers from the prepared environment.
+
+<br />
+
+<a href="https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent"><img src="https://img.shields.io/badge/All_Examples-%E2%86%92-A770EF?style=flat-square&labelColor=2b2b2b" alt="All Examples"></a>
+
+<br />
+
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/ffffff" alt="agents-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/000000" alt="agents"></a>&nbsp;&nbsp;AI Agents
 
 #### <img height="14" src="https://octicons-col.vercel.app/book/A770EF">&nbsp;&nbsp;Agent Skills
@@ -339,47 +365,6 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 > # Claude Code
 > claude mcp add --transport stdio microsandbox -- npx -y microsandbox-mcp
 > ```
-
-<br />
-
-## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/ffffff" alt="beaker-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/000000" alt="beaker"></a>&nbsp;&nbsp;Examples
-
-Practical ways to put microsandbox to work:
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent">Isolate an AI coding agent</a></strong><br />
-      Let an agent edit and test a copied repository, then review its patch before anything crosses back to the host.
-    </td>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code">Run untrusted code</a></strong><br />
-      Bound CPU, memory, time, processes, files, and network access for user-submitted programs.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox">Run Docker in a sandbox</a></strong><br />
-      Start nested containers without exposing the host Docker daemon or its socket.
-    </td>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/sandboxing/warm-workers">Launch warm workers</a></strong><br />
-      Install a toolchain once, snapshot it, and launch clean workers from the prepared environment.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/browser-automation/playwright">Automate Chromium</a></strong><br />
-      Capture pages or expose a remote Playwright server without requiring GPU acceleration.
-    </td>
-    <td width="50%" valign="top">
-      <strong><a href="https://docs.microsandbox.dev/recipes/development/vnc-desktop">Open a Linux desktop</a></strong><br />
-      Use TigerVNC and noVNC for a CPU-only desktop that opens directly in the browser.
-    </td>
-  </tr>
-</table>
-
-**[Browse the full recipe collection →](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)**
 
 <br />
 
