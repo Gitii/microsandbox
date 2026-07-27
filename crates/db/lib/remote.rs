@@ -4,9 +4,6 @@
 //! passes it to `microsandbox_libsql`'s `open_read`/`open_write`, keeping
 //! the entity coupling in `microsandbox-db` where it belongs.
 
-#[cfg(test)]
-mod integration;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
