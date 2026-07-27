@@ -342,14 +342,44 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 
 <br />
 
-## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/light-bulb/ffffff" alt="light-bulb-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/light-bulb/000000" alt="light-bulb"></a>&nbsp;&nbsp;Recipes
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/ffffff" alt="beaker-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/000000" alt="beaker"></a>&nbsp;&nbsp;Examples
 
-- **[Run untrusted user code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)** with CPU, memory, time, process, file, and network limits.
-- **[Give an AI coding agent an isolated workspace](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)** and review its patch before copying anything back to the host.
-- **[Run OpenCode in a microVM](https://docs.microsandbox.dev/recipes/agents/opencode)** against an isolated copy of your project.
-- **[Automate Chromium with Playwright](https://docs.microsandbox.dev/recipes/browser-automation/playwright)** without requiring GPU acceleration.
-- **[Rehearse a database migration](https://docs.microsandbox.dev/recipes/data/migration-rehearsal)** and restore the pre-migration disk state from a snapshot.
-- **[Run Docker inside a sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)** without touching the host's Docker daemon.
+Practical ways to put microsandbox to work:
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent">Isolate an AI coding agent</a></strong><br />
+      Let an agent edit and test a copied repository, then review its patch before anything crosses back to the host.
+    </td>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code">Run untrusted code</a></strong><br />
+      Bound CPU, memory, time, processes, files, and network access for user-submitted programs.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox">Run Docker in a sandbox</a></strong><br />
+      Start nested containers without exposing the host Docker daemon or its socket.
+    </td>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/sandboxing/warm-workers">Launch warm workers</a></strong><br />
+      Install a toolchain once, snapshot it, and launch clean workers from the prepared environment.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/browser-automation/playwright">Automate Chromium</a></strong><br />
+      Capture pages or expose a remote Playwright server without requiring GPU acceleration.
+    </td>
+    <td width="50%" valign="top">
+      <strong><a href="https://docs.microsandbox.dev/recipes/development/vnc-desktop">Open a Linux desktop</a></strong><br />
+      Use TigerVNC and noVNC for a CPU-only desktop that opens directly in the browser.
+    </td>
+  </tr>
+</table>
+
+**[Browse the full recipe collection →](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)**
 
 <br />
 
