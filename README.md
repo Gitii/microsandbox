@@ -325,10 +325,10 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 
 Practical ways to put microsandbox to work:
 
-- <img height="14" src="https://octicons-col.vercel.app/dependabot/A770EF"> **[AI Coding Agent](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)**: Let an agent edit and test a copied repository, then review its patch before anything crosses back to the host.
-- <img height="14" src="https://octicons-col.vercel.app/shield-lock/A770EF"> **[Untrusted Code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)**: Bound CPU, memory, time, processes, files, and network access for user-submitted programs.
-- <img height="14" src="https://octicons-col.vercel.app/container/A770EF"> **[Docker in a Sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)**: Start nested containers without exposing the host Docker daemon or its socket.
-- <img height="14" src="https://octicons-col.vercel.app/cache/A770EF"> **[Warm Workers](https://docs.microsandbox.dev/recipes/sandboxing/warm-workers)**: Install a toolchain once, snapshot it, and launch clean workers from the prepared environment.
+- <img height="14" src="https://octicons-col.vercel.app/dependabot/A770EF"> **[AI Coding Agent](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)**: Edit and test copied repositories safely.
+- <img height="14" src="https://octicons-col.vercel.app/shield-lock/A770EF"> **[Untrusted Code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)**: Enforce CPU, memory, time, and network limits.
+- <img height="14" src="https://octicons-col.vercel.app/container/A770EF"> **[Docker in a Sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)**: Run nested containers without the host socket.
+- <img height="14" src="https://octicons-col.vercel.app/cache/A770EF"> **[Warm Workers](https://docs.microsandbox.dev/recipes/sandboxing/warm-workers)**: Snapshot once, then launch clean workers.
 
 <br />
 
