@@ -5,15 +5,15 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use microsandbox_image::snapshot::{
-    DEFAULT_UPPER_FILE, DESCRIPTOR_FILENAME, ImageRef, Manifest, SCHEMA_VERSION,
-    SNAPSHOT_ARTIFACT_KIND, SnapshotFormat, SnapshotScope, UpperLayer,
+    DEFAULT_UPPER_FILE, DESCRIPTOR_FILENAME, FileSnapshotState, ImageRef, Manifest, SCHEMA_VERSION,
+    SNAPSHOT_ARTIFACT_KIND, SnapshotFormat, SnapshotScope, SnapshotState, UpperLayer,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::backend::LocalBackend;
 use crate::db::entity::sandbox as sandbox_entity;
 use crate::sandbox::{RootDisk, SandboxConfig, SandboxStatus};
-use crate::{MicrosandboxError, MicrosandboxResult};
+use crate::{MicrosandboxError, MicrosandboxResult, Operation, UnsupportedReason};
 
 use super::store::index_upsert;
 use super::{Snapshot, SnapshotConfig};
@@ -32,15 +32,17 @@ pub(super) async fn create_snapshot(
         source_sandbox,
         labels,
         force,
-        record_integrity,
+        record_integrity: _,
         resumable,
     } = config;
 
     if resumable {
-        return Err(MicrosandboxError::Unsupported {
-            feature: "Resumable snapshots".into(),
-            available_when: "after VM pause/resume and resumable restore support land".into(),
-        });
+        return Err(MicrosandboxError::unsupported(
+            Operation::SnapshotOps,
+            UnsupportedReason::NotAvailable(
+                "resumable snapshots require VM pause/resume restore support".into(),
+            ),
+        ));
     }
 
     // Validate the destination before anything else so name errors surface
@@ -116,7 +118,6 @@ pub(super) async fn create_snapshot(
     let built = build_artifact(
         &staging_dir,
         &src_upper,
-        record_integrity,
         labels,
         image_reference,
         manifest_digest_str,
@@ -154,7 +155,6 @@ pub(super) async fn create_snapshot(
 async fn build_artifact(
     dir: &std::path::Path,
     src_upper: &std::path::Path,
-    record_integrity: bool,
     labels: Vec<(String, String)>,
     image_reference: String,
     manifest_digest_str: String,
@@ -182,11 +182,9 @@ async fn build_artifact(
     .await
     .map_err(|e| MicrosandboxError::Custom(format!("snapshot upper fsync task: {e}")))??;
 
-    let integrity = if record_integrity {
-        Some(super::verify::compute_sparse_integrity(&dst_upper).await?)
-    } else {
-        None
-    };
+    // File-state identity always binds the exact logical payload. This hash is
+    // mandatory in final schema 1, regardless of the legacy builder option.
+    let integrity = super::verify::compute_sparse_integrity(&dst_upper).await?;
 
     // Build the manifest.
     let mut label_map: BTreeMap<String, String> = BTreeMap::new();
@@ -198,21 +196,23 @@ async fn build_artifact(
         schema: SCHEMA_VERSION,
         artifact: SNAPSHOT_ARTIFACT_KIND.into(),
         scope: SnapshotScope::Disk,
-        format: SnapshotFormat::Raw,
-        fstype: "ext4".into(),
+        created_at: Utc::now().to_rfc3339(),
+        parent: None,
         image: ImageRef {
             reference: image_reference,
             manifest_digest: manifest_digest_str,
         },
-        parent: None,
-        created_at: Utc::now().to_rfc3339(),
-        labels: label_map,
-        upper: UpperLayer {
-            file: DEFAULT_UPPER_FILE.into(),
-            size_bytes: copied_len,
-            integrity,
-        },
         source_sandbox: Some(source_sandbox.to_string()),
+        state: SnapshotState::File(FileSnapshotState {
+            format: SnapshotFormat::Raw,
+            fstype: "ext4".into(),
+            upper: UpperLayer {
+                file: DEFAULT_UPPER_FILE.into(),
+                size_bytes: copied_len,
+                integrity,
+            },
+        }),
+        labels: label_map,
         extensions: BTreeMap::new(),
         requires: Vec::new(),
     };

@@ -22,7 +22,9 @@ use super::{
         SecurityProfile, VolumeMount,
     },
 };
-use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, size::Mebibytes};
+use crate::{
+    LogLevel, MicrosandboxError, MicrosandboxResult, Operation, UnsupportedReason, size::Mebibytes,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -340,6 +342,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Request a globally-unique slug for the sandbox (cloud backends only).
+    ///
+    /// Lowercase letters, digits, and single hyphens. When unset, the cloud
+    /// assigns one; create fails when the slug is already taken. The local
+    /// backend has no slugs and ignores this with a warning.
+    pub fn slug(mut self, slug: impl Into<String>) -> Self {
+        self.config.slug = Some(slug.into());
+        self
+    }
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If a sandbox with this name is already active, microsandbox stops
@@ -379,22 +391,28 @@ impl SandboxBuilder {
         self
     }
 
-    /// Clear detached startup intent for attached CLI `run`.
+    /// Select the foreground command for attached CLI `run`.
     #[doc(hidden)]
-    pub fn initial_command(mut self, command: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.config
-            .set_initial_command(command.into_iter().map(Into::into).collect());
-        self
-    }
-
-    /// Set the persisted startup command for detached CLI `run`.
-    #[doc(hidden)]
-    pub fn persistent_initial_command(
+    pub fn foreground_command(
         mut self,
         command: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.config
-            .set_persistent_initial_command(command.into_iter().map(Into::into).collect());
+            .set_foreground_command(command.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Select the background command for detached CLI `run`.
+    ///
+    /// An empty command uses the image's default CMD. A non-empty command replaces CMD while
+    /// preserving the effective OCI entrypoint.
+    #[doc(hidden)]
+    pub fn background_command(
+        mut self,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config
+            .set_background_command(command.into_iter().map(Into::into).collect());
         self
     }
 
@@ -933,27 +951,49 @@ impl SandboxBuilder {
 
         let snap = crate::snapshot::Snapshot::open(&snapshot_ref).await?;
         if snap.manifest().scope != crate::snapshot::SnapshotScope::Disk {
-            return Err(crate::MicrosandboxError::Unsupported {
-                feature: "Restoring non-disk snapshots".into(),
-                available_when: "after resumable restore support lands; upgrade may be required"
-                    .into(),
-            });
+            return Err(crate::MicrosandboxError::unsupported(
+                Operation::SnapshotOps,
+                UnsupportedReason::NotAvailable(
+                    "restoring non-disk snapshots requires resumable restore support".into(),
+                ),
+            ));
         }
         let unsupported = snap.manifest().unsupported_requires();
         if !unsupported.is_empty() {
-            return Err(crate::MicrosandboxError::Unsupported {
-                feature: format!(
-                    "snapshot requires capabilities this runtime does not have: {}",
+            return Err(crate::MicrosandboxError::unsupported(
+                Operation::SnapshotOps,
+                UnsupportedReason::NotAvailable(format!(
+                    "snapshot requires unsupported runtime capabilities: {}",
                     unsupported.join(", ")
-                ),
-                available_when: "in a runtime that understands these snapshot extensions".into(),
-            });
+                )),
+            ));
+        }
+        let file_state = match &snap.manifest().state {
+            crate::snapshot::SnapshotState::File(state) => state,
+            crate::snapshot::SnapshotState::Checkpoint(_) => {
+                return Err(crate::MicrosandboxError::unsupported(
+                    Operation::SnapshotOps,
+                    UnsupportedReason::NotAvailable(
+                        "checkpoint-state restore providers are not available".into(),
+                    ),
+                ));
+            }
+        };
+        if file_state.format != crate::snapshot::SnapshotFormat::Raw || file_state.fstype != "ext4"
+        {
+            return Err(crate::MicrosandboxError::unsupported(
+                Operation::SnapshotOps,
+                UnsupportedReason::NotAvailable(format!(
+                    "snapshot file state {:?}/{} is not qualified for restore",
+                    file_state.format, file_state.fstype
+                )),
+            ));
         }
         let snap_ref = snap.manifest().image.reference.clone();
 
         self.config.spec.image = RootfsSource::oci(snap_ref);
         self.config.manifest_digest = Some(snap.manifest().image.manifest_digest.clone());
-        self.config.snapshot_upper_source = Some(snap.path().join(&snap.manifest().upper.file));
+        self.config.snapshot_upper_source = Some(snap.path().join(&file_state.upper.file));
         Ok(())
     }
 
@@ -1008,7 +1048,15 @@ impl SandboxBuilder {
                     } else {
                         crate::runtime::SpawnMode::Attached
                     };
-                    crate::sandbox::create_local(backend, config, mode, Some(sender)).await
+                    // Pull progress is a local-only extension that is not part of
+                    // SandboxBackend::create, so dispatch to the local backend's
+                    // canonical create entry point explicitly.
+                    let local = backend
+                        .as_local()
+                        .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxCreate))?;
+                    local
+                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender);
@@ -1043,13 +1091,17 @@ impl SandboxBuilder {
             let backend = crate::backend::default_backend();
             match backend.kind() {
                 crate::backend::BackendKind::Local => {
-                    crate::sandbox::create_local(
-                        backend,
-                        config,
-                        crate::runtime::SpawnMode::Detached,
-                        Some(sender),
-                    )
-                    .await
+                    let local = backend
+                        .as_local()
+                        .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxCreate))?;
+                    local
+                        .create_sandbox(
+                            backend.clone(),
+                            config,
+                            crate::runtime::SpawnMode::Detached,
+                            Some(sender),
+                        )
+                        .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender);

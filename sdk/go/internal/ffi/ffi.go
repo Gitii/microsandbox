@@ -1076,6 +1076,7 @@ const (
 	KindSnapshotSandboxRunning = "snapshot_sandbox_running"
 	KindSnapshotImageMissing   = "snapshot_image_missing"
 	KindSnapshotIntegrity      = "snapshot_integrity"
+	KindSnapshotMigration      = "snapshot_migration"
 	KindPatchFailed            = "patch_failed"
 	KindMetricsDisabled        = "metrics_disabled"
 	KindMetricsUnavailable     = "metrics_unavailable"
@@ -1466,9 +1467,17 @@ func (c *AgentClient) CloseCtx(ctx context.Context) error {
 // Sandbox lifecycle
 // =============================================================================
 
-// SandboxListFilter matches the JSON filter shape expected by msb_sandbox_list.
-type SandboxListFilter struct {
+// SandboxListOptions matches the JSON request shape expected by msb_sandbox_list.
+type SandboxListOptions struct {
+	Cursor *string           `json:"cursor,omitempty"`
+	Limit  *uint32           `json:"limit,omitempty"`
 	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// SandboxPage is the JSON page returned by msb_sandbox_list.
+type SandboxPage struct {
+	Sandboxes  []*SandboxHandleInfo `json:"sandboxes"`
+	NextCursor *string              `json:"next_cursor"`
 }
 
 // CreateOptions matches the JSON payload shape expected by msb_sandbox_create.
@@ -2229,13 +2238,12 @@ func (s *Sandbox) Modify(ctx context.Context, optsJSON string) (string, error) {
 	})
 }
 
-// ListSandboxes returns metadata for all known sandboxes (running or stopped),
-// optionally filtered by the given labels (AND-matched).
-func ListSandboxes(ctx context.Context, labels map[string]string) ([]*SandboxHandleInfo, error) {
+// ListSandboxes returns one configured page of sandbox metadata.
+func ListSandboxes(ctx context.Context, options SandboxListOptions) (*SandboxPage, error) {
 	if err := ensureLoaded(); err != nil {
 		return nil, err
 	}
-	filterJSON, err := json.Marshal(SandboxListFilter{Labels: labels})
+	filterJSON, err := json.Marshal(options)
 	if err != nil {
 		return nil, fmt.Errorf("marshal list filter: %w", err)
 	}
@@ -2248,11 +2256,11 @@ func ListSandboxes(ctx context.Context, labels map[string]string) ([]*SandboxHan
 	if err != nil {
 		return nil, err
 	}
-	var infos []*SandboxHandleInfo
-	if err := json.Unmarshal([]byte(out), &infos); err != nil {
+	var page SandboxPage
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
 		return nil, fmt.Errorf("parse sandbox list: %w", err)
 	}
-	return infos, nil
+	return &page, nil
 }
 
 // RemoveSandbox removes a stopped sandbox's persisted state by name.
@@ -4271,30 +4279,43 @@ func ImageSave(ctx context.Context, references []string, outputPath string, form
 // ---------------------------------------------------------------------------
 
 type SnapshotInfo struct {
-	Path                string            `json:"path"`
-	Digest              string            `json:"digest"`
-	SizeBytes           uint64            `json:"size_bytes"`
-	ImageRef            string            `json:"image_ref"`
-	ImageManifestDigest string            `json:"image_manifest_digest"`
-	Scope               string            `json:"scope"`
-	Format              string            `json:"format"`
-	Fstype              string            `json:"fstype"`
-	Parent              *string           `json:"parent"`
-	CreatedAt           string            `json:"created_at"`
-	Labels              map[string]string `json:"labels"`
-	SourceSandbox       *string           `json:"source_sandbox"`
+	Path                     string            `json:"path"`
+	Digest                   string            `json:"digest"`
+	SizeBytes                *uint64           `json:"size_bytes"`
+	ImageRef                 string            `json:"image_ref"`
+	ImageManifestDigest      string            `json:"image_manifest_digest"`
+	Scope                    string            `json:"scope"`
+	StateKind                string            `json:"state_kind"`
+	Format                   *string           `json:"format"`
+	Fstype                   *string           `json:"fstype"`
+	UpperFile                *string           `json:"upper_file"`
+	UpperIntegrityAlgorithm  *string           `json:"upper_integrity_algorithm"`
+	UpperIntegrityDigest     *string           `json:"upper_integrity_digest"`
+	CheckpointID             *string           `json:"checkpoint_id"`
+	CheckpointManifestDigest *string           `json:"checkpoint_manifest_digest"`
+	Parent                   *string           `json:"parent"`
+	CreatedAt                string            `json:"created_at"`
+	Labels                   map[string]string `json:"labels"`
+	SourceSandbox            *string           `json:"source_sandbox"`
 }
 
 type SnapshotHandleInfo struct {
-	Digest        string  `json:"digest"`
-	Name          *string `json:"name"`
-	ParentDigest  *string `json:"parent_digest"`
-	ImageRef      string  `json:"image_ref"`
-	Scope         string  `json:"scope"`
-	Format        string  `json:"format"`
-	SizeBytes     *uint64 `json:"size_bytes"`
-	CreatedAtUnix int64   `json:"created_at_unix"`
-	Path          string  `json:"path"`
+	Digest                   string  `json:"digest"`
+	Name                     *string `json:"name"`
+	ParentDigest             *string `json:"parent_digest"`
+	ImageRef                 string  `json:"image_ref"`
+	Scope                    string  `json:"scope"`
+	StateKind                string  `json:"state_kind"`
+	Format                   *string `json:"format"`
+	Fstype                   *string `json:"fstype"`
+	CheckpointManifestDigest *string `json:"checkpoint_manifest_digest"`
+	SizeBytes                *uint64 `json:"size_bytes"`
+	Locality                 string  `json:"locality"`
+	Availability             string  `json:"availability"`
+	MigrationState           string  `json:"migration_state"`
+	MigrationErrorCode       *string `json:"migration_error_code"`
+	CreatedAtUnix            int64   `json:"created_at_unix"`
+	Path                     string  `json:"path"`
 }
 
 type SnapshotVerifyReport struct {

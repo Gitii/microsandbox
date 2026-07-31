@@ -119,16 +119,23 @@ export interface NapiAgentClient {
 export type NapiBuilderCtor<T> = new () => T;
 export type NapiSandboxConfig = Record<string, unknown>;
 
-export interface NapiSandboxListFilter {
+export interface NapiSandboxListOptions {
+  cursor?: string;
+  limit?: number;
   labels?: Record<string, string>;
+}
+
+export interface NapiSandboxPage {
+  sandboxes: NapiSandboxHandle[];
+  nextCursor?: string;
 }
 
 export interface NapiSandboxStatic {
   start(name: string): Promise<NapiSandbox>;
   startDetached(name: string): Promise<NapiSandbox>;
   get(name: string): Promise<NapiSandboxHandle>;
-  list(): Promise<NapiSandboxHandle[]>;
-  listWith(filter: NapiSandboxListFilter): Promise<NapiSandboxHandle[]>;
+  list(): Promise<NapiSandboxPage>;
+  listWith(options: NapiSandboxListOptions): Promise<NapiSandboxPage>;
   remove(name: string): Promise<void>;
 }
 
@@ -523,11 +530,17 @@ export interface NapiSnapshotBuilder extends NapiSnapshotBuilderSetters {
 export interface NapiSnapshot {
   readonly path: string;
   readonly digest: string;
-  readonly sizeBytes: bigint;
+  readonly sizeBytes: bigint | null | undefined;
   readonly imageRef: string;
   readonly imageManifestDigest: string;
-  readonly format: string; // "raw" | "qcow2"
-  readonly fstype: string;
+  readonly stateKind: string; // "file" | "checkpoint"
+  readonly format: string | null | undefined; // "raw" | "qcow2"
+  readonly fstype: string | null | undefined;
+  readonly upperFile: string | null | undefined;
+  readonly upperIntegrityAlgorithm: string | null | undefined;
+  readonly upperIntegrityDigest: string | null | undefined;
+  readonly checkpointId: string | null | undefined;
+  readonly checkpointManifestDigest: string | null | undefined;
   readonly parent: string | null | undefined;
   readonly scope: string; // "disk" | "resumable"
   readonly createdAt: string; // RFC 3339 UTC
@@ -542,8 +555,15 @@ export interface NapiSnapshotHandle {
   readonly parentDigest: string | null | undefined;
   readonly scope: string; // "disk" | "resumable"
   readonly imageRef: string;
-  readonly format: string;
+  readonly stateKind: string;
+  readonly format: string | null | undefined;
+  readonly fstype: string | null | undefined;
+  readonly checkpointManifestDigest: string | null | undefined;
   readonly sizeBytes: bigint | null | undefined;
+  readonly locality: string;
+  readonly availability: string;
+  readonly migrationState: string;
+  readonly migrationErrorCode: string | null | undefined;
   readonly createdAt: number;
   readonly path: string;
   open(): Promise<NapiSnapshot>;
@@ -556,8 +576,15 @@ export interface NapiSnapshotInfo {
   readonly parentDigest: string | null | undefined;
   readonly scope: string; // "disk" | "resumable"
   readonly imageRef: string;
-  readonly format: string;
+  readonly stateKind: string;
+  readonly format: string | null | undefined;
+  readonly fstype: string | null | undefined;
+  readonly checkpointManifestDigest: string | null | undefined;
   readonly sizeBytes: number | null | undefined;
+  readonly locality: string;
+  readonly availability: string;
+  readonly migrationState: string;
+  readonly migrationErrorCode: string | null | undefined;
   readonly createdAt: number;
   readonly path: string;
 }
@@ -575,7 +602,7 @@ export interface NapiSnapshotRemoveOptions {
 export interface NapiSnapshotVerifyReport {
   readonly digest: string;
   readonly path: string;
-  readonly upperKind: string; // "notRecorded" | "verified"
+  readonly upperKind: string; // "verified"
   readonly upperAlgorithm: string | null | undefined;
   readonly upperDigest: string | null | undefined;
 }

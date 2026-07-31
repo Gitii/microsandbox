@@ -839,10 +839,10 @@ export declare class Sandbox {
    * Sandbox names are limited to 128 UTF-8 bytes.
    */
   static get(name: string): Promise<JsSandboxHandle>
-  /** List all sandboxes. */
-  static list(): Promise<Array<JsSandboxHandle>>
-  /** List sandboxes matching a filter. */
-  static listWith(filter: SandboxListFilter): Promise<Array<JsSandboxHandle>>
+  /** List the first page of sandboxes. */
+  static list(): Promise<JsSandboxPage>
+  /** List a configured page of sandboxes. */
+  static listWith(options: SandboxListOptions): Promise<JsSandboxPage>
   /**
    * Remove a stopped sandbox from the database.
    *
@@ -1306,7 +1306,7 @@ export type JsSandboxHandle = SandboxHandle
 export declare class SecretBuilder {
   constructor()
   /** Environment variable to expose the placeholder under (required). */
-  env(var: string): this
+  env(envVar: string): this
   /** Secret value (required). */
   value(value: string): this
   /** Custom placeholder. Auto-generated as `$MSB_<env>` when unset. */
@@ -1400,11 +1400,17 @@ export declare class Snapshot {
   static load(archive: string, dest?: string | undefined | null): Promise<SnapshotHandle>
   get path(): string
   get digest(): string
-  get sizeBytes(): bigint
+  get sizeBytes(): bigint | null
   get imageRef(): string
   get imageManifestDigest(): string
-  get format(): string
-  get fstype(): string
+  get stateKind(): string
+  get format(): string | null
+  get fstype(): string | null
+  get upperFile(): string | null
+  get upperIntegrityAlgorithm(): string | null
+  get upperIntegrityDigest(): string | null
+  get checkpointId(): string | null
+  get checkpointManifestDigest(): string | null
   get parent(): string | null
   get scope(): 'disk' | 'resumable'
   get createdAt(): string
@@ -1457,8 +1463,15 @@ export declare class SnapshotHandle {
   get parentDigest(): string | null
   get scope(): 'disk' | 'resumable'
   get imageRef(): string
-  get format(): string
+  get stateKind(): string
+  get format(): string | null
+  get fstype(): string | null
+  get checkpointManifestDigest(): string | null
   get sizeBytes(): bigint | null
+  get locality(): string
+  get availability(): string
+  get migrationState(): string
+  get migrationErrorCode(): string | null
   get createdAt(): number
   get path(): string
   open(): Promise<Snapshot>
@@ -1801,6 +1814,12 @@ export declare function install(): Promise<void>
 /** Check if msb and libkrunfw are installed and available. */
 export declare function isInstalled(): boolean
 
+/** One page returned by `Sandbox.list` / `Sandbox.listWith`. */
+export interface JsSandboxPage {
+  sandboxes: Array<JsSandboxHandle>
+  nextCursor?: string
+}
+
 /** One captured log entry from `exec.log`. */
 export interface LogEntry {
   /** Wall-clock timestamp when the chunk was captured (ms since epoch). */
@@ -2034,11 +2053,10 @@ export interface Rlimit {
   hard: number
 }
 
-/**
- * Filter for `Sandbox.list`. Matched sandboxes must carry all of `labels`
- * (AND-matched). Omit or leave empty to match every sandbox.
- */
-export interface SandboxListFilter {
+/** Options for one paginated sandbox list request. */
+export interface SandboxListOptions {
+  cursor?: string
+  limit?: number
   labels?: Record<string, string>
 }
 
@@ -2216,8 +2234,15 @@ export interface SnapshotInfo {
   /** `"disk"` today; `"resumable"` once memory/device-state restore lands. */
   scope: string
   /** `"raw"` or `"qcow2"`. */
-  format: string
+  stateKind: string
+  format?: string
+  fstype?: string
+  checkpointManifestDigest?: string
   sizeBytes?: number
+  locality: string
+  availability: string
+  migrationState: string
+  migrationErrorCode?: string
   createdAt: number
   path: string
 }
@@ -2235,10 +2260,8 @@ export interface SnapshotRemoveOptions {
 /**
  * Result of `Snapshot.verify()`.
  *
- * `upperKind` is `"notRecorded"` when no integrity hash was stored,
- * or `"verified"` when the recorded hash matched the recomputed one.
- * `upperAlgorithm` and `upperDigest` are populated only when
- * `upperKind === "verified"`.
+ * `upperKind` is `"verified"` when the mandatory file-state integrity
+ * matched. `upperAlgorithm` and `upperDigest` carry the verified binding.
  */
 export interface SnapshotVerifyReport {
   digest: string
