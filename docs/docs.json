@@ -200,6 +200,7 @@
             "group": "Agents",
             "icon": "robot",
             "pages": [
+              "recipes/overview",
               "recipes/use-cases/ai-coding-agent",
               "recipes/agents/opencode",
               "recipes/agents/openclaw",
@@ -207,6 +208,15 @@
               "recipes/agents/gemini-cli",
               "recipes/agents/hermes-agent",
               "recipes/agents/pi"
+            ]
+          },
+          {
+            "group": "CI/CD",
+            "icon": "code-pull-request",
+            "pages": [
+              "recipes/ci-cd/pr-checks",
+              "recipes/ci-cd/compose-tests",
+              "recipes/ci-cd/preview-deploys"
             ]
           },
           {
@@ -219,6 +229,14 @@
             ]
           },
           {
+            "group": "Guest Systems",
+            "icon": "desktop",
+            "pages": [
+              "recipes/development/vnc-desktop",
+              "recipes/guest/systemd-services"
+            ]
+          },
+          {
             "group": "Sandboxing",
             "icon": "shield-halved",
             "pages": [
@@ -227,14 +245,36 @@
             ]
           },
           {
+            "group": "Automation",
+            "icon": "gears",
+            "pages": [
+              "recipes/automation/dependency-audits",
+              "recipes/automation/parallel-batch-jobs"
+            ]
+          },
+          {
             "group": "Development",
             "icon": "code",
             "pages": [
               "recipes/development/code-server",
-              "recipes/development/jupyterlab",
+              "recipes/development/jupyterlab"
+            ]
+          },
+          {
+            "group": "Plugins",
+            "icon": "puzzle-piece",
+            "pages": [
+              "recipes/plugins/extism",
+              "recipes/plugins/terraform",
+              "recipes/plugins/eslint"
+            ]
+          },
+          {
+            "group": "Web Automation",
+            "icon": "globe",
+            "pages": [
               "recipes/browser-automation/playwright",
-              "recipes/development/vnc-desktop",
-              "recipes/guest/systemd-services"
+              "recipes/web-automation/scrapy"
             ]
           },
           {
