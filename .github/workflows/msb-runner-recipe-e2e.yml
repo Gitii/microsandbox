@@ -1,0 +1,47 @@
+name: Microsandbox runner recipe E2E
+
+on:
+  push:
+    branches:
+      - appcypher/add-practical-recipes
+    paths:
+      - .github/workflows/msb-runner-recipe-e2e.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: msb-recipe-e2e-20260731t101927z
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test ! -e /var/run/docker.sock
+          test -f README.md
+          sudo -n sh -c 'printf guest-root > /root/microsandbox-runner-smoke'
+          test "$(sudo cat /root/microsandbox-runner-smoke)" = guest-root
+
+          jq -n \
+            --arg runner "$RUNNER_NAME" \
+            --arg os "$RUNNER_OS" \
+            --arg arch "$RUNNER_ARCH" \
+            --arg sha "$(git rev-parse HEAD)" \
+            --argjson uid "$(id -u)" \
+            '{runner:$runner,os:$os,arch:$arch,sha:$sha,uid:$uid}' \
+            > runner-smoke.json
+          cat runner-smoke.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microsandbox-runner-smoke
+          path: runner-smoke.json
+          if-no-files-found: error
