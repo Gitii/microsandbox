@@ -214,6 +214,7 @@
             "group": "CI/CD",
             "icon": "code-pull-request",
             "pages": [
+              "recipes/ci-cd/github-actions-runner",
               "recipes/ci-cd/pr-checks",
               "recipes/ci-cd/compose-tests",
               "recipes/ci-cd/preview-deploys"
@@ -261,10 +262,9 @@
             ]
           },
           {
-            "group": "Plugins",
+            "group": "Tooling",
             "icon": "puzzle-piece",
             "pages": [
-              "recipes/plugins/extism",
               "recipes/plugins/terraform",
               "recipes/plugins/eslint"
             ]

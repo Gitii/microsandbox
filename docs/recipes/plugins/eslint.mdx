@@ -1,18 +1,32 @@
 ---
-title: Run a third-party ESLint plugin
+title: Sandbox an ESLint plugin
 sidebarTitle: ESLint
-description: Analyze JavaScript with a pinned npm plugin in an offline worker
+description: Run arbitrary third-party linter code in an offline microVM
 icon: "magnifying-glass"
 ---
 
-ESLint plugins execute JavaScript in the linter process. This recipe installs a pinned security plugin without lifecycle scripts, snapshots the resulting toolchain and lock file, then analyzes a read-only source file in a resource-bounded worker with no network access.
+An ESLint plugin is JavaScript loaded into the linter process, so installing a package without lifecycle scripts does not make the plugin safe to execute. This recipe prepares a pinned plugin without project credentials, snapshots the toolchain, and loads the plugin only in a disposable worker with read-only source, no network access, and explicit resource limits.
+
+Run the blocks below in one shell so the unique resource names remain available:
+
+```sh
+eslint_run_id="eslint-plugin-$(date +%Y%m%d%H%M%S)-$$"
+eslint_base="${eslint_run_id}-base"
+eslint_snapshot="${eslint_run_id}-runtime"
+eslint_worker="${eslint_run_id}-worker"
+
+eslint_host_dir=$(mktemp -d "${TMPDIR:-/tmp}/msb-eslint-plugin.XXXXXX")
+chmod 700 "$eslint_host_dir"
+eslint_source="$eslint_host_dir/suspicious.cjs"
+eslint_report="$eslint_host_dir/report.json"
+```
 
 ## Prepare the linter
 
-The setup verifies the package integrity values recorded by npm before the toolchain is snapshotted:
+The setup pins Node, ESLint, and `eslint-plugin-security`. npm checks downloaded packages against their registry integrity metadata, while the two hard-coded integrity values ensure the direct ESLint and plugin tarballs match the versions reviewed for this recipe.
 
 ```sh
-msb run --name eslint-plugin-base --replace \
+msb run --name "$eslint_base" \
   --cpus 1 --memory 768M --root-disk 2G \
   --max-duration 5m \
   --script prepare='set -eu
@@ -54,21 +68,20 @@ EOF
   --entrypoint prepare \
   node:22.23.2-bookworm-slim
 
-msb snapshot create eslint-plugin-runtime \
-  --from eslint-plugin-base \
-  --integrity \
-  --force
-msb snapshot verify eslint-plugin-runtime
+msb snapshot create "$eslint_snapshot" \
+  --from "$eslint_base" \
+  --integrity
+msb snapshot verify "$eslint_snapshot"
 ```
 
-`--ignore-scripts` prevents npm `preinstall`, `install`, and `postinstall` hooks. The plugin itself remains executable code and will run when ESLint loads it in the worker.
+`--ignore-scripts` blocks npm `preinstall`, `install`, and `postinstall` hooks during preparation. It does not constrain top-level code or rule implementations: `require(...)` executes the plugin when ESLint starts in the worker. For a real project, prepare a reviewed `package-lock.json` and use `npm ci --ignore-scripts` so the complete transitive dependency graph is fixed before snapshot creation.
 
 ## Create a test target
 
 This deliberately unsafe file triggers two rules from `eslint-plugin-security`:
 
 ```sh
-cat > suspicious.cjs <<'EOF'
+cat > "$eslint_source" <<'EOF'
 const childProcess = require("node:child_process");
 const command = process.argv[2];
 childProcess.exec(command);
@@ -78,17 +91,17 @@ EOF
 
 ## Analyze it offline
 
-Mount the source read-only, run the plugin as the image's unprivileged `node` user, assert the expected findings, and independently probe the worker's network policy. Running non-root also makes the process limit enforceable:
+Mount only the source under review, keep it read-only, and run the plugin as the image's unprivileged `node` user. Running non-root also makes the process limit enforceable.
 
 ```sh
-msb run --name eslint-plugin-worker --replace \
-  --from-snapshot eslint-plugin-runtime \
+msb run --name "$eslint_worker" \
+  --from-snapshot "$eslint_snapshot" \
   --cpus 1 --memory 384M \
   --no-net --security restricted \
   --rlimit nproc=64 --rlimit nofile=128 --rlimit fsize=10485760 \
   --max-duration 30s \
   --user node \
-  --mount-file ./suspicious.cjs:/work/suspicious.cjs:ro \
+  --mount-file "$eslint_source:/work/suspicious.cjs:ro" \
   --script lint-offline='set -eu
     cd /work
 
@@ -119,36 +132,34 @@ security/detect-child-process, security/detect-eval-with-expression
 network blocked
 ```
 
-Stop the worker before exporting its plugin-controlled report. Copy it into a fresh private directory, reject links and unexpected file types or sizes, and only then parse it on the host:
+Stop the worker before exporting the plugin-influenced report. Copy it into the private directory, reject links and unexpected file types or sizes, and only then parse it as JSON on the host:
 
 ```sh
-msb stop eslint-plugin-worker
-
-eslint_output_dir=$(mktemp -d "${TMPDIR:-/tmp}/msb-eslint.XXXXXX")
-chmod 700 "$eslint_output_dir"
-eslint_report="$eslint_output_dir/report.json"
-
-msb cp eslint-plugin-worker:/out/eslint-report.json "$eslint_report"
+msb stop "$eslint_worker"
+msb cp "$eslint_worker:/out/eslint-report.json" "$eslint_report"
 test ! -L "$eslint_report"
 test -f "$eslint_report"
 test -s "$eslint_report"
 test "$(wc -c < "$eslint_report")" -le 1048576
-node -e 'const report = require(process.argv[1]); console.log(report[0].messages.map(message => message.ruleId))' "$eslint_report"
+node -e 'const fs = require("node:fs"); const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log(report[0].messages.map(message => message.ruleId))' "$eslint_report"
 ```
 
-For a real project, replace `--mount-file` with a read-only source mount such as `--mount-dir ./src:/work/src:ro`, then change the ESLint target from `suspicious.cjs` to `src`.
+For a real project, replace the single-file mount with the smallest read-only source tree the linter needs, such as `--mount-dir ./src:/work/src:ro`, then change the target from `suspicious.cjs` to `src`. Do not mount a whole checkout when the plugin only needs one subtree.
 
 <Warning>
-  An npm plugin can read every file exposed to its process, allocate memory, spawn subprocesses within its limits, and write elsewhere in the guest. Mount only the inputs it needs, keep them read-only, enforce duration and concurrency limits, and export only known report paths. Add `--max-warnings 0` if findings must fail a CI job; the plugin's recommended rules report warnings by default.
+  A plugin can read every guest file visible to its process, allocate memory, spawn subprocesses within its limits, and write to writable guest paths. Keep credentials and unrelated source out of the sandbox, leave networking disabled, and export only known report paths from a stopped worker. Add `--max-warnings 0` if findings must fail a CI job; the plugin's recommended rules report warnings by default.
 </Warning>
 
 ## Cleanup
 
+Remove only the resources named by this shell and the private temporary files it created:
+
 ```sh
-msb rm -f eslint-plugin-base eslint-plugin-worker
-msb snapshot rm eslint-plugin-runtime
-rm ./suspicious.cjs "$eslint_report"
-rmdir "$eslint_output_dir"
+msb remove -f "$eslint_worker"
+msb remove -f "$eslint_base"
+msb snapshot remove "$eslint_snapshot"
+rm -f "$eslint_report" "$eslint_source"
+rmdir "$eslint_host_dir"
 ```
 
 ## Reference
