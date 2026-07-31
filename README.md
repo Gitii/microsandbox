@@ -327,12 +327,15 @@ Practical ways to put microsandbox to work:
 
 - <img height="14" src="https://octicons-col.vercel.app/dependabot/A770EF"> **[AI Coding Agent](https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent)**: Edit and test copied repositories inside an isolated microVM.
 - <img height="14" src="https://octicons-col.vercel.app/shield-lock/A770EF"> **[Untrusted Code](https://docs.microsandbox.dev/recipes/use-cases/run-untrusted-code)**: Run user code with strict CPU, memory, time, and network limits.
-- <img height="14" src="https://octicons-col.vercel.app/container/A770EF"> **[Docker in a Sandbox](https://docs.microsandbox.dev/recipes/docker/docker-in-sandbox)**: Run nested containers without exposing the host Docker socket.
+- <img height="14" src="https://octicons-col.vercel.app/checklist/A770EF"> **[PR Checks](https://docs.microsandbox.dev/recipes/ci-cd/pr-checks)**: Test untrusted commits offline from reviewed dependencies.
+- <img height="14" src="https://octicons-col.vercel.app/container/A770EF"> **[Compose Tests](https://docs.microsandbox.dev/recipes/ci-cd/compose-tests)**: Test a full Compose stack without exposing the host Docker socket.
 - <img height="14" src="https://octicons-col.vercel.app/cache/A770EF"> **[Warm Workers](https://docs.microsandbox.dev/recipes/sandboxing/warm-workers)**: Snapshot a toolchain once, then launch clean, prepared workers.
+- <img height="14" src="https://octicons-col.vercel.app/package/A770EF"> **[WebAssembly Plugins](https://docs.microsandbox.dev/recipes/plugins/extism)**: Invoke pinned plugins inside an offline, resource-bounded microVM.
+- <img height="14" src="https://octicons-col.vercel.app/globe/A770EF"> **[Web Crawling](https://docs.microsandbox.dev/recipes/web-automation/scrapy)**: Crawl sites into bounded JSON with robots.txt and network controls.
 
 <br />
 
-<a href="https://docs.microsandbox.dev/recipes/use-cases/ai-coding-agent"><img src="https://img.shields.io/badge/All_Examples-%E2%86%92-A770EF?style=flat-square&labelColor=2b2b2b" alt="All Examples"></a>
+<a href="https://docs.microsandbox.dev/recipes/overview"><img src="https://img.shields.io/badge/Browse_Recipes-%E2%86%92-A770EF?style=flat-square&labelColor=2b2b2b" alt="Browse Recipes"></a>
 
 <br />
 

@@ -1,0 +1,150 @@
+---
+title: Run an Extism WebAssembly plugin
+sidebarTitle: Extism
+description: Invoke a pinned WebAssembly plugin inside an offline microVM
+icon: "puzzle-piece"
+---
+
+[Extism](https://extism.org/) is a plugin runtime for portable WebAssembly modules. This recipe installs a checksum-verified Extism CLI once, snapshots the runtime, and invokes a host-supplied plugin in a fresh microVM with no network access.
+
+## Download a plugin
+
+Use Extism's `count_vowels` example as a small, deterministic plugin:
+
+```sh
+curl -fL --retry 3 \
+  https://github.com/extism/plugins/releases/download/v1.1.1/count_vowels.wasm \
+  -o count_vowels.wasm
+
+printf '%s  %s\n' \
+  72dfe2c69d8e5ac50886b7961664af6cccbbdcabeb45ce48270db2242778ce25 \
+  count_vowels.wasm | shasum -a 256 -c -
+```
+
+The checksum command should print `count_vowels.wasm: OK`.
+
+## Prepare the runtime
+
+The Extism release provides separate Linux archives for AMD64 and ARM64. The setup script selects the guest architecture and verifies the corresponding upstream checksum before installing the binary:
+
+```sh
+msb run --name extism-base --replace \
+  --cpus 1 --memory 512M --root-disk 1G \
+  --max-duration 5m \
+  --script prepare='set -eu
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl
+    rm -rf /var/lib/apt/lists/*
+
+    case "$(uname -m)" in
+      x86_64)
+        extism_arch=amd64
+        extism_sha=34e7ae9bfded6e2c32dee83f70a4e50d34f9d3e80d1762b09625fe82e214d02d
+        ;;
+      aarch64|arm64)
+        extism_arch=arm64
+        extism_sha=d92f830c9be39637569feacb04e9750c28848df6d9a219db94152a9b4eb9452b
+        ;;
+      *)
+        echo "unsupported architecture: $(uname -m)" >&2
+        exit 1
+        ;;
+    esac
+
+    extism_archive=/tmp/extism.tar.gz
+    curl -fL --retry 3 \
+      "https://github.com/extism/cli/releases/download/v1.6.3/extism-v1.6.3-linux-${extism_arch}.tar.gz" \
+      -o "$extism_archive"
+    printf "%s  %s\n" "$extism_sha" "$extism_archive" | sha256sum -c -
+    tar -xzf "$extism_archive" -C /usr/local/bin extism
+    rm "$extism_archive"
+    extism --version | grep -Fx "extism version 1.6.3"
+    install -d -o 65534 -g 65534 /out' \
+  --entrypoint prepare \
+  debian:bookworm-slim
+
+msb snapshot create extism-runtime --from extism-base --integrity --force
+msb snapshot verify extism-runtime
+```
+
+The final two commands record and verify the prepared disk's content integrity. They do not attest the trustworthiness of the software that was initially installed, which is why the release checksums are verified first.
+
+## Invoke the plugin offline
+
+Mount the plugin read-only rather than copying it into the snapshot. The worker runs as unprivileged UID/GID `65534`, so the process limit applies and `/out` is its only prepared output directory. It proves that the mount cannot be changed, invokes the plugin, and confirms that outbound HTTPS is blocked:
+
+```sh
+msb run --name extism-worker --replace \
+  --from-snapshot extism-runtime \
+  --cpus 1 --memory 256M \
+  --no-net --security restricted \
+  --rlimit nproc=64 --rlimit nofile=128 --rlimit fsize=1048576 \
+  --max-duration 30s \
+  --user 65534:65534 --env HOME=/tmp \
+  --mount-file ./count_vowels.wasm:/plugin.wasm:ro \
+  --script invoke='set -eu
+    if (printf x >> /plugin.wasm) 2>/dev/null; then
+      echo "plugin unexpectedly writable" >&2
+      exit 1
+    fi
+    echo "plugin read-only"
+
+    extism call \
+      --input "microsandbox" \
+      /plugin.wasm \
+      count_vowels > /out/result.json
+    grep -Fq '"'"'"count"'"'":4' /out/result.json
+    cat /out/result.json
+
+    if curl -fsS --connect-timeout 2 https://example.com >/dev/null 2>&1; then
+      echo "network unexpectedly reachable" >&2
+      exit 1
+    fi
+    echo "network blocked"' \
+  --entrypoint invoke
+```
+
+The worker should print:
+
+```text
+plugin read-only
+{"count":4,"total":4,"vowels":"aeiouAEIOU"}
+network blocked
+```
+
+The attached run has finished, but stop the sandbox explicitly before exporting an untrusted path. Copy the result into a fresh private directory, reject links and unexpected file types or sizes, and only then inspect it:
+
+```sh
+msb stop extism-worker
+
+extism_output_dir=$(mktemp -d "${TMPDIR:-/tmp}/msb-extism.XXXXXX")
+chmod 700 "$extism_output_dir"
+extism_result="$extism_output_dir/result.json"
+
+msb cp extism-worker:/out/result.json "$extism_result"
+test ! -L "$extism_result"
+test -f "$extism_result"
+test -s "$extism_result"
+test "$(wc -c < "$extism_result")" -le 4096
+grep -F '"count":4' "$extism_result"
+```
+
+<Warning>
+  Extism controls the capabilities exposed to a compatible WebAssembly plugin, while microsandbox supplies an outer VM, resource, filesystem, and network boundary. Do not assume an arbitrary `.wasm` file implements the Extism ABI, and do not mount host directories read-write for untrusted plugins.
+</Warning>
+
+## Cleanup
+
+```sh
+msb rm -f extism-base extism-worker
+msb snapshot rm extism-runtime
+rm ./count_vowels.wasm "$extism_result"
+rmdir "$extism_output_dir"
+```
+
+## Reference
+
+- [Extism CLI](https://extism.org/docs/install/)
+- [Calling plugins](https://extism.org/docs/quickstart/host-quickstart/)
+- [Extism CLI v1.6.3](https://github.com/extism/cli/releases/tag/v1.6.3)
