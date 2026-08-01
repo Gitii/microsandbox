@@ -440,6 +440,37 @@ impl DnsForwarder {
         handle.changed().await.ok()?;
         handle.borrow().clone()
     }
+
+    /// Build a forwarder for proxy tests whose queries are handled locally.
+    #[cfg(test)]
+    pub(crate) async fn for_proxy_test(shared: Arc<SharedState>, gateway: GatewayIps) -> Arc<Self> {
+        let config = Arc::new(NormalizedDnsConfig::from_config(
+            crate::config::DnsConfig::default(),
+        ));
+        let upstream = SocketAddr::from(([127, 0, 0, 1], 9));
+        let configured_udp = build_udp_client(upstream, config.query_timeout)
+            .await
+            .expect("test UDP client should initialize");
+        let gateway_ips = Arc::new(
+            gateway
+                .ipv4
+                .map(IpAddr::V4)
+                .into_iter()
+                .chain(gateway.ipv6.map(IpAddr::V6))
+                .collect(),
+        );
+
+        Arc::new(Self {
+            configured_udp,
+            configured_tcp: OnceCell::new(),
+            configured_upstream: upstream,
+            gateway_ips,
+            network_policy: Arc::new(NetworkPolicy::allow_all()),
+            shared,
+            gateway,
+            config,
+        })
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
