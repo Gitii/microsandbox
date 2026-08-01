@@ -2029,4 +2029,88 @@ mod tests {
             "creation at the limit must be refused",
         );
     }
+
+    #[test]
+    fn guest_fin_before_proxy_spawn_is_handed_off() {
+        let shared = Arc::new(SharedState::new(64));
+        let poll_config = leak_poll_config();
+        let mut device = SmoltcpDevice::new(shared.clone(), poll_config.mtu);
+        let mut iface = create_interface(&mut device, &poll_config);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut tracker = ConnectionTracker::new(None);
+        let now = smoltcp_now();
+        let guest_port = 54323;
+        let guest_isn = 1000i32;
+        let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), guest_port);
+        let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 443);
+
+        ingress(
+            build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP),
+            &mut device,
+            &mut iface,
+            &mut sockets,
+            &shared,
+            now,
+        );
+        let _ = shared.rx_ring.pop();
+
+        assert!(tracker.create_tcp_socket(src, dst, &mut sockets));
+        ingress(
+            build_tcp_frame(guest_port, 443, TcpControl::Syn, guest_isn, None, &[]),
+            &mut device,
+            &mut iface,
+            &mut sockets,
+            &shared,
+            now,
+        );
+        let (server_isn, _, is_syn, _, _) =
+            last_tcp_reply(&shared).expect("expected SYN-ACK from smoltcp");
+        assert!(is_syn, "expected SYN flag on handshake reply");
+
+        // The production poll loop drains every queued guest frame before
+        // taking new connections, so the handshake ACK and FIN can both be
+        // processed before the proxy task is spawned.
+        ingress(
+            build_tcp_frame(
+                guest_port,
+                443,
+                TcpControl::None,
+                guest_isn + 1,
+                Some(server_isn + 1),
+                &[],
+            ),
+            &mut device,
+            &mut iface,
+            &mut sockets,
+            &shared,
+            now,
+        );
+        ingress(
+            build_tcp_frame(
+                guest_port,
+                443,
+                TcpControl::Fin,
+                guest_isn + 1,
+                Some(server_isn + 1),
+                &[],
+            ),
+            &mut device,
+            &mut iface,
+            &mut sockets,
+            &shared,
+            now,
+        );
+        assert_eq!(
+            only_tcp_state(&sockets),
+            Some(tcp::State::CloseWait),
+            "guest FIN should arrive before the proxy handoff",
+        );
+
+        let new_conns = tracker.take_new_connections(&mut sockets);
+        assert_eq!(
+            new_conns.len(),
+            1,
+            "a connection that reached CLOSE_WAIT still needs a proxy task",
+        );
+    }
 }
