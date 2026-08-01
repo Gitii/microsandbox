@@ -228,25 +228,33 @@ impl DotProxy {
     /// responses back through an internal channel.
     async fn dispatch_loop(&mut self) -> io::Result<()> {
         let (resp_tx, mut resp_rx) = mpsc::channel::<Bytes>(RESPONSE_CHANNEL_CAPACITY);
+        let mut resp_tx = Some(resp_tx);
+        let mut guest_eof = false;
 
         // Any plaintext already decrypted during the handshake (TLS 1.3
         // 0-RTT / early-data flight) must be drained before the select
         // loop starts — otherwise we might block waiting for the next
         // record and miss an in-flight query.
         self.drain_plaintext()?;
-        self.dispatch_ready_queries(&resp_tx);
+        self.dispatch_ready_queries(resp_tx.as_ref().unwrap());
 
         loop {
             tokio::select! {
                 // Incoming encrypted bytes from the guest.
-                incoming = timeout(IDLE_TIMEOUT, self.from_smoltcp.recv()) => {
+                incoming = timeout(IDLE_TIMEOUT, self.from_smoltcp.recv()), if !guest_eof => {
                     match incoming {
                         Ok(Some(chunk)) => {
                             self.feed_tls(&chunk)?;
                             self.drain_plaintext()?;
-                            self.dispatch_ready_queries(&resp_tx);
+                            self.dispatch_ready_queries(resp_tx.as_ref().unwrap());
                         }
-                        Ok(None) => return Ok(()),
+                        Ok(None) => {
+                            // Guest half-close: no more queries can arrive, but
+                            // keep the TLS write side alive until every query
+                            // already handed to the forwarder has responded.
+                            guest_eof = true;
+                            drop(resp_tx.take());
+                        }
                         Err(_) => {
                             tracing::debug!(dst = %self.dst, "DoT: idle timeout, closing connection");
                             return Ok(());
@@ -255,9 +263,19 @@ impl DotProxy {
                 }
 
                 // A forwarded DNS response is ready. Frame + encrypt + send.
-                Some(response) = resp_rx.recv() => {
-                    self.write_plaintext(&frame(&response))?;
-                    self.flush_to_guest().await?;
+                response = resp_rx.recv() => {
+                    match response {
+                        Some(response) => {
+                            self.write_plaintext(&frame(&response))?;
+                            self.flush_to_guest().await?;
+                        }
+                        None => {
+                            debug_assert!(guest_eof);
+                            self.guest_tls.send_close_notify();
+                            self.flush_to_guest().await?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
