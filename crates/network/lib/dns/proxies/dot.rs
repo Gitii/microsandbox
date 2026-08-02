@@ -228,33 +228,25 @@ impl DotProxy {
     /// responses back through an internal channel.
     async fn dispatch_loop(&mut self) -> io::Result<()> {
         let (resp_tx, mut resp_rx) = mpsc::channel::<Bytes>(RESPONSE_CHANNEL_CAPACITY);
-        let mut resp_tx = Some(resp_tx);
-        let mut guest_eof = false;
 
         // Any plaintext already decrypted during the handshake (TLS 1.3
         // 0-RTT / early-data flight) must be drained before the select
         // loop starts — otherwise we might block waiting for the next
         // record and miss an in-flight query.
         self.drain_plaintext()?;
-        self.dispatch_ready_queries(resp_tx.as_ref().unwrap());
+        self.dispatch_ready_queries(&resp_tx);
 
         loop {
             tokio::select! {
                 // Incoming encrypted bytes from the guest.
-                incoming = timeout(IDLE_TIMEOUT, self.from_smoltcp.recv()), if !guest_eof => {
+                incoming = timeout(IDLE_TIMEOUT, self.from_smoltcp.recv()) => {
                     match incoming {
                         Ok(Some(chunk)) => {
                             self.feed_tls(&chunk)?;
                             self.drain_plaintext()?;
-                            self.dispatch_ready_queries(resp_tx.as_ref().unwrap());
+                            self.dispatch_ready_queries(&resp_tx);
                         }
-                        Ok(None) => {
-                            // Stop accepting queries from the guest. Dropping the
-                            // root sender lets `resp_rx` close after all in-flight
-                            // forwarder tasks have dropped their cloned senders.
-                            guest_eof = true;
-                            drop(resp_tx.take());
-                        }
+                        Ok(None) => break,
                         Err(_) => {
                             tracing::debug!(dst = %self.dst, "DoT: idle timeout, closing connection");
                             return Ok(());
@@ -263,22 +255,23 @@ impl DotProxy {
                 }
 
                 // A forwarded DNS response is ready. Frame + encrypt + send.
-                response = resp_rx.recv() => {
-                    match response {
-                        Some(response) => {
-                            self.write_plaintext(&frame(&response))?;
-                            self.flush_to_guest().await?;
-                        }
-                        None => {
-                            debug_assert!(guest_eof);
-                            self.guest_tls.send_close_notify();
-                            self.flush_to_guest().await?;
-                            return Ok(());
-                        }
-                    }
+                Some(response) = resp_rx.recv() => {
+                    self.write_plaintext(&frame(&response))?;
+                    self.flush_to_guest().await?;
                 }
             }
         }
+
+        // Stop accepting queries from the guest. Dropping the root sender lets
+        // `resp_rx` close after all in-flight tasks drop their cloned senders.
+        drop(resp_tx);
+        while let Some(response) = resp_rx.recv().await {
+            self.write_plaintext(&frame(&response))?;
+            self.flush_to_guest().await?;
+        }
+
+        self.guest_tls.send_close_notify();
+        self.flush_to_guest().await
     }
 
     /// Drain all complete DNS frames from the plaintext buffer and
@@ -472,7 +465,6 @@ mod tests {
         // runtime, the spawned forwarder cannot run until dispatch_loop yields.
         drop(from_guest_tx);
         proxy.dispatch_loop().await.unwrap();
-        tokio::task::yield_now().await;
 
         let mut encrypted = Vec::new();
         while let Ok(chunk) = to_guest_rx.try_recv() {

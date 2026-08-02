@@ -1667,8 +1667,8 @@ mod tests {
     }
 
     /// Drive guest→server handshake to ESTABLISHED, returning (server_isn,
-    /// guest_seq_after_handshake) and the spawned NewConnection channels.
-    fn establish(
+    /// guest_seq_after_handshake).
+    fn handshake(
         tracker: &mut ConnectionTracker,
         device: &mut SmoltcpDevice,
         iface: &mut Interface,
@@ -1676,7 +1676,7 @@ mod tests {
         shared: &Arc<SharedState>,
         now: Instant,
         guest_port: u16,
-    ) -> (i32, i32, Vec<crate::conn::NewConnection>) {
+    ) -> (i32, i32) {
         let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), guest_port);
         let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 443);
 
@@ -1735,7 +1735,23 @@ mod tests {
             "socket should be ESTABLISHED after handshake",
         );
 
-        // 3) Poll loop detects the established connection and spawns a proxy.
+        (server_isn, guest_isn + 1)
+    }
+
+    /// Complete a guest→server handshake and hand the connection to a proxy.
+    fn establish(
+        tracker: &mut ConnectionTracker,
+        device: &mut SmoltcpDevice,
+        iface: &mut Interface,
+        sockets: &mut SocketSet<'_>,
+        shared: &Arc<SharedState>,
+        now: Instant,
+        guest_port: u16,
+    ) -> (i32, i32, Vec<crate::conn::NewConnection>) {
+        let (server_isn, guest_seq) =
+            handshake(tracker, device, iface, sockets, shared, now, guest_port);
+
+        // Poll loop detects the established connection and spawns a proxy.
         let new_conns = tracker.take_new_connections(sockets);
         assert_eq!(
             new_conns.len(),
@@ -1743,7 +1759,7 @@ mod tests {
             "one new connection should be handed off"
         );
 
-        (server_isn, guest_isn + 1, new_conns)
+        (server_isn, guest_seq, new_conns)
     }
 
     #[test]
@@ -2040,57 +2056,25 @@ mod tests {
         let mut tracker = ConnectionTracker::new(None);
         let now = smoltcp_now();
         let guest_port = 54323;
-        let guest_isn = 1000i32;
-        let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), guest_port);
-        let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 443);
-
-        ingress(
-            build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP),
+        let (server_isn, guest_seq) = handshake(
+            &mut tracker,
             &mut device,
             &mut iface,
             &mut sockets,
             &shared,
             now,
+            guest_port,
         );
-        let _ = shared.rx_ring.pop();
-
-        assert!(tracker.create_tcp_socket(src, dst, &mut sockets));
-        ingress(
-            build_tcp_frame(guest_port, 443, TcpControl::Syn, guest_isn, None, &[]),
-            &mut device,
-            &mut iface,
-            &mut sockets,
-            &shared,
-            now,
-        );
-        let (server_isn, _, is_syn, _, _) =
-            last_tcp_reply(&shared).expect("expected SYN-ACK from smoltcp");
-        assert!(is_syn, "expected SYN flag on handshake reply");
 
         // The production poll loop drains every queued guest frame before
-        // taking new connections, so the handshake ACK and FIN can both be
-        // processed before the proxy task is spawned.
-        ingress(
-            build_tcp_frame(
-                guest_port,
-                443,
-                TcpControl::None,
-                guest_isn + 1,
-                Some(server_isn + 1),
-                &[],
-            ),
-            &mut device,
-            &mut iface,
-            &mut sockets,
-            &shared,
-            now,
-        );
+        // taking new connections, so the FIN can be processed before the
+        // proxy task is spawned.
         ingress(
             build_tcp_frame(
                 guest_port,
                 443,
                 TcpControl::Fin,
-                guest_isn + 1,
+                guest_seq,
                 Some(server_isn + 1),
                 &[],
             ),
