@@ -249,9 +249,9 @@ impl DotProxy {
                             self.dispatch_ready_queries(resp_tx.as_ref().unwrap());
                         }
                         Ok(None) => {
-                            // Guest half-close: no more queries can arrive, but
-                            // keep the TLS write side alive until every query
-                            // already handed to the forwarder has responded.
+                            // Stop accepting queries from the guest. Dropping the
+                            // root sender lets `resp_rx` close after all in-flight
+                            // forwarder tasks have dropped their cloned senders.
                             guest_eof = true;
                             drop(resp_tx.take());
                         }
