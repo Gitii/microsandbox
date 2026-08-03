@@ -346,24 +346,54 @@
       },
       {
         "tab": "Changelog",
-        "pages": [
-          "changelog/2026-07-31",
-          "changelog/2026-07-24",
-          "changelog/2026-07-17",
-          "changelog/2026-07-10",
-          "changelog/2026-07-05",
-          "changelog/2026-06-26",
-          "changelog/2026-06-19",
-          "changelog/2026-06-12",
-          "changelog/2026-06-05",
-          "changelog/2026-05-29",
-          "changelog/2026-05-22",
-          "changelog/2026-05-15",
-          "changelog/2026-05-01",
-          "changelog/2026-04-24",
-          "changelog/2026-04-17",
-          "changelog/2026-04-10",
-          "changelog/2026-04-03"
+        "groups": [
+          {
+            "group": "Releases",
+            "icon": "clock-rotate-left",
+            "pages": [
+              {
+                "group": "July 2026",
+                "expanded": true,
+                "pages": [
+                  "changelog/2026-07-31",
+                  "changelog/2026-07-24",
+                  "changelog/2026-07-17",
+                  "changelog/2026-07-10",
+                  "changelog/2026-07-05"
+                ]
+              },
+              {
+                "group": "June 2026",
+                "expanded": false,
+                "pages": [
+                  "changelog/2026-06-26",
+                  "changelog/2026-06-19",
+                  "changelog/2026-06-12",
+                  "changelog/2026-06-05"
+                ]
+              },
+              {
+                "group": "May 2026",
+                "expanded": false,
+                "pages": [
+                  "changelog/2026-05-29",
+                  "changelog/2026-05-22",
+                  "changelog/2026-05-15",
+                  "changelog/2026-05-01"
+                ]
+              },
+              {
+                "group": "April 2026",
+                "expanded": false,
+                "pages": [
+                  "changelog/2026-04-24",
+                  "changelog/2026-04-17",
+                  "changelog/2026-04-10",
+                  "changelog/2026-04-03"
+                ]
+              }
+            ]
+          }
         ]
       }
     ]
