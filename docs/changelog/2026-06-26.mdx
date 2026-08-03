@@ -13,7 +13,7 @@ icon: "bolt"
 
 **Windows host support**
 
-Microsandbox now runs as a first-class local host on Windows on top of the libkrun and libkrunfw Windows ports. The `msb` CLI, installer, runtime, networking, filesystem, image, and SDK packages all build and run natively, including a Windows-specific passthrough filesystem backend, interactive SSH attach, and a release installer flow. Pieces that still depend on Unix-only behavior surface as explicit unsupported errors instead of silently misbehaving, and Windows SDK packages are now published alongside the macOS and Linux artifacts.
+microsandbox now runs as a first-class local host on Windows on top of the libkrun and libkrunfw Windows ports. The `msb` CLI, installer, runtime, networking, filesystem, image, and SDK packages all build and run natively, including a Windows-specific passthrough filesystem backend, interactive SSH attach, and a release installer flow. Pieces that still depend on Unix-only behavior surface as explicit unsupported errors instead of silently misbehaving, and Windows SDK packages are now published alongside the macOS and Linux artifacts.
 
 ```bash
 msb run --name devbox -p 8080:8080 python:3.12
