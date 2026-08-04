@@ -114,6 +114,12 @@ pub struct Config {
     /// Internal directory containing process-held CPU allocation leases.
     pub cpu_lease_dir: PathBuf,
 
+    /// Internal directory containing process-held writeback admission leases.
+    pub writeback_lease_dir: PathBuf,
+
+    /// Host-global dirty-credit pool used for spawn-time admission.
+    pub block_writeback_pool_bytes: Option<u64>,
+
     /// Path to the Unix domain socket for the agent relay.
     pub agent_sock_path: PathBuf,
 
@@ -526,6 +532,14 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         Ok::<_, RuntimeError>((relay, db, run_db_id))
     })?;
 
+    let writeback_disk_paths = match writeback_limited_disk_paths(&config.vm) {
+        Ok(disk_paths) => disk_paths,
+        Err(error) => {
+            let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
+            return Err(error);
+        }
+    };
+
     let cpu_guard = match tokio_rt.block_on(crate::cpu::acquire(
         &db,
         run_db_id,
@@ -535,6 +549,24 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     )) {
         Ok(guard) => Arc::new(guard),
         Err(error) => {
+            let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
+            return Err(error);
+        }
+    };
+
+    let writeback_guard = match tokio_rt.block_on(crate::writeback::acquire(
+        &db,
+        run_db_id,
+        &config.writeback_lease_dir,
+        config.block_writeback_pool_bytes,
+        config.vm.block_writeback_limit_bytes,
+        &writeback_disk_paths,
+    )) {
+        Ok(guard) => Arc::new(guard),
+        Err(error) => {
+            if let Err(release_error) = tokio_rt.block_on(cpu_guard.release(&db)) {
+                tracing::warn!(%release_error, "release CPU placement after writeback admission failure");
+            }
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -597,6 +629,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     // potential `wait_for_ready` round-trip on the VMM's exit path).
     let exit_metrics_writer = metrics_writer.clone();
     let exit_cpu_guard = Arc::clone(&cpu_guard);
+    let exit_writeback_guard = Arc::clone(&writeback_guard);
     #[cfg(windows)]
     let _agent_console_pipe_bridge = AgentConsolePipeBridge::spawn(
         agent_console_pipe_name(config.sandbox_id),
@@ -629,6 +662,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             rt_handle.block_on(async {
                 let now = chrono::Utc::now().naive_utc();
 
+                if let Err(error) = exit_writeback_guard.release(&exit_db).await {
+                    tracing::warn!(%error, "release writeback admission at VM exit");
+                }
                 if let Err(error) = exit_cpu_guard.release(&exit_db).await {
                     tracing::warn!(%error, "release CPU placement at VM exit");
                 }
@@ -718,6 +754,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     ) = match build_result {
         Ok(vm) => vm,
         Err(e) => {
+            if let Err(error) = tokio_rt.block_on(writeback_guard.release(&db)) {
+                tracing::warn!(%error, "release writeback admission after VM build failure");
+            }
             if let Err(error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM build failure");
             }
@@ -1097,6 +1136,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     match vm.enter() {
         Ok(infallible) => Ok(infallible),
         Err(e) => {
+            if let Err(error) = cleanup_rt_handle.block_on(writeback_guard.release(&db)) {
+                tracing::warn!(%error, "release writeback admission after VM enter failure");
+            }
             if let Err(error) = cleanup_rt_handle.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM enter failure");
             }
@@ -1142,6 +1184,43 @@ fn apply_block_writeback_limit(
         disk = disk.writeback_limit_bytes(limit_bytes);
     }
     disk
+}
+
+fn writeback_limited_disk_paths(vm: &VmConfig) -> RuntimeResult<Vec<PathBuf>> {
+    if vm.block_writeback_limit_bytes.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::new();
+    if vm.rootfs_path.is_some() {
+        // Direct root filesystems do not attach a virtio-blk device.
+    } else if vm.rootfs_vmdk.is_some() {
+        if let Some(spec) = &vm.rootfs_upper_spec {
+            if is_writeback_limited_disk(spec.format, spec.read_only) {
+                paths.push(spec.primary.clone());
+            }
+        } else if let Some(upper) = &vm.rootfs_upper {
+            paths.push(upper.clone());
+        }
+    } else if let Some(rootfs_disk) = &vm.rootfs_disk {
+        let format = validate_disk_format(vm.rootfs_disk_format.as_deref())
+            .map_err(|error| RuntimeError::Custom(format!("disk format: {error}")))?;
+        if is_writeback_limited_disk(format, vm.rootfs_disk_readonly) {
+            paths.push(rootfs_disk.clone());
+        }
+    }
+
+    paths.extend(
+        vm.disks
+            .iter()
+            .filter(|disk| is_writeback_limited_disk(disk.format, disk.readonly))
+            .map(|disk| disk.host.clone()),
+    );
+    Ok(paths)
+}
+
+fn is_writeback_limited_disk(format: msb_krun::DiskImageFormat, read_only: bool) -> bool {
+    !read_only && matches!(format, msb_krun::DiskImageFormat::Raw)
 }
 
 /// Build the `Vm` from config with an exit observer for cleanup.
