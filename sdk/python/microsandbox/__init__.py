@@ -132,6 +132,7 @@ from microsandbox.types import (
     PortProtocol,
     Protocol,
     PullPolicy,
+    RateLimiter,
     RegistryAuth,
     Rlimit,
     RlimitResource,
@@ -149,6 +150,7 @@ from microsandbox.types import (
     StatVirtualization,
     Stdin,
     TlsConfig,
+    TokenBucket,
     ViolationAction,
     ViolationPolicy,
 )
@@ -241,6 +243,8 @@ __all__ = [
     "PortBinding",
     "PortProtocol",
     "DestGroup",
+    "RateLimiter",
+    "TokenBucket",
     # Secrets & TLS
     "Secret",
     "SecretEntry",
