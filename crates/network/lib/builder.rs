@@ -7,7 +7,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
+use microsandbox_types::{
+    RateLimiterConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
+};
 use microsandbox_utils::size::Bytes;
+use zeroize::Zeroizing;
 
 use crate::config::{
     DnsConfig, InterfaceOverrides, MAX_NETWORK_CONNECTIONS, NetworkConfig, PortProtocol,
@@ -15,13 +19,9 @@ use crate::config::{
 };
 use crate::dns::Nameserver;
 use crate::policy::{BuildError, NetworkPolicy};
-use zeroize::Zeroizing;
-
+use crate::rate_limit::RateLimitDirection;
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretSource, ViolationAction,
-};
-use microsandbox_types::{
-    RateLimiterConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -74,7 +74,7 @@ pub struct ViolationActionBuilder {
 /// Fluent builder for a [`RateLimiterConfig`].
 ///
 /// ```ignore
-/// .tx_rate_limiter(|r| r
+/// .egress_rate_limiter(|r| r
 ///     .bandwidth(1.mib(), Duration::from_secs(1))
 ///     .bandwidth_burst(512.kib())
 ///     .ops(1_000, Duration::from_secs(1))
@@ -82,8 +82,7 @@ pub struct ViolationActionBuilder {
 /// )
 /// ```
 pub struct RateLimiterBuilder {
-    /// Which limiter is being built (`tx` or `rx`), for error messages.
-    direction: &'static str,
+    direction: RateLimitDirection,
     bandwidth: Option<TokenBucketConfig>,
     ops: Option<TokenBucketConfig>,
     bandwidth_burst: Option<u64>,
@@ -298,17 +297,17 @@ impl NetworkBuilder {
     /// the next sandbox start.
     ///
     /// ```ignore
-    /// .tx_rate_limiter(|r| r
+    /// .egress_rate_limiter(|r| r
     ///     .bandwidth(1.mib(), Duration::from_secs(1))
     ///     .ops(1_000, Duration::from_secs(1))
     /// )
     /// ```
-    pub fn tx_rate_limiter(
+    pub fn egress_rate_limiter(
         mut self,
         f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder,
     ) -> Self {
-        match f(RateLimiterBuilder::new("tx")).build() {
-            Ok(limiter) => self.config.tx_rate_limiter = Some(limiter),
+        match f(RateLimiterBuilder::new(RateLimitDirection::Egress)).build() {
+            Ok(limiter) => self.config.egress_rate_limiter = Some(limiter),
             Err(err) => self.errors.push(err),
         }
         self
@@ -316,12 +315,12 @@ impl NetworkBuilder {
 
     /// Limit runtime-to-guest (ingress) traffic via a closure. Applies on
     /// the next sandbox start.
-    pub fn rx_rate_limiter(
+    pub fn ingress_rate_limiter(
         mut self,
         f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder,
     ) -> Self {
-        match f(RateLimiterBuilder::new("rx")).build() {
-            Ok(limiter) => self.config.rx_rate_limiter = Some(limiter),
+        match f(RateLimiterBuilder::new(RateLimitDirection::Ingress)).build() {
+            Ok(limiter) => self.config.ingress_rate_limiter = Some(limiter),
             Err(err) => self.errors.push(err),
         }
         self
@@ -657,9 +656,7 @@ impl SecretBuilder {
 }
 
 impl RateLimiterBuilder {
-    /// Start building a rate limiter for the given direction (`tx` or
-    /// `rx`); the direction only labels error messages.
-    pub(crate) fn new(direction: &'static str) -> Self {
+    fn new(direction: RateLimitDirection) -> Self {
         Self {
             direction,
             bandwidth: None,
@@ -1063,68 +1060,68 @@ mod tests {
         use microsandbox_utils::size::SizeExt;
 
         let cfg = NetworkBuilder::new()
-            .tx_rate_limiter(|r| {
+            .egress_rate_limiter(|r| {
                 r.bandwidth(1.mib(), Duration::from_secs(1))
                     .bandwidth_burst(512.kib())
                     .ops(1_000, Duration::from_secs(1))
                     .ops_burst(500)
             })
-            .rx_rate_limiter(|r| r.bandwidth(2.mib(), Duration::from_millis(500)))
+            .ingress_rate_limiter(|r| r.bandwidth(2.mib(), Duration::from_millis(500)))
             .build()
             .unwrap();
 
-        let tx = cfg.tx_rate_limiter.unwrap();
-        let bandwidth = tx.bandwidth.unwrap();
+        let egress = cfg.egress_rate_limiter.unwrap();
+        let bandwidth = egress.bandwidth.unwrap();
         assert_eq!(bandwidth.size, 1024 * 1024);
         assert_eq!(bandwidth.refill_time_ms, 1000);
         assert_eq!(bandwidth.one_time_burst, 512 * 1024);
-        let ops = tx.ops.unwrap();
+        let ops = egress.ops.unwrap();
         assert_eq!(ops.size, 1_000);
         assert_eq!(ops.refill_time_ms, 1000);
         assert_eq!(ops.one_time_burst, 500);
 
-        let rx = cfg.rx_rate_limiter.unwrap();
-        assert_eq!(rx.bandwidth.unwrap().refill_time_ms, 500);
-        assert!(rx.ops.is_none());
+        let ingress = cfg.ingress_rate_limiter.unwrap();
+        assert_eq!(ingress.bandwidth.unwrap().refill_time_ms, 500);
+        assert!(ingress.ops.is_none());
     }
 
     #[test]
     fn rate_limiters_default_to_unlimited() {
         let cfg = NetworkBuilder::new().build().unwrap();
-        assert!(cfg.tx_rate_limiter.is_none());
-        assert!(cfg.rx_rate_limiter.is_none());
+        assert!(cfg.egress_rate_limiter.is_none());
+        assert!(cfg.ingress_rate_limiter.is_none());
     }
 
     #[test]
     fn rate_limiter_builder_rejects_empty_limiter() {
         let err = NetworkBuilder::new()
-            .tx_rate_limiter(|r| r)
+            .egress_rate_limiter(|r| r)
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "tx rate limiter: rate limiter must configure at least one of bandwidth or ops"
+            "egress rate limiter: rate limiter must configure at least one of bandwidth or ops"
         );
     }
 
     #[test]
     fn rate_limiter_builder_rejects_zero_size_and_zero_refill() {
         let err = NetworkBuilder::new()
-            .rx_rate_limiter(|r| r.bandwidth(0u64, Duration::from_secs(1)))
+            .ingress_rate_limiter(|r| r.bandwidth(0u64, Duration::from_secs(1)))
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "rx rate limiter: bandwidth bucket: size must be greater than zero"
+            "ingress rate limiter: bandwidth bucket: size must be greater than zero"
         );
 
         let err = NetworkBuilder::new()
-            .tx_rate_limiter(|r| r.ops(10, Duration::ZERO))
+            .egress_rate_limiter(|r| r.ops(10, Duration::ZERO))
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "tx rate limiter: ops bucket: refill_time_ms must be greater than zero"
+            "egress rate limiter: ops bucket: refill_time_ms must be greater than zero"
         );
     }
 
@@ -1133,33 +1130,33 @@ mod tests {
         use microsandbox_utils::size::SizeExt;
 
         let err = NetworkBuilder::new()
-            .tx_rate_limiter(|r| r.bandwidth_burst(512.kib()))
+            .egress_rate_limiter(|r| r.bandwidth_burst(512.kib()))
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "tx rate limiter: bandwidth_burst requires the bandwidth bucket"
+            "egress rate limiter: bandwidth_burst requires the bandwidth bucket"
         );
 
         let err = NetworkBuilder::new()
-            .rx_rate_limiter(|r| r.bandwidth(1.mib(), Duration::from_secs(1)).ops_burst(5))
+            .ingress_rate_limiter(|r| r.bandwidth(1.mib(), Duration::from_secs(1)).ops_burst(5))
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "rx rate limiter: ops_burst requires the ops bucket"
+            "ingress rate limiter: ops_burst requires the ops bucket"
         );
     }
 
     #[test]
     fn rate_limiter_builder_rejects_refill_interval_overflow() {
         let err = NetworkBuilder::new()
-            .tx_rate_limiter(|r| r.ops(10, Duration::MAX))
+            .egress_rate_limiter(|r| r.ops(10, Duration::MAX))
             .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "tx rate limiter: ops refill interval overflows u64 milliseconds"
+            "egress rate limiter: ops refill interval overflows u64 milliseconds"
         );
     }
 

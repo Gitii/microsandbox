@@ -47,11 +47,11 @@ const VIRTIO_NET_HDR_LEN: usize = 12;
 ///   event handle on Windows so the NetWorker can detect new frames.
 pub struct SmoltcpBackend {
     shared: Arc<SharedState>,
-    /// RX rate limiter. `None` means unlimited.
-    rx_rate_limiter: Option<RateLimiter>,
-    /// A frame popped from `rx_ring` but throttled by the RX limiter.
+    /// Ingress rate limiter. `None` means unlimited.
+    ingress_rate_limiter: Option<RateLimiter>,
+    /// A frame popped from `rx_ring` but throttled by the ingress limiter.
     /// Delivered before any queued frame so ordering is preserved.
-    pending_rx: Option<Vec<u8>>,
+    pending_ingress_frame: Option<Vec<u8>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -60,11 +60,11 @@ pub struct SmoltcpBackend {
 
 impl SmoltcpBackend {
     /// Create a new backend connected to the given shared state.
-    pub fn new(shared: Arc<SharedState>, rx_rate_limiter: Option<RateLimiter>) -> Self {
+    pub fn new(shared: Arc<SharedState>, ingress_rate_limiter: Option<RateLimiter>) -> Self {
         Self {
             shared,
-            rx_rate_limiter,
-            pending_rx: None,
+            ingress_rate_limiter,
+            pending_ingress_frame: None,
         }
     }
 }
@@ -100,18 +100,18 @@ impl NetBackend for SmoltcpBackend {
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         self.shared.rx_wake.drain();
 
-        let frame = match self.pending_rx.take() {
+        let frame = match self.pending_ingress_frame.take() {
             Some(frame) => frame,
             None => self.shared.rx_ring.pop().ok_or(ReadError::NothingRead)?,
         };
 
-        if let Some(limiter) = &mut self.rx_rate_limiter
+        if let Some(limiter) = &mut self.ingress_rate_limiter
             && let Err(resume_at) = limiter.try_consume_frame(frame.len() as u64, Instant::now())
         {
             // Keep the frame in the pending slot; the poll loop wakes
             // `rx_wake` when the refill deadline arrives.
-            self.pending_rx = Some(frame);
-            self.shared.set_rx_resume_at(resume_at);
+            self.pending_ingress_frame = Some(frame);
+            self.shared.set_ingress_resume_at(resume_at);
             return Err(ReadError::NothingRead);
         }
 
@@ -253,7 +253,9 @@ mod tests {
             backend.read_frame(&mut buf),
             Err(ReadError::NothingRead)
         ));
-        let resume_at = shared.rx_resume_at().expect("resume deadline published");
+        let resume_at = shared
+            .ingress_resume_at()
+            .expect("resume deadline published");
         assert!(fd_is_readable(shared.tx_wake.as_raw_fd()));
 
         // The throttled frame stays first in line: nothing is lost or

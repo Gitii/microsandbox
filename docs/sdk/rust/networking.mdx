@@ -852,10 +852,10 @@ Limit the maximum number of concurrent network connections from the sandbox. Def
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">tx_rate_limiter()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">egress_rate_limiter()</span>
 
 ```rust
-fn tx_rate_limiter(self, f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder) -> Self
+fn egress_rate_limiter(self, f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder) -> Self
 ```
 
 <Accordion title="Example">
@@ -864,7 +864,7 @@ fn tx_rate_limiter(self, f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilde
 use std::time::Duration;
 use microsandbox::size::SizeExt;
 
-.network(|n| n.tx_rate_limiter(|r| r
+.network(|n| n.egress_rate_limiter(|r| r
     .bandwidth(1.mib(), Duration::from_secs(1))
     .bandwidth_burst(512.kib())
     .ops(1_000, Duration::from_secs(1))))
@@ -872,15 +872,15 @@ use microsandbox::size::SizeExt;
 
 </Accordion>
 
-Limit guest upload (egress) traffic. See [`RateLimiterBuilder`](#ratelimiterbuilder) for the bucket setters. Unset means unlimited. The limit applies on the next sandbox start; cloud sandboxes reject rate limiters as unsupported for now.
+Limit outbound (egress) traffic. See [`RateLimiterBuilder`](#ratelimiterbuilder) for the bucket setters. Unset means unlimited. The limit applies on the next sandbox start; cloud sandboxes reject rate limiters as unsupported for now.
 
-#### <span className="msb-recv">.</span><span className="msb-hn">rx_rate_limiter()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">ingress_rate_limiter()</span>
 
 ```rust
-fn rx_rate_limiter(self, f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder) -> Self
+fn ingress_rate_limiter(self, f: impl FnOnce(RateLimiterBuilder) -> RateLimiterBuilder) -> Self
 ```
 
-Limit guest download (ingress) traffic. Same shape as [`tx_rate_limiter()`](#tx_rate_limiter).
+Limit inbound (ingress) traffic. Same shape as [`egress_rate_limiter()`](#egress_rate_limiter).
 
 #### <span className="msb-recv">.</span><span className="msb-hn">ipv4_pool()</span>
 
@@ -1178,7 +1178,7 @@ Allow **any** host to receive placeholders unchanged. Takes effect only when `i_
 
 ## RateLimiterBuilder
 
-Builder for one direction's rate limiter, used in [`NetworkBuilder::tx_rate_limiter(|r| r...)`](#tx_rate_limiter) and [`rx_rate_limiter(|r| r...)`](#rx_rate_limiter). A limiter caps bandwidth (bytes) and packet rate (frames) independently; leaving a bucket unset leaves that dimension unlimited. Buckets start full plus their one-time burst and refill continuously. Every setter returns `Self`.
+Builder for one direction's rate limiter, used in [`NetworkBuilder::egress_rate_limiter(|r| r...)`](#egress_rate_limiter) and [`ingress_rate_limiter(|r| r...)`](#ingress_rate_limiter). A limiter caps bandwidth (bytes) and packet rate (frames) independently; leaving a bucket unset leaves that dimension unlimited. Buckets start full plus their one-time burst and refill continuously. Every setter returns `Self`.
 
 Validation runs at `NetworkBuilder::build()`: a limiter with neither bucket, a zero bucket size or refill interval, a burst without its bucket, or a refill interval that does not fit in u64 milliseconds surfaces as [`BuildError`](#builderror).
 
@@ -1407,9 +1407,9 @@ Per-sandbox guest interface overrides. Every field is optional; an omitted field
 
 ### RateLimiterConfig
 
-<p className="msb-backref">Built by <a href="#ratelimiterbuilder">RateLimiterBuilder</a> · used by <a href="#tx_rate_limiter">tx_rate_limiter()</a> · <a href="#rx_rate_limiter">rx_rate_limiter()</a></p>
+<p className="msb-backref">Built by <a href="#ratelimiterbuilder">RateLimiterBuilder</a> · used by <a href="#egress_rate_limiter">egress_rate_limiter()</a> · <a href="#ingress_rate_limiter">ingress_rate_limiter()</a></p>
 
-Rate limiter for one traffic direction. A missing bucket leaves that dimension unlimited. Lives in `microsandbox_types` and is stored on the network config as `tx_rate_limiter` / `rx_rate_limiter`.
+Rate limiter for one traffic direction. A missing bucket leaves that dimension unlimited. Lives in `microsandbox_types` and is stored on the network config as `egress_rate_limiter` / `ingress_rate_limiter`.
 
 | Field | Type | Description |
 |-------|------|-------------|

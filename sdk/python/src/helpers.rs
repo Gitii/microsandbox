@@ -1115,12 +1115,14 @@ fn apply_network(
         builder = builder.network(|n| n.max_connections(max));
     }
 
-    // Rate limiters (tx = guest -> runtime, rx = runtime -> guest).
-    if let Some(limiter) = parse_rate_limiter(net, "tx_rate_limiter")? {
-        builder = builder.network(move |n| n.tx_rate_limiter(|r| apply_rate_limiter(r, &limiter)));
+    // Rate limiters (egress = guest -> runtime, ingress = runtime -> guest).
+    if let Some(limiter) = parse_rate_limiter(net, "egress_rate_limiter")? {
+        builder =
+            builder.network(move |n| n.egress_rate_limiter(|r| apply_rate_limiter(r, &limiter)));
     }
-    if let Some(limiter) = parse_rate_limiter(net, "rx_rate_limiter")? {
-        builder = builder.network(move |n| n.rx_rate_limiter(|r| apply_rate_limiter(r, &limiter)));
+    if let Some(limiter) = parse_rate_limiter(net, "ingress_rate_limiter")? {
+        builder =
+            builder.network(move |n| n.ingress_rate_limiter(|r| apply_rate_limiter(r, &limiter)));
     }
 
     // Guest IPv4 pool.

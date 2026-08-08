@@ -280,12 +280,12 @@ impl JsNetworkBuilder {
     /// the next sandbox start.
     ///
     /// ```js
-    /// .txRateLimiter((r) => r
+    /// .egressRateLimiter((r) => r
     ///   .bandwidth(1_048_576, 1_000)
     ///   .ops(1_000, 1_000))
     /// ```
-    #[napi(js_name = "txRateLimiter")]
-    pub fn tx_rate_limiter(
+    #[napi(js_name = "egressRateLimiter")]
+    pub fn egress_rate_limiter(
         &mut self,
         env: &Env,
         configure: Function<
@@ -296,14 +296,14 @@ impl JsNetworkBuilder {
         let initial = JsRateLimiterBuilder::new().into_instance(env)?;
         let returned = configure.call(initial)?;
         let prev = self.take_inner();
-        self.inner = Some(prev.tx_rate_limiter(|r| apply_rate_limiter(r, &returned)));
+        self.inner = Some(prev.egress_rate_limiter(|r| apply_rate_limiter(r, &returned)));
         Ok(self)
     }
 
     /// Limit runtime-to-guest (ingress) traffic via a callback. Applies on
     /// the next sandbox start.
-    #[napi(js_name = "rxRateLimiter")]
-    pub fn rx_rate_limiter(
+    #[napi(js_name = "ingressRateLimiter")]
+    pub fn ingress_rate_limiter(
         &mut self,
         env: &Env,
         configure: Function<
@@ -314,7 +314,7 @@ impl JsNetworkBuilder {
         let initial = JsRateLimiterBuilder::new().into_instance(env)?;
         let returned = configure.call(initial)?;
         let prev = self.take_inner();
-        self.inner = Some(prev.rx_rate_limiter(|r| apply_rate_limiter(r, &returned)));
+        self.inner = Some(prev.ingress_rate_limiter(|r| apply_rate_limiter(r, &returned)));
         Ok(self)
     }
 

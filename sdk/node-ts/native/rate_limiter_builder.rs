@@ -8,7 +8,7 @@ use napi::bindgen_prelude::*;
 
 /// Fluent builder for one direction's network rate limiter. Chainable
 /// setters accumulate bucket values; the parent
-/// `NetworkBuilder.txRateLimiter()` / `.rxRateLimiter()` applies them to
+/// `NetworkBuilder.egressRateLimiter()` / `.ingressRateLimiter()` applies them to
 /// the Rust builder, where validation happens at `build()` time.
 #[napi(js_name = "RateLimiterBuilder")]
 pub struct JsRateLimiterBuilder {

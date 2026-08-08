@@ -12,13 +12,13 @@ use std::time::Instant;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_protocol::{ENV_HOST_ALIAS, ENV_NET, ENV_NET_IPV4, ENV_NET_IPV6};
-use microsandbox_types::DeploymentProfile;
+use microsandbox_types::{DeploymentProfile, RateLimitConfigError};
 use msb_krun::backends::net::NetBackend;
 
 use crate::backend::SmoltcpBackend;
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
 use crate::policy::{NetworkPolicy, NetworkProfile};
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimitDirection, RateLimiter};
 use crate::secrets::handle::SecretsHandle;
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 use crate::stack::{self, GatewayIps, PollLoopConfig};
@@ -55,6 +55,9 @@ pub struct SmoltcpNetwork {
     deployment_profile: DeploymentProfile,
     shared: Arc<SharedState>,
     backend: Option<SmoltcpBackend>,
+    /// Egress limiter validated and built at construction; moved into the poll
+    /// loop by [`start()`](Self::start).
+    egress_rate_limiter: Option<RateLimiter>,
     poll_handle: Option<JoinHandle<()>>,
 
     // Resolved from config + slot.
@@ -90,6 +93,16 @@ pub enum NetworkInitError {
     /// TLS interception state failed to initialize.
     #[error("TLS initialization failed: {0}")]
     Tls(#[from] TlsStateError),
+
+    /// A stored rate limiter configuration failed validation.
+    #[error("invalid {direction} rate limiter: {source}")]
+    InvalidRateLimit {
+        /// Which limiter is invalid: `egress` or `ingress`.
+        direction: RateLimitDirection,
+        /// Underlying validation error.
+        #[source]
+        source: RateLimitConfigError,
+    },
 }
 
 /// Handle for installing host-side termination behavior into the network stack.
@@ -229,13 +242,29 @@ impl SmoltcpNetwork {
             .unwrap_or(DEFAULT_QUEUE_CAPACITY)
             .max(DEFAULT_QUEUE_CAPACITY);
         let shared = Arc::new(SharedState::new(queue_capacity));
-        // Every path that writes a rate limiter into the config validates it
-        // first (`NetworkBuilder::build`), so an invalid one here is a bug.
-        let rx_rate_limiter = config.rx_rate_limiter.as_ref().map(|limiter| {
-            RateLimiter::new(limiter, Instant::now())
-                .expect("rx rate limiter config should be validated before reaching the engine")
-        });
-        let backend = SmoltcpBackend::new(shared.clone(), rx_rate_limiter);
+        // Every write path validates rate limiters (`NetworkBuilder::build`),
+        // but a stored config bypasses the builder: fail startup cleanly
+        // instead of panicking on a corrupted spec.
+        let now = Instant::now();
+        let ingress_rate_limiter = config
+            .ingress_rate_limiter
+            .as_ref()
+            .map(|limiter| RateLimiter::new(limiter, now))
+            .transpose()
+            .map_err(|source| NetworkInitError::InvalidRateLimit {
+                direction: RateLimitDirection::Ingress,
+                source,
+            })?;
+        let egress_rate_limiter = config
+            .egress_rate_limiter
+            .as_ref()
+            .map(|limiter| RateLimiter::new(limiter, now))
+            .transpose()
+            .map_err(|source| NetworkInitError::InvalidRateLimit {
+                direction: RateLimitDirection::Egress,
+                source,
+            })?;
+        let backend = SmoltcpBackend::new(shared.clone(), ingress_rate_limiter);
 
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
@@ -252,6 +281,7 @@ impl SmoltcpNetwork {
             deployment_profile,
             shared,
             backend: Some(backend),
+            egress_rate_limiter,
             poll_handle: None,
             guest_mac,
             gateway_mac,
@@ -298,10 +328,7 @@ impl SmoltcpNetwork {
         let tls_state = self.tls_state.clone();
         let published_ports = self.config.ports.clone();
         let max_connections = self.config.max_connections;
-        let tx_rate_limiter = self.config.tx_rate_limiter.as_ref().map(|limiter| {
-            RateLimiter::new(limiter, Instant::now())
-                .expect("tx rate limiter config should be validated before reaching the engine")
-        });
+        let egress_rate_limiter = self.egress_rate_limiter.take();
         let secrets = self.secrets.clone();
 
         self.poll_handle = Some(
@@ -317,7 +344,7 @@ impl SmoltcpNetwork {
                         tls_state,
                         published_ports,
                         max_connections,
-                        tx_rate_limiter,
+                        egress_rate_limiter,
                         tokio_handle,
                         secrets,
                     );
@@ -823,10 +850,37 @@ mod tests {
             } if configured == MAX_NETWORK_CONNECTIONS + 1
         ));
     }
+
+    /// A stored config bypasses the builder's validation, so an invalid
+    /// limiter must fail startup cleanly instead of panicking.
+    #[test]
+    fn new_with_routes_rejects_invalid_rate_limiter() {
+        let mut config = NetworkConfig {
+            ingress_rate_limiter: Some(microsandbox_types::RateLimiterConfig {
+                bandwidth: None,
+                ops: None,
+            }),
+            ..NetworkConfig::default()
+        };
+        config.tls.enabled = false;
+
+        let err = match SmoltcpNetwork::new_with_routes(config, 0, true, false) {
+            Ok(_) => panic!("empty rate limiter should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            NetworkInitError::InvalidRateLimit {
+                direction: RateLimitDirection::Ingress,
+                source: RateLimitConfigError::EmptyLimiter,
+            }
+        ));
+    }
 }
 
-/// End-to-end rate limit checks: guest ICMP echo requests cross the TX
-/// boundary into the gateway echo responder, and the replies cross the RX
+/// End-to-end rate limit checks: guest ICMP echo requests cross the egress
+/// boundary into the gateway echo responder, and the replies cross the ingress
 /// boundary back to the guest, so one ping exercises both directions.
 #[cfg(all(test, unix))]
 mod rate_limit_tests {
@@ -959,34 +1013,34 @@ mod rate_limit_tests {
     }
 
     #[test]
-    fn tx_ops_limiter_paces_guest_frames() {
+    fn egress_ops_limiter_paces_guest_frames() {
         // 2 frames up front, then one per 50ms: the 6th crosses at +200ms.
         let config = NetworkConfig {
-            tx_rate_limiter: Some(ops_limiter(2, 100)),
+            egress_rate_limiter: Some(ops_limiter(2, 100)),
             ..NetworkConfig::default()
         };
 
         let elapsed = ping_round_trip_time(config, 6, 8);
         assert!(
             elapsed >= Duration::from_millis(190),
-            "tx throttling too fast: {elapsed:?}"
+            "egress throttling too fast: {elapsed:?}"
         );
     }
 
     #[test]
-    fn rx_bandwidth_limiter_paces_frames_to_the_guest() {
+    fn ingress_bandwidth_limiter_paces_frames_to_the_guest() {
         // Echo replies are 14 (eth) + 20 (ipv4) + 8 (icmp) + 58 = 100 bytes:
         // the first reply drains the bucket, each next waits a full refill,
         // so the 4th arrives at +300ms.
         let config = NetworkConfig {
-            rx_rate_limiter: Some(bandwidth_limiter(100, 100)),
+            ingress_rate_limiter: Some(bandwidth_limiter(100, 100)),
             ..NetworkConfig::default()
         };
 
         let elapsed = ping_round_trip_time(config, 4, 58);
         assert!(
             elapsed >= Duration::from_millis(290),
-            "rx throttling too fast: {elapsed:?}"
+            "ingress throttling too fast: {elapsed:?}"
         );
     }
 

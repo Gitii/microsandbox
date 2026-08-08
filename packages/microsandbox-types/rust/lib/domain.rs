@@ -527,11 +527,11 @@ pub struct NetworkSpec {
 
     /// Guest-to-runtime (egress) rate limiter. Missing means unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_rate_limiter: Option<RateLimiterConfig>,
+    pub egress_rate_limiter: Option<RateLimiterConfig>,
 
     /// Runtime-to-guest (ingress) rate limiter. Missing means unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_rate_limiter: Option<RateLimiterConfig>,
+    pub ingress_rate_limiter: Option<RateLimiterConfig>,
 
     /// Whether to copy trusted host CAs into the guest at boot.
     pub trust_host_cas: bool,
@@ -1258,8 +1258,8 @@ impl Default for NetworkSpec {
             tls: None,
             secrets: None,
             max_connections: None,
-            tx_rate_limiter: None,
-            rx_rate_limiter: None,
+            egress_rate_limiter: None,
+            ingress_rate_limiter: None,
             trust_host_cas: false,
         }
     }
@@ -2349,7 +2349,7 @@ fn empty_secret_value() -> Zeroizing<String> {
 //--------------------------------------------------------------------------------------------------
 
 /// Token-bucket rate limiter for one traffic direction. Carried in
-/// [`NetworkSpec::tx_rate_limiter`] and [`NetworkSpec::rx_rate_limiter`].
+/// [`NetworkSpec::egress_rate_limiter`] and [`NetworkSpec::ingress_rate_limiter`].
 ///
 /// A limiter caps bandwidth (bytes) and packet rate (operations)
 /// independently; a missing bucket leaves that dimension unlimited.

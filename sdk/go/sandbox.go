@@ -291,8 +291,8 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 		IPv4Pool:            n.IPv4Pool,
 		IPv6Pool:            n.IPv6Pool,
 		MaxConnections:      n.MaxConnections,
-		TxRateLimiter:       buildFFIRateLimiter(n.TxRateLimiter),
-		RxRateLimiter:       buildFFIRateLimiter(n.RxRateLimiter),
+		EgressRateLimiter:   buildFFIRateLimiter(n.EgressRateLimiter),
+		IngressRateLimiter:  buildFFIRateLimiter(n.IngressRateLimiter),
 		OnSecretViolation:   string(n.OnSecretViolation),
 		TrustHostCAs:        n.TrustHostCAs,
 	}
@@ -372,9 +372,16 @@ func buildFFITokenBucket(b *TokenBucketConfig) *ffi.TokenBucketOptions {
 	if b == nil {
 		return nil
 	}
+	// Keep invalid durations invalid on the wire so the Rust builder returns
+	// a configuration error. Casting a negative Milliseconds result directly
+	// to uint64 would otherwise turn it into an enormous valid interval.
+	var refillTimeMs uint64
+	if b.RefillTime >= time.Millisecond {
+		refillTimeMs = uint64(b.RefillTime / time.Millisecond)
+	}
 	return &ffi.TokenBucketOptions{
 		Size:         b.Size,
-		RefillTimeMs: uint64(b.RefillTime.Milliseconds()),
+		RefillTimeMs: refillTimeMs,
 		OneTimeBurst: b.OneTimeBurst,
 	}
 }

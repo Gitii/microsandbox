@@ -1875,7 +1875,7 @@ mod tests {
         let config = SandboxBuilder::new("test")
             .image("alpine")
             .network(|n| {
-                n.tx_rate_limiter(|r| {
+                n.egress_rate_limiter(|r| {
                     r.bandwidth(1.mib(), Duration::from_secs(1))
                         .bandwidth_burst(512.kib())
                         .ops(1_000, Duration::from_secs(1))
@@ -1886,18 +1886,18 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = config
+        let egress = config
             .spec
             .network
-            .tx_rate_limiter
+            .egress_rate_limiter
             .as_ref()
-            .expect("tx limiter persisted");
-        let bandwidth = tx.bandwidth.as_ref().unwrap();
+            .expect("egress limiter persisted");
+        let bandwidth = egress.bandwidth.as_ref().unwrap();
         assert_eq!(bandwidth.size, 1024 * 1024);
         assert_eq!(bandwidth.refill_time_ms, 1000);
         assert_eq!(bandwidth.one_time_burst, 512 * 1024);
-        assert_eq!(tx.ops.as_ref().unwrap().one_time_burst, 500);
-        assert!(config.spec.network.rx_rate_limiter.is_none());
+        assert_eq!(egress.ops.as_ref().unwrap().one_time_burst, 500);
+        assert!(config.spec.network.ingress_rate_limiter.is_none());
     }
 
     #[cfg(feature = "net")]
@@ -1905,7 +1905,7 @@ mod tests {
     async fn test_builder_rejects_invalid_rate_limiter() {
         let err = SandboxBuilder::new("test")
             .image("alpine")
-            .network(|n| n.rx_rate_limiter(|r| r))
+            .network(|n| n.ingress_rate_limiter(|r| r))
             .build()
             .await
             .unwrap_err();

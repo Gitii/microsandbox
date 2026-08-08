@@ -6,10 +6,12 @@
 //! current [`Instant`] so refill math stays deterministic under test.
 //!
 //! Buckets start full plus their one-time burst and refill continuously at
-//! `size` tokens per `refill_time_ms`. A frame larger than the bandwidth
-//! bucket is permitted once and then blocks the limiter proportionally, so
-//! oversized frames throttle instead of sticking forever.
+//! `size` tokens per `refill_time_ms`; a full bucket accrues nothing. A
+//! frame larger than the bandwidth bucket is permitted once, putting the
+//! bucket into debt, and the limiter blocks until the debt refills to
+//! zero, so oversized frames throttle instead of sticking forever.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use microsandbox_types::{RateLimitConfigError, RateLimiterConfig, TokenBucketConfig};
@@ -18,7 +20,16 @@ use microsandbox_types::{RateLimitConfigError, RateLimiterConfig, TokenBucketCon
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// Rate limiter for one traffic direction (TX or RX).
+/// Sandbox-relative traffic direction governed by a network rate limiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateLimitDirection {
+    /// Traffic leaving the sandbox.
+    Egress,
+    /// Traffic entering the sandbox.
+    Ingress,
+}
+
+/// Rate limiter for one sandbox traffic direction (egress or ingress).
 #[derive(Debug)]
 pub struct RateLimiter {
     bandwidth: Option<TokenBucket>,
@@ -37,10 +48,13 @@ struct TokenBucket {
     refill_time_ns: u128,
     /// Startup-only tokens, spent before the balance and never refilled.
     one_time_burst: u64,
-    /// Current token balance, capped at `size`.
-    balance: u64,
+    /// Current token balance, capped at `size`. Negative after an
+    /// over-consumption charge: the debt refills back to zero before any
+    /// further traffic passes, so oversized frames never mint tokens.
+    balance: i128,
     /// Refill progress marker. Advanced only by whole granted tokens so the
-    /// fractional remainder carries into the next refill.
+    /// fractional remainder carries into the next refill, and snapped to
+    /// `now` at capacity so a full bucket banks no idle time.
     last_refill: Instant,
 }
 
@@ -49,10 +63,10 @@ enum BucketCharge {
     /// The charge fits the current balance (including burst).
     Ready,
     /// The charge exceeds the bucket capacity; it may proceed once as an
-    /// over-consumption that blocks the limiter for the returned duration.
-    Overdraft(Duration),
-    /// Not enough tokens yet; retry after the returned duration.
-    Blocked(Duration),
+    /// over-consumption whose debt refills by the returned deadline.
+    Overdraft(Instant),
+    /// Not enough tokens yet; retry at the returned deadline.
+    Blocked(Instant),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -95,23 +109,23 @@ impl RateLimiter {
             self.bandwidth.as_ref().map(|b| b.plan(frame_len)),
             self.ops.as_ref().map(|b| b.plan(1)),
         ];
-        let blocked_for = charges
+        let blocked_until = charges
             .iter()
             .flatten()
             .filter_map(|charge| match charge {
-                BucketCharge::Blocked(wait) => Some(*wait),
+                BucketCharge::Blocked(deadline) => Some(*deadline),
                 _ => None,
             })
             .max();
-        if let Some(wait) = blocked_for {
-            return Err(now + wait);
+        if let Some(deadline) = blocked_until {
+            return Err(deadline);
         }
 
-        let overdraft = charges
+        let overdraft_until = charges
             .iter()
             .flatten()
             .filter_map(|charge| match charge {
-                BucketCharge::Overdraft(wait) => Some(*wait),
+                BucketCharge::Overdraft(deadline) => Some(*deadline),
                 _ => None,
             })
             .max();
@@ -121,8 +135,8 @@ impl RateLimiter {
         if let Some(bucket) = &mut self.ops {
             bucket.commit(1);
         }
-        if let Some(wait) = overdraft {
-            self.blocked_until = Some(now + wait);
+        if let Some(deadline) = overdraft_until {
+            self.blocked_until = Some(deadline);
         }
         Ok(())
     }
@@ -135,14 +149,21 @@ impl TokenBucket {
             size: config.size,
             refill_time_ns: config.refill_time_ms as u128 * 1_000_000,
             one_time_burst: config.one_time_burst,
-            balance: config.size,
+            balance: config.size as i128,
             last_refill: now,
         }
     }
 
-    /// Grant tokens earned since the last refill, keeping the sub-token
-    /// remainder pending by advancing `last_refill` only by whole tokens.
+    /// Grant tokens earned since the last refill. The sub-token remainder
+    /// stays pending by advancing `last_refill` only by whole tokens, except
+    /// at capacity, where the clock snaps to `now` so a full bucket does not
+    /// bank idle time.
     fn refill(&mut self, now: Instant) {
+        if self.balance >= self.size as i128 {
+            self.last_refill = now;
+            return;
+        }
+
         let elapsed_ns = now.saturating_duration_since(self.last_refill).as_nanos();
         let tokens = elapsed_ns * self.size as u128 / self.refill_time_ns;
         if tokens == 0 {
@@ -151,37 +172,59 @@ impl TokenBucket {
 
         self.balance = self
             .balance
-            .saturating_add(u64::try_from(tokens).unwrap_or(u64::MAX))
-            .min(self.size);
+            .saturating_add(i128::try_from(tokens).unwrap_or(i128::MAX));
+        if self.balance >= self.size as i128 {
+            self.balance = self.size as i128;
+            self.last_refill = now;
+            return;
+        }
         let granted_ns = tokens * self.refill_time_ns / self.size as u128;
         self.last_refill += Duration::from_nanos(u64::try_from(granted_ns).unwrap_or(u64::MAX));
     }
 
     /// Plan a charge without committing it.
     fn plan(&self, tokens: u64) -> BucketCharge {
-        let after_burst = tokens.saturating_sub(self.one_time_burst);
+        let after_burst = tokens.saturating_sub(self.one_time_burst) as i128;
         if after_burst <= self.balance {
             return BucketCharge::Ready;
         }
-        if after_burst > self.size {
-            return BucketCharge::Overdraft(self.refill_duration(after_burst));
+        // The refill must cover exactly what the balance cannot, whether the
+        // charge waits (blocked) or goes through on debt (overdraft).
+        let deadline = self.refill_deadline(after_burst - self.balance);
+        if after_burst > self.size as i128 {
+            return BucketCharge::Overdraft(deadline);
         }
-        BucketCharge::Blocked(self.refill_duration(after_burst - self.balance))
+        BucketCharge::Blocked(deadline)
     }
 
     /// Commit a planned charge: burst tokens spend first, and an
-    /// over-consumption empties the balance (the limiter-level block repays
-    /// the overage).
+    /// over-consumption drives the balance negative (the limiter-level block
+    /// lasts until the debt refills to zero).
     fn commit(&mut self, tokens: u64) {
         let burst_spend = tokens.min(self.one_time_burst);
         self.one_time_burst -= burst_spend;
-        self.balance = self.balance.saturating_sub(tokens - burst_spend);
+        self.balance -= (tokens - burst_spend) as i128;
     }
 
-    /// Time to refill `tokens`, rounded up so the deadline is never early.
-    fn refill_duration(&self, tokens: u64) -> Duration {
-        let ns = (tokens as u128 * self.refill_time_ns).div_ceil(self.size as u128);
-        Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+    /// Deadline when `tokens` more whole tokens have accrued. Anchoring the
+    /// calculation at `last_refill` preserves partial-token progress already
+    /// earned before the current attempt.
+    fn refill_deadline(&self, tokens: i128) -> Instant {
+        let ns = (tokens.max(0) as u128 * self.refill_time_ns).div_ceil(self.size as u128);
+        self.last_refill + Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl fmt::Display for RateLimitDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Egress => f.write_str("egress"),
+            Self::Ingress => f.write_str("ingress"),
+        }
     }
 }
 
@@ -256,7 +299,8 @@ mod tests {
 
         // 333ms earns 0 whole tokens (0.999).
         let early = base() + Duration::from_millis(333);
-        assert!(limiter.try_consume_frame(1, early).is_err());
+        let deadline = limiter.try_consume_frame(1, early).unwrap_err();
+        assert_eq!(deadline - base(), Duration::from_nanos(333_333_334));
 
         // The 0.999 fraction is not discarded by the failed attempt: 334ms
         // total crosses one whole token.
@@ -286,15 +330,75 @@ mod tests {
     fn oversized_frame_passes_once_then_blocks_proportionally() {
         let mut limiter = bandwidth_limiter(1000, 1000, 0);
 
-        // 2500 bytes can never fit a 1000-byte bucket; permit it once.
+        // 2500 bytes can never fit a 1000-byte bucket; permit it once. The
+        // full balance covers 1000 of it, leaving a 1500-token debt.
         assert!(limiter.try_consume_frame(2500, base()).is_ok());
 
-        // The limiter then blocks for the frame's full cost: 2.5 refills.
+        // The limiter blocks until the debt refills: 1.5 refills.
         let deadline = limiter.try_consume_frame(1, base()).unwrap_err();
-        assert_eq!(deadline - base(), Duration::from_millis(2500));
+        assert_eq!(deadline - base(), Duration::from_millis(1500));
 
-        // Once repaid, traffic flows again.
-        assert!(limiter.try_consume_frame(1000, deadline).is_ok());
+        // At the deadline the balance is exactly zero, not refreshed: the
+        // oversized frame consumed real budget, never minted it. One refill
+        // later a full frame fits again, conserving 3500 bytes in 2.5s from
+        // a full 1000-byte bucket.
+        assert!(limiter.try_consume_frame(1, deadline).is_err());
+        assert!(
+            limiter
+                .try_consume_frame(1000, base() + Duration::from_millis(2500))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn oversized_frame_from_a_partial_bucket_repays_the_exact_deficit() {
+        let mut limiter = bandwidth_limiter(1000, 1000, 0);
+
+        // Deplete to 400, then over-consume: the 2500-byte frame leaves a
+        // 2100-token debt, so the block lasts 2.1 refills.
+        assert!(limiter.try_consume_frame(600, base()).is_ok());
+        assert!(limiter.try_consume_frame(2500, base()).is_ok());
+        let deadline = limiter.try_consume_frame(1, base()).unwrap_err();
+        assert_eq!(deadline - base(), Duration::from_millis(2100));
+
+        // Debt repaid means balance zero, not a refreshed bucket: a full
+        // frame still needs one more whole refill. Total: 4100 bytes in
+        // 3.1s from a full 1000-byte bucket, exactly the configured rate.
+        assert!(limiter.try_consume_frame(1000, deadline).is_err());
+        assert!(
+            limiter
+                .try_consume_frame(1000, base() + Duration::from_millis(3100))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn full_bucket_does_not_bank_idle_time() {
+        // One token per second, left idle just short of two refills.
+        let mut limiter = bandwidth_limiter(1, 1000, 0);
+        assert!(limiter.try_consume_frame(1, base()).is_ok());
+
+        // 1.999s later the bucket holds exactly one token, not 1.999: the
+        // surplus idle time was discarded at capacity, so a second frame
+        // one millisecond later must wait a full refill.
+        let idle = base() + Duration::from_millis(1999);
+        assert!(limiter.try_consume_frame(1, idle).is_ok());
+        let deadline = limiter
+            .try_consume_frame(1, idle + Duration::from_millis(1))
+            .unwrap_err();
+        assert_eq!(deadline - idle, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn full_bucket_does_not_bank_fractional_idle_time() {
+        let mut limiter = bandwidth_limiter(1, 1000, 0);
+        let first = base() + Duration::from_millis(999);
+
+        // Time spent below a whole-token boundary while already full must
+        // not make the next token arrive early after the balance is spent.
+        assert!(limiter.try_consume_frame(1, first).is_ok());
+        let deadline = limiter.try_consume_frame(1, first).unwrap_err();
+        assert_eq!(deadline - first, Duration::from_secs(1));
     }
 
     #[test]

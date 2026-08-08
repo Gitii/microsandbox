@@ -84,8 +84,8 @@ export interface NetworkConfig {
   readonly secrets: readonly SecretEntry[];
   readonly secretViolation: ViolationAction | null;
   readonly maxConnections: number | null;
-  readonly txRateLimiter: RateLimiterConfig | null;
-  readonly rxRateLimiter: RateLimiterConfig | null;
+  readonly egressRateLimiter: RateLimiterConfig | null;
+  readonly ingressRateLimiter: RateLimiterConfig | null;
   readonly interface?: {
     readonly ipv4Pool?: string | null;
     readonly ipv6Pool?: string | null;

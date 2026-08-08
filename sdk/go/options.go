@@ -917,13 +917,13 @@ type NetworkConfig struct {
 	// MaxConnections caps concurrent network connections from the sandbox.
 	MaxConnections *uint
 
-	// TxRateLimiter throttles guest-to-runtime (egress) traffic. Nil means
+	// EgressRateLimiter throttles guest-to-runtime (egress) traffic. Nil means
 	// unlimited. Takes effect on the next sandbox start.
-	TxRateLimiter *RateLimiterConfig
+	EgressRateLimiter *RateLimiterConfig
 
-	// RxRateLimiter throttles runtime-to-guest (ingress) traffic. Nil means
+	// IngressRateLimiter throttles runtime-to-guest (ingress) traffic. Nil means
 	// unlimited. Takes effect on the next sandbox start.
-	RxRateLimiter *RateLimiterConfig
+	IngressRateLimiter *RateLimiterConfig
 
 	// OnSecretViolation is the sandbox-wide action when a secret is sent to
 	// a disallowed host. Per-secret overrides via SecretEntry.OnViolation.

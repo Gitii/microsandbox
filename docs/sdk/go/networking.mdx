@@ -362,8 +362,8 @@ The full network stack configuration passed via [`WithNetwork`](#m-withnetwork).
 | IPv4Pool | `string` | Pool used to derive per-sandbox `/30` guest subnets. Defaults to `172.16.0.0/12` |
 | IPv6Pool | `string` | Pool used to derive per-sandbox `/64` guest prefixes. Defaults to `fd42:6d73:62::/48` |
 | MaxConnections | `*uint` | Cap on concurrent network connections from the sandbox |
-| TxRateLimiter | [`*RateLimiterConfig`](#ratelimiterconfig) | Guest upload (egress) rate limiter. `nil` means unlimited. Takes effect on the next sandbox start |
-| RxRateLimiter | [`*RateLimiterConfig`](#ratelimiterconfig) | Guest download (ingress) rate limiter. `nil` means unlimited. Takes effect on the next sandbox start |
+| EgressRateLimiter | [`*RateLimiterConfig`](#ratelimiterconfig) | Outbound (egress) rate limiter. `nil` means unlimited. Takes effect on the next sandbox start |
+| IngressRateLimiter | [`*RateLimiterConfig`](#ratelimiterconfig) | Inbound (ingress) rate limiter. `nil` means unlimited. Takes effect on the next sandbox start |
 | OnSecretViolation | [`ViolationAction`](/sdk/go/secrets#violationaction) | Sandbox-wide action when a secret is sent to a disallowed host. Per-secret overrides via `SecretEntry.OnViolation` |
 | TrustHostCAs | `*bool` | Ship the host's extra CA bundles into the guest. Opt-in for corporate MITM proxies whose gateway CA is unknown to the guest's stock bundle |
 
@@ -449,7 +449,7 @@ Host-scoped upstream certificate verification override.
 
 ### RateLimiterConfig
 
-<p className="msb-backref">Used by <a href="#networkconfig">NetworkConfig.TxRateLimiter / RxRateLimiter</a></p>
+<p className="msb-backref">Used by <a href="#networkconfig">NetworkConfig.EgressRateLimiter / IngressRateLimiter</a></p>
 
 Rate limiter for one traffic direction. Caps bandwidth (bytes) and packet rate (frames) independently; a `nil` bucket leaves that dimension unlimited. Cloud sandboxes reject rate limiters as unsupported for now.
 
@@ -464,7 +464,7 @@ Rate limiter for one traffic direction. Caps bandwidth (bytes) and packet rate (
 sb, err := m.CreateSandbox(ctx, "throttled",
     m.WithImage("python"),
     m.WithNetwork(&m.NetworkConfig{
-        TxRateLimiter: &m.RateLimiterConfig{
+        EgressRateLimiter: &m.RateLimiterConfig{
             Bandwidth: &m.TokenBucketConfig{Size: 1 << 20, RefillTime: time.Second, OneTimeBurst: 512 << 10},
             Ops:       &m.TokenBucketConfig{Size: 1000, RefillTime: time.Second},
         },

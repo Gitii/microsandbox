@@ -398,11 +398,11 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     {
         return Err(unsupported("network.tls"));
     }
-    if config.spec.network.tx_rate_limiter.is_some() {
-        return Err(unsupported("network.tx_rate_limiter"));
+    if config.spec.network.egress_rate_limiter.is_some() {
+        return Err(unsupported("network.egress_rate_limiter"));
     }
-    if config.spec.network.rx_rate_limiter.is_some() {
-        return Err(unsupported("network.rx_rate_limiter"));
+    if config.spec.network.ingress_rate_limiter.is_some() {
+        return Err(unsupported("network.ingress_rate_limiter"));
     }
 
     if config
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn cloud_create_request_rejects_rate_limiters() {
         let mut config = base_cloud_config();
-        config.spec.network.rx_rate_limiter = Some(microsandbox_types::RateLimiterConfig {
+        config.spec.network.ingress_rate_limiter = Some(microsandbox_types::RateLimiterConfig {
             bandwidth: Some(microsandbox_types::TokenBucketConfig {
                 size: 1024 * 1024,
                 refill_time_ms: 1000,

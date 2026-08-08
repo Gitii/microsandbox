@@ -222,7 +222,7 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 ///   connections on the host-bind address and forwards into the guest.
 /// * `max_connections` - Optional cap on concurrent guest connections tracked by
 ///   [`ConnectionTracker`]; `None` uses the default.
-/// * `tx_rate_limiter` - Optional guest-to-runtime rate limiter. A throttled
+/// * `egress_rate_limiter` - Optional guest-to-runtime rate limiter. A throttled
 ///   frame stays staged and the poll timeout retries at its refill deadline.
 /// * `tokio_handle` - Runtime handle used for proxy tasks, DNS forwarding, port publishing,
 ///   and ICMP relays.
@@ -236,7 +236,7 @@ pub fn smoltcp_poll_loop(
     tls_state: Option<Arc<TlsState>>,
     published_ports: Vec<PublishedPort>,
     max_connections: Option<usize>,
-    mut tx_rate_limiter: Option<RateLimiter>,
+    mut egress_rate_limiter: Option<RateLimiter>,
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
 ) {
@@ -335,16 +335,16 @@ pub fn smoltcp_poll_loop(
         let now = smoltcp_now();
 
         // ── Phase 1: Drain all guest frames with pre-inspection ──────────
-        let mut tx_resume_at: Option<std::time::Instant> = None;
+        let mut egress_resume_at: Option<std::time::Instant> = None;
         while let Some(frame) = device.stage_next_frame() {
             // Every guest frame crossing the boundary is charged one op and
             // its Ethernet length. A throttled frame stays staged; the poll
             // timeout below retries at the refill deadline.
-            if let Some(limiter) = tx_rate_limiter.as_mut()
+            if let Some(limiter) = egress_rate_limiter.as_mut()
                 && let Err(resume_at) =
                     limiter.try_consume_frame(frame.len() as u64, std::time::Instant::now())
             {
-                tx_resume_at = Some(resume_at);
+                egress_resume_at = Some(resume_at);
                 break;
             }
 
@@ -652,14 +652,17 @@ pub fn smoltcp_poll_loop(
             .map(|d| d.total_millis().min(i32::MAX as u64) as i32)
             .unwrap_or(100); // 100ms fallback when no timers pending.
 
-        // Rate-limit deadlines bound the sleep: a due RX deadline re-wakes
-        // the guest for its throttled frame, and pending TX/RX deadlines
+        // Rate-limit deadlines bound the sleep: a due ingress deadline re-wakes
+        // the guest for its throttled frame, and pending egress/ingress deadlines
         // shorten the timeout so throttled frames retry on time.
         let now_std = std::time::Instant::now();
-        if shared.take_due_rx_resume(now_std) {
+        if shared.take_due_ingress_resume(now_std) {
             shared.rx_wake.wake();
         }
-        for deadline in tx_resume_at.into_iter().chain(shared.rx_resume_at()) {
+        for deadline in egress_resume_at
+            .into_iter()
+            .chain(shared.ingress_resume_at())
+        {
             timeout_ms = timeout_ms.min(deadline_timeout_ms(deadline, now_std));
         }
 

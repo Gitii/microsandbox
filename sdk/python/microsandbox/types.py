@@ -1034,10 +1034,10 @@ class Network:
     """IPv6 pool used to derive per-sandbox /64 guest prefixes. Defaults
     to ``fd42:6d73:62::/48``."""
     max_connections: int | None = None
-    tx_rate_limiter: RateLimiter | None = None
+    egress_rate_limiter: RateLimiter | None = None
     """Guest-to-runtime (egress) rate limiter. ``None`` means unlimited.
     Applies on the next sandbox start."""
-    rx_rate_limiter: RateLimiter | None = None
+    ingress_rate_limiter: RateLimiter | None = None
     """Runtime-to-guest (ingress) rate limiter. ``None`` means unlimited.
     Applies on the next sandbox start."""
     on_secret_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG
@@ -1085,10 +1085,10 @@ class Network:
             d["ipv6_pool"] = self.ipv6_pool
         if self.max_connections is not None:
             d["max_connections"] = self.max_connections
-        if self.tx_rate_limiter is not None:
-            d["tx_rate_limiter"] = self.tx_rate_limiter._to_dict()
-        if self.rx_rate_limiter is not None:
-            d["rx_rate_limiter"] = self.rx_rate_limiter._to_dict()
+        if self.egress_rate_limiter is not None:
+            d["egress_rate_limiter"] = self.egress_rate_limiter._to_dict()
+        if self.ingress_rate_limiter is not None:
+            d["ingress_rate_limiter"] = self.ingress_rate_limiter._to_dict()
         violation = violation_policy_to_dict(self.on_secret_violation)
         if violation != str(ViolationAction.BLOCK_AND_LOG):
             d["on_secret_violation"] = violation

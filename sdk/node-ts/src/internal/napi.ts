@@ -928,8 +928,8 @@ export interface NapiNetworkBuilder {
   ipv4Pool(pool: string): this;
   ipv6Pool(pool: string): this;
   trustHostCAs(enabled: boolean): this;
-  txRateLimiter(configure: (b: NapiRateLimiterBuilder) => NapiRateLimiterBuilder): this;
-  rxRateLimiter(configure: (b: NapiRateLimiterBuilder) => NapiRateLimiterBuilder): this;
+  egressRateLimiter(configure: (b: NapiRateLimiterBuilder) => NapiRateLimiterBuilder): this;
+  ingressRateLimiter(configure: (b: NapiRateLimiterBuilder) => NapiRateLimiterBuilder): this;
   build(): NetworkConfig;
 }
 

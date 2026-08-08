@@ -516,8 +516,8 @@ Network(
     ipv4_pool: str | None = None,
     ipv6_pool: str | None = None,
     max_connections: int | None = None,
-    tx_rate_limiter: RateLimiter | None = None,
-    rx_rate_limiter: RateLimiter | None = None,
+    egress_rate_limiter: RateLimiter | None = None,
+    ingress_rate_limiter: RateLimiter | None = None,
     on_secret_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG,
 )
 ```
@@ -533,8 +533,8 @@ Network(
 | ipv4_pool | `str \| None` | `None` | IPv4 pool used for per-sandbox `/30` guest subnets. Defaults to `172.16.0.0/12` |
 | ipv6_pool | `str \| None` | `None` | IPv6 pool used for per-sandbox `/64` guest prefixes. Defaults to `fd42:6d73:62::/48` |
 | max_connections | `int \| None` | `None` | Maximum concurrent connections |
-| tx_rate_limiter | [`RateLimiter`](#ratelimiter)` \| None` | `None` | Guest upload (egress) rate limiter. `None` means unlimited |
-| rx_rate_limiter | [`RateLimiter`](#ratelimiter)` \| None` | `None` | Guest download (ingress) rate limiter. `None` means unlimited |
+| egress_rate_limiter | [`RateLimiter`](#ratelimiter)` \| None` | `None` | Outbound (egress) rate limiter. `None` means unlimited |
+| ingress_rate_limiter | [`RateLimiter`](#ratelimiter)` \| None` | `None` | Inbound (ingress) rate limiter. `None` means unlimited |
 | on_secret_violation | [`ViolationAction`](/sdk/python/secrets#violationaction)` \| `[`ViolationPolicy`](/sdk/python/secrets#violationpolicy) | `BLOCK_AND_LOG` | Sandbox-wide action when a secret placeholder reaches a disallowed host |
 
 | Class method | Returns | Description |
@@ -764,7 +764,7 @@ ScopedVerifyUpstream(
 
 <div className="msb-tags"><span className="msb-tag is-type">dataclass</span></div>
 
-<p className="msb-backref">Used by <a href="#network">Network(tx_rate_limiter=... / rx_rate_limiter=...)</a></p>
+<p className="msb-backref">Used by <a href="#network">Network(egress_rate_limiter=... / ingress_rate_limiter=...)</a></p>
 
 Frozen dataclass limiting one traffic direction. Caps bandwidth (bytes) and packet rate (frames) independently; a `None` bucket leaves that dimension unlimited. Limits apply on the next sandbox start; cloud sandboxes reject rate limiters as unsupported for now. Import it from `microsandbox`.
 
@@ -789,7 +789,7 @@ sb = await Sandbox.create(
     "throttled",
     image="python",
     network=Network(
-        tx_rate_limiter=RateLimiter(
+        egress_rate_limiter=RateLimiter(
             bandwidth=TokenBucket(size=1_048_576, refill_time_ms=1_000, one_time_burst=524_288),
             ops=TokenBucket(size=1_000, refill_time_ms=1_000),
         ),

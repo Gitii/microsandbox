@@ -512,17 +512,17 @@ export declare class NetworkBuilder {
    * the next sandbox start.
    *
    * ```js
-   * .txRateLimiter((r) => r
+   * .egressRateLimiter((r) => r
    *   .bandwidth(1_048_576, 1_000)
    *   .ops(1_000, 1_000))
    * ```
    */
-  txRateLimiter(configure: (arg: JsRateLimiterBuilder) => JsRateLimiterBuilder): this
+  egressRateLimiter(configure: (arg: JsRateLimiterBuilder) => JsRateLimiterBuilder): this
   /**
    * Limit runtime-to-guest (ingress) traffic via a callback. Applies on
    * the next sandbox start.
    */
-  rxRateLimiter(configure: (arg: JsRateLimiterBuilder) => JsRateLimiterBuilder): this
+  ingressRateLimiter(configure: (arg: JsRateLimiterBuilder) => JsRateLimiterBuilder): this
   /**
    * Snapshot the accumulated configuration as a JSON string. The TS
    * layer parses + key-remaps to camelCase before returning to the
@@ -649,7 +649,7 @@ export type JsPullProgressStream = PullProgressStream
 /**
  * Fluent builder for one direction's network rate limiter. Chainable
  * setters accumulate bucket values; the parent
- * `NetworkBuilder.txRateLimiter()` / `.rxRateLimiter()` applies them to
+ * `NetworkBuilder.egressRateLimiter()` / `.ingressRateLimiter()` applies them to
  * the Rust builder, where validation happens at `build()` time.
  */
 export declare class RateLimiterBuilder {

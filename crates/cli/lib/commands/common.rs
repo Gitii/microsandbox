@@ -10,6 +10,8 @@ use microsandbox::sandbox::{
     DeploymentProfile, DiskImageFormat, MountBuilder, Patch, RootDiskBuilder, Sandbox,
     SandboxBuilder, SandboxHandle, SecurityProfile,
 };
+#[cfg(feature = "net")]
+use microsandbox_network::rate_limit::RateLimitDirection;
 
 use crate::ui;
 
@@ -351,53 +353,53 @@ pub struct SandboxOpts {
     #[arg(long = "net-default-ingress", value_name = "ACTION")]
     pub net_default_ingress: Option<String>,
 
-    /// Limit guest upload (egress) bandwidth, e.g. 1M/1s. SIZE accepts
+    /// Limit outbound (egress) bandwidth, e.g. 1M/1s. SIZE accepts
     /// raw bytes plus K, M, and G suffixes; the interval defaults to one
     /// second when omitted. Applies on the next sandbox start.
     #[cfg(feature = "net")]
-    #[arg(long = "net-tx-bandwidth", value_name = "SIZE[/DURATION]")]
-    pub net_tx_bandwidth: Option<String>,
+    #[arg(long = "net-egress-bandwidth", value_name = "SIZE[/DURATION]")]
+    pub net_egress_bandwidth: Option<String>,
 
     /// One-time startup burst for the egress bandwidth limit, e.g. 512K.
-    /// Requires --net-tx-bandwidth.
+    /// Requires --net-egress-bandwidth.
     #[cfg(feature = "net")]
-    #[arg(long = "net-tx-bandwidth-burst", value_name = "SIZE")]
-    pub net_tx_bandwidth_burst: Option<String>,
+    #[arg(long = "net-egress-bandwidth-burst", value_name = "SIZE")]
+    pub net_egress_bandwidth_burst: Option<String>,
 
-    /// Limit guest upload (egress) packet rate, e.g. 1000/1s. The
+    /// Limit outbound (egress) packet rate, e.g. 1000/1s. The
     /// interval defaults to one second when omitted.
     #[cfg(feature = "net")]
-    #[arg(long = "net-tx-ops", value_name = "COUNT[/DURATION]")]
-    pub net_tx_ops: Option<String>,
+    #[arg(long = "net-egress-ops", value_name = "COUNT[/DURATION]")]
+    pub net_egress_ops: Option<String>,
 
     /// One-time startup burst for the egress packet-rate limit.
-    /// Requires --net-tx-ops.
+    /// Requires --net-egress-ops.
     #[cfg(feature = "net")]
-    #[arg(long = "net-tx-ops-burst", value_name = "COUNT")]
-    pub net_tx_ops_burst: Option<u64>,
+    #[arg(long = "net-egress-ops-burst", value_name = "COUNT")]
+    pub net_egress_ops_burst: Option<u64>,
 
-    /// Limit guest download (ingress) bandwidth, e.g. 1M/1s. Same syntax
-    /// as --net-tx-bandwidth.
+    /// Limit inbound (ingress) bandwidth, e.g. 1M/1s. Same syntax
+    /// as --net-egress-bandwidth.
     #[cfg(feature = "net")]
-    #[arg(long = "net-rx-bandwidth", value_name = "SIZE[/DURATION]")]
-    pub net_rx_bandwidth: Option<String>,
+    #[arg(long = "net-ingress-bandwidth", value_name = "SIZE[/DURATION]")]
+    pub net_ingress_bandwidth: Option<String>,
 
     /// One-time startup burst for the ingress bandwidth limit.
-    /// Requires --net-rx-bandwidth.
+    /// Requires --net-ingress-bandwidth.
     #[cfg(feature = "net")]
-    #[arg(long = "net-rx-bandwidth-burst", value_name = "SIZE")]
-    pub net_rx_bandwidth_burst: Option<String>,
+    #[arg(long = "net-ingress-bandwidth-burst", value_name = "SIZE")]
+    pub net_ingress_bandwidth_burst: Option<String>,
 
-    /// Limit guest download (ingress) packet rate, e.g. 1000/1s.
+    /// Limit inbound (ingress) packet rate, e.g. 1000/1s.
     #[cfg(feature = "net")]
-    #[arg(long = "net-rx-ops", value_name = "COUNT[/DURATION]")]
-    pub net_rx_ops: Option<String>,
+    #[arg(long = "net-ingress-ops", value_name = "COUNT[/DURATION]")]
+    pub net_ingress_ops: Option<String>,
 
     /// One-time startup burst for the ingress packet-rate limit.
-    /// Requires --net-rx-ops.
+    /// Requires --net-ingress-ops.
     #[cfg(feature = "net")]
-    #[arg(long = "net-rx-ops-burst", value_name = "COUNT")]
-    pub net_rx_ops_burst: Option<u64>,
+    #[arg(long = "net-ingress-ops-burst", value_name = "COUNT")]
+    pub net_ingress_ops_burst: Option<u64>,
 
     /// Limit the number of concurrent network connections.
     #[cfg(feature = "net")]
@@ -579,14 +581,14 @@ impl SandboxOpts {
             || self.net_default.is_some()
             || self.net_default_egress.is_some()
             || self.net_default_ingress.is_some()
-            || self.net_tx_bandwidth.is_some()
-            || self.net_tx_bandwidth_burst.is_some()
-            || self.net_tx_ops.is_some()
-            || self.net_tx_ops_burst.is_some()
-            || self.net_rx_bandwidth.is_some()
-            || self.net_rx_bandwidth_burst.is_some()
-            || self.net_rx_ops.is_some()
-            || self.net_rx_ops_burst.is_some()
+            || self.net_egress_bandwidth.is_some()
+            || self.net_egress_bandwidth_burst.is_some()
+            || self.net_egress_ops.is_some()
+            || self.net_egress_ops_burst.is_some()
+            || self.net_ingress_bandwidth.is_some()
+            || self.net_ingress_bandwidth_burst.is_some()
+            || self.net_ingress_ops.is_some()
+            || self.net_ingress_ops_burst.is_some()
             || self.max_connections.is_some()
             || self.trust_host_cas
             || self.tls_intercept
@@ -1603,14 +1605,14 @@ fn apply_network_opts(
         || opts.net_default_ingress.is_some()
         || opts.net_ipv4_pool.is_some()
         || opts.net_ipv6_pool.is_some()
-        || opts.net_tx_bandwidth.is_some()
-        || opts.net_tx_bandwidth_burst.is_some()
-        || opts.net_tx_ops.is_some()
-        || opts.net_tx_ops_burst.is_some()
-        || opts.net_rx_bandwidth.is_some()
-        || opts.net_rx_bandwidth_burst.is_some()
-        || opts.net_rx_ops.is_some()
-        || opts.net_rx_ops_burst.is_some()
+        || opts.net_egress_bandwidth.is_some()
+        || opts.net_egress_bandwidth_burst.is_some()
+        || opts.net_egress_ops.is_some()
+        || opts.net_egress_ops_burst.is_some()
+        || opts.net_ingress_bandwidth.is_some()
+        || opts.net_ingress_bandwidth_burst.is_some()
+        || opts.net_ingress_ops.is_some()
+        || opts.net_ingress_ops_burst.is_some()
         || opts.max_connections.is_some()
         || opts.trust_host_cas
         || opts.tls_intercept
@@ -1672,19 +1674,19 @@ fn apply_network_opts(
             .collect::<anyhow::Result<Vec<_>>>()?;
         let no_verify_upstream_for = opts.tls_no_verify_upstream_for.clone();
         let violation_action = parse_violation_action(&opts.on_secret_violation)?;
-        let tx_rate_limiter = parse_rate_limiter_flags(
-            "tx",
-            opts.net_tx_bandwidth.as_deref(),
-            opts.net_tx_bandwidth_burst.as_deref(),
-            opts.net_tx_ops.as_deref(),
-            opts.net_tx_ops_burst,
+        let egress_rate_limiter = parse_rate_limiter_flags(
+            RateLimitDirection::Egress,
+            opts.net_egress_bandwidth.as_deref(),
+            opts.net_egress_bandwidth_burst.as_deref(),
+            opts.net_egress_ops.as_deref(),
+            opts.net_egress_ops_burst,
         )?;
-        let rx_rate_limiter = parse_rate_limiter_flags(
-            "rx",
-            opts.net_rx_bandwidth.as_deref(),
-            opts.net_rx_bandwidth_burst.as_deref(),
-            opts.net_rx_ops.as_deref(),
-            opts.net_rx_ops_burst,
+        let ingress_rate_limiter = parse_rate_limiter_flags(
+            RateLimitDirection::Ingress,
+            opts.net_ingress_bandwidth.as_deref(),
+            opts.net_ingress_bandwidth_burst.as_deref(),
+            opts.net_ingress_ops.as_deref(),
+            opts.net_ingress_ops_burst,
         )?;
 
         builder = builder.network(move |mut n| {
@@ -1715,11 +1717,11 @@ fn apply_network_opts(
             if trust_host_cas {
                 n = n.trust_host_cas(true);
             }
-            if let Some(limiter) = tx_rate_limiter {
-                n = n.tx_rate_limiter(|r| limiter.apply(r));
+            if let Some(limiter) = egress_rate_limiter {
+                n = n.egress_rate_limiter(|r| limiter.apply(r));
             }
-            if let Some(limiter) = rx_rate_limiter {
-                n = n.rx_rate_limiter(|r| limiter.apply(r));
+            if let Some(limiter) = ingress_rate_limiter {
+                n = n.ingress_rate_limiter(|r| limiter.apply(r));
             }
             if let Some(action) = violation_action {
                 n = n.on_secret_violation(|_| {
@@ -1820,7 +1822,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     }
 }
 
-/// Parsed values of one direction's `--net-{tx,rx}-*` rate limit flags.
+/// Parsed values of one direction's `--net-{egress,ingress}-*` rate limit flags.
 #[cfg(feature = "net")]
 struct CliRateLimiter {
     bandwidth: Option<(u64, std::time::Duration)>,
@@ -1857,7 +1859,7 @@ impl CliRateLimiter {
 /// the four flags is set.
 #[cfg(feature = "net")]
 fn parse_rate_limiter_flags(
-    direction: &str,
+    direction: RateLimitDirection,
     bandwidth: Option<&str>,
     bandwidth_burst: Option<&str>,
     ops: Option<&str>,
@@ -2640,35 +2642,35 @@ mod tests {
     fn parse_rate_splits_value_and_duration() {
         let bytes = |s: &str| ui::parse_size_bytes(s).map_err(anyhow::Error::msg);
 
-        let (size, per) = parse_rate("--net-tx-bandwidth", "1M/1s", bytes).unwrap();
+        let (size, per) = parse_rate("--net-egress-bandwidth", "1M/1s", bytes).unwrap();
         assert_eq!(size, 1024 * 1024);
         assert_eq!(per, std::time::Duration::from_secs(1));
 
         // A bare value means per second.
-        let (count, per) = parse_rate("--net-tx-ops", "1000", |s| {
+        let (count, per) = parse_rate("--net-egress-ops", "1000", |s| {
             s.parse::<u64>().map_err(anyhow::Error::from)
         })
         .unwrap();
         assert_eq!(count, 1000);
         assert_eq!(per, std::time::Duration::from_secs(1));
 
-        let (size, per) = parse_rate("--net-rx-bandwidth", "512K/500ms", bytes).unwrap();
+        let (size, per) = parse_rate("--net-ingress-bandwidth", "512K/500ms", bytes).unwrap();
         assert_eq!(size, 512 * 1024);
         assert_eq!(per, std::time::Duration::from_millis(500));
 
-        let err = parse_rate("--net-tx-ops", "abc/1s", |s| {
+        let err = parse_rate("--net-egress-ops", "abc/1s", |s| {
             s.parse::<u64>().map_err(anyhow::Error::from)
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("--net-tx-ops"), "unexpected error: {err}");
+        assert!(err.contains("--net-egress-ops"), "unexpected error: {err}");
     }
 
     #[cfg(feature = "net")]
     #[test]
     fn parse_rate_limiter_flags_maps_all_four_flags() {
         let limiter = parse_rate_limiter_flags(
-            "tx",
+            RateLimitDirection::Egress,
             Some("1M/1s"),
             Some("512K"),
             Some("1000/1s"),
@@ -2686,7 +2688,7 @@ mod tests {
         assert_eq!(limiter.ops_burst, Some(500));
 
         assert!(
-            parse_rate_limiter_flags("rx", None, None, None, None)
+            parse_rate_limiter_flags(RateLimitDirection::Ingress, None, None, None, None)
                 .unwrap()
                 .is_none()
         );

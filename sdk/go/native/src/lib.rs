@@ -906,9 +906,9 @@ struct NetworkOpts {
     ipv6_pool: Option<String>,
     max_connections: Option<usize>,
     /// Guest-to-runtime (egress) rate limiter.
-    tx_rate_limiter: Option<RateLimiterOpts>,
+    egress_rate_limiter: Option<RateLimiterOpts>,
     /// Runtime-to-guest (ingress) rate limiter.
-    rx_rate_limiter: Option<RateLimiterOpts>,
+    ingress_rate_limiter: Option<RateLimiterOpts>,
     /// Sandbox-wide secret violation action: "block", "block-and-log",
     /// "block-and-terminate".
     on_secret_violation: Option<String>,
@@ -1357,15 +1357,15 @@ fn apply_network(
 
     // Rate limiters. Validation (empty limiter, zero size/refill, burst
     // without a bucket) happens in the network builder's build step.
-    if let Some(ref limiter) = net.tx_rate_limiter {
+    if let Some(ref limiter) = net.egress_rate_limiter {
         let limiter = limiter.clone();
-        builder =
-            builder.network(move |n| n.tx_rate_limiter(move |r| apply_rate_limiter(r, &limiter)));
+        builder = builder
+            .network(move |n| n.egress_rate_limiter(move |r| apply_rate_limiter(r, &limiter)));
     }
-    if let Some(ref limiter) = net.rx_rate_limiter {
+    if let Some(ref limiter) = net.ingress_rate_limiter {
         let limiter = limiter.clone();
-        builder =
-            builder.network(move |n| n.rx_rate_limiter(move |r| apply_rate_limiter(r, &limiter)));
+        builder = builder
+            .network(move |n| n.ingress_rate_limiter(move |r| apply_rate_limiter(r, &limiter)));
     }
 
     // Trust host CA bundles inside the guest.
