@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use microsandbox_image::snapshot::{
+use microsandbox_types::snapshot::{
     DEFAULT_UPPER_FILE, DESCRIPTOR_FILENAME, FileSnapshotState, ImageRef, Manifest, SCHEMA_VERSION,
     SNAPSHOT_ARTIFACT_KIND, SnapshotFormat, SnapshotScope, SnapshotState, UpperLayer,
 };

@@ -10,12 +10,13 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::error::{ImageError, ImageResult};
-
-use super::{
-    FileSnapshotState, ImageRef, Manifest, SCHEMA_VERSION, SNAPSHOT_ARTIFACT_KIND,
-    SPARSE_SHA256_V1, SnapshotFormat, SnapshotScope, SnapshotState, UpperIntegrity, UpperLayer,
+use microsandbox_types::snapshot::{
+    DESCRIPTOR_FILENAME, FileSnapshotState, ImageRef, Manifest, SCHEMA_VERSION,
+    SNAPSHOT_ARTIFACT_KIND, SPARSE_SHA256_V1, SnapshotFormat, SnapshotScope, SnapshotState,
+    UpperIntegrity, UpperLayer,
 };
+
+use crate::error::{ImageError, ImageResult};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -325,7 +326,7 @@ fn validate_filename(value: &str) -> ImageResult<()> {
         value,
         V066_DESCRIPTOR_FILENAME
             | V066_BACKUP_FILENAME
-            | super::DESCRIPTOR_FILENAME
+            | DESCRIPTOR_FILENAME
             | ".snapshot-migration.lock"
     ) {
         return legacy_error("legacy_descriptor_malformed: upper.file uses a reserved name");

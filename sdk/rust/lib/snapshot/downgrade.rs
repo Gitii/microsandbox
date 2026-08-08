@@ -17,7 +17,7 @@ use chrono::Utc;
 use microsandbox_image::snapshot::migration::{
     V066_BACKUP_FILENAME, V066_DESCRIPTOR_FILENAME, inspect_v066_source, translate_v066_reverse,
 };
-use microsandbox_image::snapshot::{DESCRIPTOR_FILENAME, Manifest, SnapshotState};
+use microsandbox_types::snapshot::{DESCRIPTOR_FILENAME, Manifest, SnapshotState};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
 use serde::Serialize;
 

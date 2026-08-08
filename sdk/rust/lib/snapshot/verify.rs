@@ -5,7 +5,7 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use microsandbox_image::snapshot::{SPARSE_SHA256_V1, SnapshotState, UpperIntegrity};
+use microsandbox_types::snapshot::{SPARSE_SHA256_V1, SnapshotState, UpperIntegrity};
 use microsandbox_utils::extent::ExtentMap;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt;
