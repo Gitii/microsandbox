@@ -6,6 +6,7 @@ mod cloud;
 mod domain;
 mod error;
 pub mod modify;
+pub mod snapshot;
 mod validation;
 
 #[cfg(feature = "ts")]
@@ -35,7 +36,7 @@ pub use domain::{
     SecretConfigError, SecretEntry, SecretInjection, SecretsConfig, SecurityProfile, SnapshotSpec,
     StatVirtualization, TlsConfig, ViolationAction, VolumeKind, VolumeMount, VolumeSpec,
 };
-pub use error::{TypesError, TypesResult};
+pub use error::{SnapshotManifestError, SnapshotManifestResult, TypesError, TypesResult};
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
     ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
