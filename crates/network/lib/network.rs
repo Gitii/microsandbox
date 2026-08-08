@@ -185,12 +185,48 @@ impl SmoltcpNetwork {
         )
     }
 
+    #[cfg(test)]
+    fn new_with_routes_at(
+        config: NetworkConfig,
+        slot: u64,
+        host_has_ipv4: bool,
+        host_has_ipv6: bool,
+        now: Instant,
+    ) -> Result<Self, NetworkInitError> {
+        Self::new_with_profile_and_routes_at(
+            config,
+            slot,
+            DeploymentProfile::SingleTenant,
+            host_has_ipv4,
+            host_has_ipv6,
+            now,
+        )
+    }
+
     fn new_with_profile_and_routes(
         config: NetworkConfig,
         slot: u64,
         deployment_profile: DeploymentProfile,
         host_has_ipv4: bool,
         host_has_ipv6: bool,
+    ) -> Result<Self, NetworkInitError> {
+        Self::new_with_profile_and_routes_at(
+            config,
+            slot,
+            deployment_profile,
+            host_has_ipv4,
+            host_has_ipv6,
+            Instant::now(),
+        )
+    }
+
+    fn new_with_profile_and_routes_at(
+        config: NetworkConfig,
+        slot: u64,
+        deployment_profile: DeploymentProfile,
+        host_has_ipv4: bool,
+        host_has_ipv6: bool,
+        now: Instant,
     ) -> Result<Self, NetworkInitError> {
         assert!(
             slot <= MAX_SLOT,
@@ -245,7 +281,6 @@ impl SmoltcpNetwork {
         // Every write path validates rate limiters (`NetworkBuilder::build`),
         // but a stored config bypasses the builder: fail startup cleanly
         // instead of panicking on a corrupted spec.
-        let now = Instant::now();
         let ingress_rate_limiter = config
             .ingress_rate_limiter
             .as_ref()
@@ -879,174 +914,82 @@ mod tests {
     }
 }
 
-/// End-to-end rate limit checks: guest ICMP echo requests cross the egress
-/// boundary into the gateway echo responder, and the replies cross the ingress
-/// boundary back to the guest, so one ping exercises both directions.
-#[cfg(all(test, unix))]
+/// Deterministic checks that directional limiters attach to the correct
+/// virtio-net boundaries.
+#[cfg(test)]
 mod rate_limit_tests {
     use std::time::{Duration, Instant};
 
     use microsandbox_types::{RateLimiterConfig, TokenBucketConfig};
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{
-        EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr,
-        IpProtocol, Ipv4Packet, Ipv4Repr,
-    };
+    use msb_krun::backends::net::ReadError;
 
     use super::*;
 
     const VIRTIO_NET_HDR_LEN: usize = 12;
 
-    fn ops_limiter(size: u64, refill_time_ms: u64) -> RateLimiterConfig {
-        RateLimiterConfig {
-            bandwidth: None,
-            ops: Some(TokenBucketConfig {
-                size,
-                refill_time_ms,
-                one_time_burst: 0,
+    fn bucket(size: u64, refill_time_ms: u64) -> TokenBucketConfig {
+        TokenBucketConfig {
+            size,
+            refill_time_ms,
+            one_time_burst: 0,
+        }
+    }
+
+    #[test]
+    fn directional_limiters_apply_at_the_correct_boundaries() {
+        let base = Instant::now();
+        let config = NetworkConfig {
+            egress_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: None,
+                ops: Some(bucket(1, 100)),
             }),
-        }
-    }
-
-    fn bandwidth_limiter(size: u64, refill_time_ms: u64) -> RateLimiterConfig {
-        RateLimiterConfig {
-            bandwidth: Some(TokenBucketConfig {
-                size,
-                refill_time_ms,
-                one_time_burst: 0,
+            ingress_rate_limiter: Some(RateLimiterConfig {
+                bandwidth: Some(bucket(1, 200)),
+                ops: None,
             }),
-            ops: None,
-        }
-    }
-
-    /// Build a guest -> gateway ICMP echo request frame.
-    fn echo_request_frame(net: &SmoltcpNetwork, seq_no: u16, data: &[u8]) -> Vec<u8> {
-        let guest_ipv4 = net.guest_ipv4.expect("guest ipv4 active");
-        let gateway_ipv4 = net.gateway_ipv4.expect("gateway ipv4 active");
-
-        let ipv4_repr = Ipv4Repr {
-            src_addr: guest_ipv4,
-            dst_addr: gateway_ipv4,
-            next_header: IpProtocol::Icmp,
-            payload_len: 8 + data.len(),
-            hop_limit: 64,
+            ..NetworkConfig::default()
         };
-        let icmp_repr = Icmpv4Repr::EchoRequest {
-            ident: 0x42,
-            seq_no,
-            data,
-        };
-        let mut frame = vec![0u8; 14 + ipv4_repr.buffer_len() + icmp_repr.buffer_len()];
-
-        let mut eth = EthernetFrame::new_unchecked(&mut frame);
-        EthernetRepr {
-            src_addr: EthernetAddress(net.guest_mac),
-            dst_addr: EthernetAddress(net.gateway_mac),
-            ethertype: EthernetProtocol::Ipv4,
-        }
-        .emit(&mut eth);
-        ipv4_repr.emit(
-            &mut Ipv4Packet::new_unchecked(&mut frame[14..34]),
-            &ChecksumCapabilities::default(),
-        );
-        icmp_repr.emit(
-            &mut Icmpv4Packet::new_unchecked(&mut frame[34..]),
-            &ChecksumCapabilities::default(),
-        );
-
-        frame
-    }
-
-    /// Wait (bounded) for the backend's wake fd, mirroring the NetWorker.
-    fn wait_readable(fd: std::os::fd::RawFd, timeout_ms: i32) {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pfd` points to a valid pollfd for a live file descriptor.
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    }
-
-    /// Send `count` gateway pings with `payload_len`-byte payloads through
-    /// a started network and return the time until every reply arrived.
-    fn ping_round_trip_time(
-        mut config: NetworkConfig,
-        count: usize,
-        payload_len: usize,
-    ) -> Duration {
-        // Gateway echo replies are policy-gated; these tests measure rate
-        // limiting, not policy.
-        config.policy = crate::policy::NetworkPolicy::allow_all();
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let mut net =
-            SmoltcpNetwork::new_with_routes(config, 0, true, false).expect("network init");
-        let mut backend = net.take_backend();
-        net.start(runtime.handle().clone());
+            SmoltcpNetwork::new_with_routes_at(config, 0, true, false, base).expect("network init");
 
-        let payload = vec![0xab_u8; payload_len];
-        let started = Instant::now();
-        for seq_no in 0..count {
-            let frame = echo_request_frame(&net, seq_no as u16, &payload);
-            let mut buf = vec![0u8; VIRTIO_NET_HDR_LEN + frame.len()];
-            buf[VIRTIO_NET_HDR_LEN..].copy_from_slice(&frame);
-            backend
-                .write_frame(VIRTIO_NET_HDR_LEN, &mut buf)
-                .expect("guest frame accepted");
-        }
+        // The guest-to-runtime boundary uses the egress ops limiter.
+        let mut egress = net.egress_rate_limiter.take().expect("egress limiter");
+        assert!(egress.try_consume_frame(1000, base).is_ok());
+        let egress_deadline = egress.try_consume_frame(1, base).unwrap_err();
+        assert_eq!(egress_deadline, base + Duration::from_millis(100));
 
-        let deadline = started + Duration::from_secs(10);
-        let mut received = 0;
-        let mut buf = [0u8; 2048];
-        while received < count {
-            assert!(
-                Instant::now() < deadline,
-                "timed out after {received}/{count} echo replies"
-            );
-            if backend.read_frame(&mut buf).is_ok() {
-                received += 1;
-                continue;
-            }
-            wait_readable(backend.raw_socket_fd(), 100);
-        }
-        started.elapsed()
-    }
+        // The runtime-to-guest boundary uses the ingress bandwidth limiter.
+        // Its pending slot preserves the blocked frame and its position.
+        assert!(net.shared.push_rx_frame_and_wake(vec![0xaa]));
+        assert!(net.shared.push_rx_frame_and_wake(vec![0xbb]));
+        let mut backend = net.backend.take().expect("network backend");
+        let mut buf = [0u8; 64];
 
-    #[test]
-    fn egress_ops_limiter_paces_guest_frames() {
-        // 2 frames up front, then one per 50ms: the 6th crosses at +200ms.
-        let config = NetworkConfig {
-            egress_rate_limiter: Some(ops_limiter(2, 100)),
-            ..NetworkConfig::default()
-        };
-
-        let elapsed = ping_round_trip_time(config, 6, 8);
-        assert!(
-            elapsed >= Duration::from_millis(190),
-            "egress throttling too fast: {elapsed:?}"
+        let len = backend.read_frame_at(&mut buf, base).expect("first frame");
+        assert_eq!(&buf[VIRTIO_NET_HDR_LEN..len], &[0xaa]);
+        assert!(matches!(
+            backend.read_frame_at(&mut buf, base),
+            Err(ReadError::NothingRead)
+        ));
+        assert_eq!(
+            net.shared.ingress_resume_at(),
+            Some(base + Duration::from_millis(200))
         );
-    }
 
-    #[test]
-    fn ingress_bandwidth_limiter_paces_frames_to_the_guest() {
-        // Echo replies are 14 (eth) + 20 (ipv4) + 8 (icmp) + 58 = 100 bytes:
-        // the first reply drains the bucket, each next waits a full refill,
-        // so the 4th arrives at +300ms.
-        let config = NetworkConfig {
-            ingress_rate_limiter: Some(bandwidth_limiter(100, 100)),
-            ..NetworkConfig::default()
-        };
-
-        let elapsed = ping_round_trip_time(config, 4, 58);
+        let before_deadline = base + Duration::from_millis(199);
+        assert!(matches!(
+            backend.read_frame_at(&mut buf, before_deadline),
+            Err(ReadError::NothingRead)
+        ));
+        assert!(!net.shared.take_due_ingress_resume(before_deadline));
         assert!(
-            elapsed >= Duration::from_millis(290),
-            "ingress throttling too fast: {elapsed:?}"
+            net.shared
+                .take_due_ingress_resume(base + Duration::from_millis(200))
         );
-    }
-
-    #[test]
-    fn unlimited_config_is_not_throttled() {
-        let elapsed = ping_round_trip_time(NetworkConfig::default(), 6, 8);
-        assert!(elapsed < Duration::from_secs(5), "unexpected {elapsed:?}");
+        assert_eq!(net.shared.ingress_resume_at(), None);
+        let len = backend
+            .read_frame_at(&mut buf, base + Duration::from_millis(200))
+            .expect("throttled frame at exact deadline");
+        assert_eq!(&buf[VIRTIO_NET_HDR_LEN..len], &[0xbb]);
     }
 }

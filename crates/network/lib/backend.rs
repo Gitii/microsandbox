@@ -67,6 +67,50 @@ impl SmoltcpBackend {
             pending_ingress_frame: None,
         }
     }
+
+    /// Deliver a frame using an explicit rate-limiter clock value.
+    ///
+    /// The production trait implementation supplies [`Instant::now`]; tests
+    /// use this seam to assert exact deadlines without sleeping.
+    pub(crate) fn read_frame_at(
+        &mut self,
+        buf: &mut [u8],
+        now: Instant,
+    ) -> Result<usize, ReadError> {
+        self.shared.rx_wake.drain();
+
+        let frame = match self.pending_ingress_frame.take() {
+            Some(frame) => frame,
+            None => self.shared.rx_ring.pop().ok_or(ReadError::NothingRead)?,
+        };
+
+        if let Some(limiter) = &mut self.ingress_rate_limiter
+            && let Err(resume_at) = limiter.try_consume_frame(frame.len() as u64, now)
+        {
+            // Keep the frame in the pending slot; the poll loop wakes
+            // `rx_wake` when the refill deadline arrives.
+            self.pending_ingress_frame = Some(frame);
+            self.shared.set_ingress_resume_at(resume_at);
+            return Err(ReadError::NothingRead);
+        }
+
+        let total_len = VIRTIO_NET_HDR_LEN + frame.len();
+        if total_len > buf.len() {
+            // Frame too large for the buffer — drop it to avoid panicking.
+            tracing::debug!(
+                frame_len = frame.len(),
+                buf_len = buf.len(),
+                "dropping oversized frame from rx_ring"
+            );
+            return Err(ReadError::NothingRead);
+        }
+
+        // Prepend zeroed virtio-net header.
+        buf[..VIRTIO_NET_HDR_LEN].fill(0);
+        buf[VIRTIO_NET_HDR_LEN..total_len].copy_from_slice(&frame);
+
+        Ok(total_len)
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -98,39 +142,7 @@ impl NetBackend for SmoltcpBackend {
     /// Deliver a frame from smoltcp to the guest. Prepends a zeroed
     /// virtio-net header.
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        self.shared.rx_wake.drain();
-
-        let frame = match self.pending_ingress_frame.take() {
-            Some(frame) => frame,
-            None => self.shared.rx_ring.pop().ok_or(ReadError::NothingRead)?,
-        };
-
-        if let Some(limiter) = &mut self.ingress_rate_limiter
-            && let Err(resume_at) = limiter.try_consume_frame(frame.len() as u64, Instant::now())
-        {
-            // Keep the frame in the pending slot; the poll loop wakes
-            // `rx_wake` when the refill deadline arrives.
-            self.pending_ingress_frame = Some(frame);
-            self.shared.set_ingress_resume_at(resume_at);
-            return Err(ReadError::NothingRead);
-        }
-
-        let total_len = VIRTIO_NET_HDR_LEN + frame.len();
-        if total_len > buf.len() {
-            // Frame too large for the buffer — drop it to avoid panicking.
-            tracing::debug!(
-                frame_len = frame.len(),
-                buf_len = buf.len(),
-                "dropping oversized frame from rx_ring"
-            );
-            return Err(ReadError::NothingRead);
-        }
-
-        // Prepend zeroed virtio-net header.
-        buf[..VIRTIO_NET_HDR_LEN].fill(0);
-        buf[VIRTIO_NET_HDR_LEN..total_len].copy_from_slice(&frame);
-
-        Ok(total_len)
+        self.read_frame_at(buf, Instant::now())
     }
 
     /// No partial writes — queue push is atomic.
@@ -217,56 +229,6 @@ mod tests {
         assert_eq!(shared.tx_bytes(), 0);
         assert_eq!(shared.tx_ring.pop(), Some(vec![0x11]));
         assert_eq!(shared.tx_ring.pop(), None);
-    }
-
-    #[test]
-    fn read_frame_throttles_via_pending_slot_and_preserves_order() {
-        use microsandbox_types::{RateLimiterConfig, TokenBucketConfig};
-
-        use crate::rate_limit::RateLimiter;
-
-        let shared = Arc::new(SharedState::new(4));
-        // One op per 100ms: the second frame must throttle.
-        let limiter = RateLimiter::new(
-            &RateLimiterConfig {
-                bandwidth: None,
-                ops: Some(TokenBucketConfig {
-                    size: 1,
-                    refill_time_ms: 100,
-                    one_time_burst: 0,
-                }),
-            },
-            Instant::now(),
-        )
-        .unwrap();
-        let mut backend = SmoltcpBackend::new(shared.clone(), Some(limiter));
-        let mut buf = [0u8; 64];
-
-        assert!(shared.push_rx_frame_and_wake(vec![0xaa]));
-        assert!(shared.push_rx_frame_and_wake(vec![0xbb]));
-
-        // First frame passes; the second lands in the pending slot with a
-        // published resume deadline that nudged the poll loop.
-        let n = backend.read_frame(&mut buf).expect("first frame");
-        assert_eq!(&buf[VIRTIO_NET_HDR_LEN..n], &[0xaa]);
-        assert!(matches!(
-            backend.read_frame(&mut buf),
-            Err(ReadError::NothingRead)
-        ));
-        let resume_at = shared
-            .ingress_resume_at()
-            .expect("resume deadline published");
-        assert!(fd_is_readable(shared.tx_wake.as_raw_fd()));
-
-        // The throttled frame stays first in line: nothing is lost or
-        // reordered while blocked, and it delivers once the deadline passes.
-        assert!(matches!(
-            backend.read_frame(&mut buf),
-            Err(ReadError::NothingRead)
-        ));
-        std::thread::sleep(resume_at.saturating_duration_since(Instant::now()));
-        let n = backend.read_frame(&mut buf).expect("throttled frame");
-        assert_eq!(&buf[VIRTIO_NET_HDR_LEN..n], &[0xbb]);
     }
 
     fn fd_is_readable(fd: RawFd) -> bool {
