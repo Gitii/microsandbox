@@ -1281,7 +1281,7 @@ fn parse_rate_limiter(net: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<Rat
     if obj.is_none() {
         return Ok(None);
     }
-    let limiter = as_dict(&obj)?;
+    let limiter: Bound<'_, PyDict> = obj.downcast::<PyDict>()?.clone();
     Ok(Some(RateLimiterOpts {
         bandwidth: parse_token_bucket(&limiter, "bandwidth")?,
         ops: parse_token_bucket(&limiter, "ops")?,
@@ -1295,7 +1295,7 @@ fn parse_token_bucket(limiter: &Bound<'_, PyDict>, key: &str) -> PyResult<Option
     if obj.is_none() {
         return Ok(None);
     }
-    let bucket = as_dict(&obj)?;
+    let bucket: Bound<'_, PyDict> = obj.downcast::<PyDict>()?.clone();
     Ok(Some(TokenBucketOpts {
         size: extract_required(&bucket, "size")?,
         refill_time_ms: extract_required(&bucket, "refill_time_ms")?,
