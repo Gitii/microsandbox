@@ -5,6 +5,8 @@
 //! sandbox process PID. The sandbox process runs the VMM and agent relay
 //! internally.
 
+#[cfg(windows)]
+use std::fmt::Write as _;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]

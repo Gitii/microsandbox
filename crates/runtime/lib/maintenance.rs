@@ -777,6 +777,9 @@ fn remove_runtime_socket_artifacts(
     sandboxes_dir: &Path,
     name: &str,
 ) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = sandboxes_dir;
+
     let canonical_result = crate::ipc::remove_sandbox_socket_artifacts(run_dir, name);
 
     #[cfg(unix)]
