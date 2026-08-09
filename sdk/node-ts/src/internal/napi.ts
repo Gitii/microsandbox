@@ -39,6 +39,7 @@ export interface NativeBindings {
   ) => number;
   readonly popDefaultBackend?: (token: number) => void;
   readonly defaultBackendKind?: () => "local" | "cloud";
+  readonly defaultBackendInfo?: () => NapiBackendInfo;
   readonly Sandbox: NapiSandboxStatic;
   readonly SandboxBuilder: NapiSandboxBuilderCtor;
   readonly Volume: NapiVolumeStatic;
@@ -84,6 +85,20 @@ export interface NativeBindings {
   readonly isInstalled: () => boolean;
   readonly allSandboxMetrics: () => Promise<Record<string, NapiSandboxMetrics>>;
   readonly AgentClient: NapiAgentClientStatic;
+}
+
+export interface NapiBackendInfo {
+  kind: "local" | "cloud";
+  apiUrl?: string;
+  source:
+    | "programmatic"
+    | "MSB_BACKEND"
+    | "MSB_API_KEY"
+    | "MSB_PROFILE"
+    | "profile"
+    | "active_profile"
+    | "default";
+  profile?: string;
 }
 
 export interface NapiAgentClientStatic {
@@ -222,6 +237,7 @@ export interface NapiSandboxBuilder extends NapiSandboxBuilderSetters {
 }
 
 export interface NapiSandbox {
+  readonly backendKind: "local" | "cloud";
   configJson(): Promise<string>;
   exec(cmd: string, args?: string[]): Promise<NapiExecOutput>;
   execWithBuilder(cmd: string, builder: NapiExecOptionsBuilder): Promise<NapiExecOutput>;
@@ -256,6 +272,7 @@ export interface NapiSandbox {
 export interface NapiSandboxHandle {
   readonly name: string;
   readonly status: string;
+  readonly backendKind: "local" | "cloud";
   readonly configJson: string;
   readonly createdAt: number | null;
   readonly updatedAt: number | null;
@@ -307,6 +324,7 @@ export interface NapiSandboxModifyOptions {
   maxCpus?: number;
   memoryMib?: number;
   maxMemoryMib?: number;
+  rootDiskSizeMib?: number;
   env?: Record<string, string>;
   envRemove?: string[];
   labels?: Record<string, string>;
@@ -413,6 +431,7 @@ export interface NapiSshServer {
 
 export interface NapiVolumeStatic {
   get(name: string): Promise<NapiVolumeHandle>;
+  getDefault(): Promise<NapiVolumeHandle>;
   list(): Promise<NapiVolumeInfo[]>;
   remove(name: string): Promise<void>;
 }
@@ -450,6 +469,7 @@ export interface NapiVolumeConfig {
 
 export interface NapiVolumeHandle {
   readonly name: string;
+  readonly isDefault: boolean;
   readonly kind: string;
   readonly quotaMib: number | null | undefined;
   readonly usedBytes: number;
@@ -489,6 +509,7 @@ export interface NapiVolumeFsWriteSink {
 
 export interface NapiVolumeInfo {
   readonly name: string;
+  readonly isDefault: boolean;
   readonly kind: string;
   readonly quotaMib: number | null | undefined;
   readonly usedBytes: number;
@@ -1149,14 +1170,18 @@ export interface NapiImageBuilder {
 }
 
 export interface NapiRootDiskBuilder {
-  /** Size in MiB (managed and tmpfs kinds only). */
+  /** Size in MiB (managed, tmpfs and flat kinds only). */
   size(mib: number): this;
   /** RAM-backed tmpfs upper: ephemeral, counts against guest memory. */
   tmpfs(): this;
+  /** Complete flat OCI rootfs mounted directly without guest OverlayFS. */
+  flat(): this;
   /** User-supplied disk image attached writable as the upper. */
   disk(path: string): this;
   /** Disk image format (`"raw" | "qcow2"`); only valid after `.disk()`. */
   format(format: "raw" | "qcow2"): this;
-  /** Inner filesystem type (e.g. `"ext4"`); only valid after `.disk()`. */
+  /** Inner filesystem type (e.g. `"ext4"`); valid after `.disk()` or `.flat()`. */
   fstype(fstype: string): this;
+  /** Private flat-root clone strategy. */
+  cloneStrategy(strategy: "auto" | "copy" | "reflink"): this;
 }
