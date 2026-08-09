@@ -88,11 +88,59 @@ impl LocalBackend {
             )));
         }
 
+        let lifecycle_guard = crate::runtime::acquire_sandbox_lifecycle_guard(
+            &self.config().run_dir(),
+            name,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        // Removal or another start may have won while the initial reconciled
+        // snapshot was being loaded. Re-read under ownership and require the
+        // same persisted identity before changing state or touching sockets.
+        let current = load_sandbox_record(pools.read(), name).await?;
+        if current.id != model.id {
+            return Err(crate::MicrosandboxError::Runtime(format!(
+                "sandbox {name:?} identity changed from database id {} to {}; refusing stale start",
+                model.id, current.id
+            )));
+        }
+        if !matches!(
+            current.status,
+            SandboxStatus::Stopped | SandboxStatus::Crashed
+        ) {
+            return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+                "cannot start sandbox {name:?}: status changed to {:?}",
+                current.status
+            )));
+        }
+        let model = current;
+
+        // Older runtimes did not hold the lifecycle lock and published their
+        // terminal DB state just before process exit. Preserve upgrade safety
+        // by waiting for that recorded owner before the new runtime acquires
+        // and cleans the deterministic socket namespace.
+        if let Some(pid) = Self::load_latest_run(pools.read(), model.id)
+            .await?
+            .and_then(|run| run.pid)
+            .filter(|pid| Self::pid_is_alive(*pid))
+        {
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(5) && !Self::pid_is_dead_or_reaped(pid) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !Self::pid_is_dead_or_reaped(pid) {
+                return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+                    "cannot start sandbox {name:?}: previous runtime pid {pid} is still alive"
+                )));
+            }
+        }
+
         let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
         self.apply_deployment_profile(&mut config);
         config.apply_runtime_defaults();
-        self.validate_sandbox_name_for_runtime(&config.spec.name)?;
         validate_hostname(config.spec.runtime.hostname.as_deref())?;
+        self.validate_sandbox_name_for_runtime(&config.spec.name)?;
         Self::validate_rootfs_source(&config.spec.image)?;
         validate_env(&config.spec.env)?;
         validate_labels(&config.spec.labels)?;
@@ -100,7 +148,10 @@ impl LocalBackend {
         self.validate_start_state(&config, &self.sandboxes_dir().join(name))?;
         Self::update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
 
-        match self.create_sandbox_inner(config, model.id, mode).await {
+        match self
+            .create_sandbox_inner(config, model.id, mode, Some(lifecycle_guard))
+            .await
+        {
             Ok((local_state, returned_config)) => {
                 let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
                 if let Err(err) = Self::update_sandbox_active_config(
@@ -429,6 +480,40 @@ impl LocalBackend {
         }
 
         let run = Self::load_active_run(pools.read(), sandbox.id).await?;
+        if run
+            .as_ref()
+            .and_then(|run| run.pid)
+            .is_some_and(Self::pid_is_alive)
+        {
+            return Ok(sandbox);
+        }
+
+        // A dead-PID snapshot is not sufficient: another process may already
+        // have reconciled and restarted this name. Serialize on the runtime
+        // ownership lock, then re-read the exact row/run before unlinking.
+        let _guard = if let Some((run_dir, _)) = socket_roots {
+            let Some(guard) =
+                microsandbox_runtime::ipc::try_acquire_lifecycle_guard(run_dir, &sandbox.name)?
+            else {
+                return Ok(sandbox);
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox.id)
+            .one(pools.read())
+            .await?
+        else {
+            return Err(crate::MicrosandboxError::SandboxNotFound(sandbox.name));
+        };
+        if !matches!(
+            sandbox.status,
+            SandboxStatus::Running | SandboxStatus::Draining
+        ) {
+            return Ok(sandbox);
+        }
+        let run = Self::load_active_run(pools.read(), sandbox.id).await?;
 
         // No run record yet while Running means the sandbox is still starting up
         // (the child process has not inserted its PID). A Draining row with no
@@ -498,6 +583,19 @@ impl LocalBackend {
             .filter(run_entity::Column::SandboxId.eq(sandbox_id))
             .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
             .order_by_desc(run_entity::Column::StartedAt)
+            .one(db)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Load the most recent run record regardless of lifecycle status.
+    pub(crate) async fn load_latest_run(
+        db: &DbReadConnection,
+        sandbox_id: i32,
+    ) -> MicrosandboxResult<Option<run_entity::Model>> {
+        run_entity::Entity::find()
+            .filter(run_entity::Column::SandboxId.eq(sandbox_id))
+            .order_by_desc(run_entity::Column::Id)
             .one(db)
             .await
             .map_err(Into::into)

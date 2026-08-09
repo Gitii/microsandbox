@@ -325,6 +325,27 @@ pub async fn cleanup_terminal_ephemeral_sandbox(
     run_dir: &Path,
     sandbox_id: i32,
 ) -> RuntimeResult<CleanupOutcome> {
+    cleanup_terminal_ephemeral_sandbox_inner(db, sandboxes_dir, run_dir, sandbox_id, false).await
+}
+
+/// Remove a terminal ephemeral sandbox while its runtime still owns the
+/// lifecycle guard during the synchronous exit observer.
+pub(crate) async fn cleanup_terminal_ephemeral_sandbox_owned(
+    db: &DbWriteConnection,
+    sandboxes_dir: &Path,
+    run_dir: &Path,
+    sandbox_id: i32,
+) -> RuntimeResult<CleanupOutcome> {
+    cleanup_terminal_ephemeral_sandbox_inner(db, sandboxes_dir, run_dir, sandbox_id, true).await
+}
+
+async fn cleanup_terminal_ephemeral_sandbox_inner(
+    db: &DbWriteConnection,
+    sandboxes_dir: &Path,
+    run_dir: &Path,
+    sandbox_id: i32,
+    owner_holds_guard: bool,
+) -> RuntimeResult<CleanupOutcome> {
     let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox_id)
         .one(db)
         .await?
@@ -336,6 +357,30 @@ pub async fn cleanup_terminal_ephemeral_sandbox(
         return Ok(CleanupOutcome::SkippedPersistent);
     }
 
+    if !is_terminal(sandbox.status) {
+        return Ok(CleanupOutcome::SkippedActive);
+    }
+
+    let _guard = if owner_holds_guard {
+        None
+    } else {
+        let Some(guard) = crate::ipc::try_acquire_lifecycle_guard(run_dir, &sandbox.name)? else {
+            return Ok(CleanupOutcome::SkippedLivePid);
+        };
+        Some(guard)
+    };
+
+    // Status can change while waiting for another lifecycle operation. Re-read
+    // under ownership before removing any name-derived filesystem state.
+    let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(CleanupOutcome::AlreadyGone);
+    };
+    if !sandbox.ephemeral {
+        return Ok(CleanupOutcome::SkippedPersistent);
+    }
     if !is_terminal(sandbox.status) {
         return Ok(CleanupOutcome::SkippedActive);
     }
@@ -670,6 +715,22 @@ async fn reconcile_stale_active(
     run_dir: &Path,
     sandbox: &sandbox_entity::Model,
 ) -> RuntimeResult<bool> {
+    let Some(_guard) = crate::ipc::try_acquire_lifecycle_guard(run_dir, &sandbox.name)? else {
+        return Ok(false);
+    };
+    let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox.id)
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if !matches!(
+        sandbox.status,
+        sandbox_entity::SandboxStatus::Running | sandbox_entity::SandboxStatus::Draining
+    ) {
+        return Ok(false);
+    }
+
     let run = run_entity::Entity::find()
         .filter(run_entity::Column::SandboxId.eq(sandbox.id))
         .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
@@ -980,6 +1041,33 @@ mod tests {
         assert!(!sandbox_dir.exists(), "directory should be removed");
         #[cfg(unix)]
         assert_socket_artifacts_absent(dir.path(), &socket_paths, "eph");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cleanup_does_not_cross_a_live_lifecycle_owner() {
+        let (dir, db) = test_db().await;
+        let id = insert_sandbox(
+            &db,
+            "successor",
+            sandbox_entity::SandboxStatus::Stopped,
+            true,
+        )
+        .await;
+        let run_dir = dir.path().join("run");
+        let paths = seed_socket_artifacts(dir.path(), &run_dir, "successor");
+        let _owner = crate::ipc::acquire_lifecycle_guard(&run_dir, "successor").unwrap();
+
+        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &run_dir, id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CleanupOutcome::SkippedLivePid);
+        assert!(status_of(&db, id).await.is_some());
+        assert!(paths.agent.exists());
+        assert!(paths.control.exists());
+        assert!(std::fs::symlink_metadata(paths.legacy_agent).is_ok());
+        assert!(std::fs::symlink_metadata(paths.legacy_control).is_ok());
     }
 
     #[tokio::test]

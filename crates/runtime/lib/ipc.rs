@@ -1,6 +1,16 @@
 //! Host-side per-sandbox IPC endpoint paths and lifecycle cleanup.
 
-use std::fmt::Write as _;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
+use std::fmt::{self, Write as _};
+#[cfg(unix)]
+use std::fs::{DirBuilder, File, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -35,6 +45,23 @@ pub struct SandboxSocketPaths {
     pub legacy_control: PathBuf,
 }
 
+/// Cross-process ownership guard for one sandbox's runtime lifecycle.
+///
+/// On Unix the guard is an advisory `flock` held by the underlying open file
+/// description. Launchers may duplicate the descriptor into the sandbox
+/// process; closing the launcher's copy then preserves ownership in the child
+/// until it exits, including after `SIGKILL`.
+pub struct SandboxLifecycleGuard {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl fmt::Debug for SandboxLifecycleGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SandboxLifecycleGuard")
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -53,6 +80,67 @@ pub fn canonical_agent_endpoint(run_dir: &Path, name: &str) -> PathBuf {
             r"\\.\pipe\msb-agent-{}",
             socket_hash(name, LEGACY_SOCKET_HASH_BYTES)
         ))
+    }
+}
+
+/// Derive the stable lifecycle-lock path for one sandbox name.
+pub fn lifecycle_lock_path(run_dir: &Path, name: &str) -> PathBuf {
+    let digest = Sha256::digest(name.as_bytes());
+    let id = encode_hash(&digest, LEGACY_SOCKET_HASH_BYTES);
+    run_dir.join("locks").join(format!("{id}.lock"))
+}
+
+/// Acquire exclusive lifecycle ownership, waiting for a current owner to exit.
+pub fn acquire_lifecycle_guard(
+    run_dir: &Path,
+    name: &str,
+) -> std::io::Result<SandboxLifecycleGuard> {
+    #[cfg(unix)]
+    {
+        acquire_lifecycle_guard_unix(run_dir, name, false)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("sandbox {name:?} lifecycle is currently owned"),
+            )
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (run_dir, name);
+        Ok(SandboxLifecycleGuard {})
+    }
+}
+
+/// Try to acquire exclusive lifecycle ownership without blocking.
+pub fn try_acquire_lifecycle_guard(
+    run_dir: &Path,
+    name: &str,
+) -> std::io::Result<Option<SandboxLifecycleGuard>> {
+    #[cfg(unix)]
+    {
+        acquire_lifecycle_guard_unix(run_dir, name, true)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (run_dir, name);
+        Ok(Some(SandboxLifecycleGuard {}))
+    }
+}
+
+#[cfg(unix)]
+impl SandboxLifecycleGuard {
+    /// Adopt a descriptor that already owns the sandbox lifecycle lock.
+    ///
+    /// This is used only for the descriptor inherited from the SDK launcher.
+    pub fn from_inherited_file(file: File) -> Self {
+        Self { file }
+    }
+
+    /// Return the descriptor to duplicate into a sandbox child process.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 
@@ -137,7 +225,9 @@ pub fn prepare_canonical_socket_dir(
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    match std::fs::create_dir(&paths.canonical_dir) {
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&paths.canonical_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::symlink_metadata(&paths.canonical_dir)?;
@@ -192,6 +282,13 @@ pub fn publish_legacy_control_link(
 pub fn remove_socket_pair(agent_sock: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        if is_canonical_agent_socket(agent_sock) {
+            return remove_canonical_socket_pair(agent_sock);
+        }
+        if is_legacy_agent_socket(agent_sock) {
+            return remove_legacy_socket_pair(agent_sock);
+        }
+
         let control_sock = control_socket_path_for(agent_sock);
         let control_result = remove_file_if_exists(&control_sock);
         let agent_result = remove_file_if_exists(agent_sock);
@@ -209,7 +306,7 @@ pub fn remove_socket_pair(agent_sock: &Path) -> std::io::Result<()> {
 pub fn remove_canonical_socket_artifacts(run_dir: &Path, name: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        remove_canonical_socket_dir(&sandbox_socket_paths(run_dir, name))
+        remove_canonical_socket_dir(run_dir, &sandbox_socket_paths(run_dir, name))
     }
 
     #[cfg(windows)]
@@ -226,12 +323,8 @@ pub fn remove_sandbox_socket_artifacts(run_dir: &Path, name: &str) -> std::io::R
         let paths = sandbox_socket_paths(run_dir, name);
         let mut first_error = None;
 
-        for path in [&paths.legacy_control, &paths.legacy_agent] {
-            if let Err(error) = remove_file_if_exists(path)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+        if let Err(error) = remove_legacy_socket_artifacts(run_dir, &paths) {
+            first_error = Some(error);
         }
 
         if let Err(error) = remove_canonical_socket_artifacts(run_dir, name)
@@ -297,6 +390,38 @@ fn publish_compatibility_link(run_dir: &Path, link: &Path, target: &Path) -> std
 }
 
 #[cfg(unix)]
+fn acquire_lifecycle_guard_unix(
+    run_dir: &Path,
+    name: &str,
+    nonblocking: bool,
+) -> std::io::Result<Option<SandboxLifecycleGuard>> {
+    let path = lifecycle_lock_path(run_dir, name);
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("lifecycle lock has no parent: {}", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        return Ok(Some(SandboxLifecycleGuard { file }));
+    }
+
+    let error = std::io::Error::last_os_error();
+    if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
 fn validate_compatibility_path(path: &Path) -> std::io::Result<()> {
     if socket_path_fits(path) {
         Ok(())
@@ -349,6 +474,24 @@ fn is_canonical_agent_socket(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
+fn is_legacy_agent_socket(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "agent")
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "sock")
+        && stem.len() == LEGACY_SOCKET_HASH_BYTES * 2
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(unix)]
 fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -358,32 +501,217 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn remove_canonical_socket_dir(paths: &SandboxSocketPaths) -> std::io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(&paths.canonical_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+fn remove_canonical_socket_pair(agent_sock: &Path) -> std::io::Result<()> {
+    let canonical_path = agent_sock.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "canonical socket has no directory: {}",
+                agent_sock.display()
+            ),
+        )
+    })?;
+    let run_dir = canonical_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "canonical socket has no run directory: {}",
+                    agent_sock.display()
+                ),
+            )
+        })?;
+    let Some(run) = open_directory(run_dir)? else {
+        return Ok(());
+    };
+    let Some(sandboxes) = open_owned_child_directory(&run, c"sandboxes", run_dir)? else {
+        return Ok(());
+    };
+    let hash = c_path_name(canonical_path)?;
+    let Some(canonical) =
+        open_owned_child_directory(&sandboxes, &hash, &run_dir.join("sandboxes"))?
+    else {
+        return Ok(());
+    };
+
+    let control_result = unlinkat_if_exists(&canonical, c"control.sock", 0);
+    let agent_result = unlinkat_if_exists(&canonical, c"agent.sock", 0);
+    control_result.and(agent_result)
+}
+
+#[cfg(unix)]
+fn remove_legacy_socket_pair(agent_sock: &Path) -> std::io::Result<()> {
+    let agent_path = agent_sock.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("legacy socket has no directory: {}", agent_sock.display()),
+        )
+    })?;
+    let run_dir = agent_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "legacy socket has no run directory: {}",
+                agent_sock.display()
+            ),
+        )
+    })?;
+    let Some(run) = open_directory(run_dir)? else {
+        return Ok(());
+    };
+    let Some(agent) = open_owned_child_directory(&run, c"agent", run_dir)? else {
+        return Ok(());
+    };
+
+    let control = c_path_name(&control_socket_path_for(agent_sock))?;
+    let relay = c_path_name(agent_sock)?;
+    let control_result = unlinkat_if_exists(&agent, &control, 0);
+    let relay_result = unlinkat_if_exists(&agent, &relay, 0);
+    control_result.and(relay_result)
+}
+
+#[cfg(unix)]
+fn remove_legacy_socket_artifacts(
+    run_dir: &Path,
+    paths: &SandboxSocketPaths,
+) -> std::io::Result<()> {
+    let Some(run) = open_directory(run_dir)? else {
+        return Ok(());
+    };
+    let Some(agent) = open_owned_child_directory(&run, c"agent", run_dir)? else {
+        return Ok(());
+    };
+
+    let control = c_path_name(&paths.legacy_control)?;
+    let relay = c_path_name(&paths.legacy_agent)?;
+    let control_result = unlinkat_if_exists(&agent, &control, 0);
+    let relay_result = unlinkat_if_exists(&agent, &relay, 0);
+    control_result.and(relay_result)
+}
+
+#[cfg(unix)]
+fn remove_canonical_socket_dir(run_dir: &Path, paths: &SandboxSocketPaths) -> std::io::Result<()> {
+    let Some(run) = open_directory(run_dir)? else {
+        return Ok(());
+    };
+    let Some(sandboxes) = open_owned_child_directory(&run, c"sandboxes", run_dir)? else {
+        return Ok(());
+    };
+    let hash = c_path_name(&paths.canonical_dir)?;
+    let canonical = match open_child_directory(&sandboxes, &hash) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ) =>
+        {
+            // The hash entry is not a directory. Remove that exact entry via
+            // the already-open parent without following a possible symlink.
+            return unlinkat_if_exists(&sandboxes, &hash, 0);
+        }
         Err(error) => return Err(error),
     };
 
-    if metadata.file_type().is_symlink() {
-        // Remove the unexpected namespace entry itself without following it
-        // to attacker-controlled socket names elsewhere on the host.
-        return std::fs::remove_file(&paths.canonical_dir);
+    let control_result = unlinkat_if_exists(&canonical, c"control.sock", 0);
+    let agent_result = unlinkat_if_exists(&canonical, c"agent.sock", 0);
+    control_result.and(agent_result)?;
+    unlinkat_if_exists(&sandboxes, &hash, libc::AT_REMOVEDIR)
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> std::io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+    match options.open(path) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    if !metadata.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "canonical socket path is not a directory: {}",
-                paths.canonical_dir.display()
-            ),
-        ));
+}
+
+#[cfg(unix)]
+fn open_owned_child_directory(
+    parent: &File,
+    name: &CStr,
+    run_dir: &Path,
+) -> std::io::Result<Option<File>> {
+    match open_child_directory(parent, name) {
+        Ok(directory) => Ok(directory),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ) =>
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "runtime IPC directory is not an owned directory: {}",
+                    run_dir
+                        .join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+                        .display()
+                ),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn open_child_directory(parent: &File, name: &CStr) -> std::io::Result<Option<File>> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        return Ok(Some(unsafe { File::from_raw_fd(fd) }));
     }
 
-    let control_result = remove_file_if_exists(&paths.control);
-    let agent_result = remove_file_if_exists(&paths.agent);
-    control_result.and(agent_result)?;
-    std::fs::remove_dir(&paths.canonical_dir)
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unlinkat_if_exists(parent: &File, name: &CStr, flags: i32) -> std::io::Result<()> {
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn c_path_name(path: &Path) -> std::io::Result<CString> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("runtime IPC path has no file name: {}", path.display()),
+        )
+    })?;
+    CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("runtime IPC file name contains NUL: {}", path.display()),
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -447,6 +775,42 @@ mod tests {
         assert_eq!(
             paths.legacy_agent,
             Path::new("/tmp/msb/run/agent/bc62d1b6b936c78dbbd0bbe5572e32d0.sock")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lifecycle_guard_remains_owned_by_an_inherited_descriptor() {
+        use std::os::fd::FromRawFd;
+
+        let temp = tempfile::Builder::new()
+            .prefix("msb-lifecycle")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = temp.path().join("run");
+        let launcher = acquire_lifecycle_guard(&run_dir, "worker").unwrap();
+        let inherited_fd = unsafe { libc::dup(launcher.as_raw_fd()) };
+        assert!(inherited_fd >= 0);
+        let inherited =
+            SandboxLifecycleGuard::from_inherited_file(unsafe { File::from_raw_fd(inherited_fd) });
+
+        assert!(
+            try_acquire_lifecycle_guard(&run_dir, "worker")
+                .unwrap()
+                .is_none()
+        );
+        drop(launcher);
+        assert!(
+            try_acquire_lifecycle_guard(&run_dir, "worker")
+                .unwrap()
+                .is_none(),
+            "closing the launcher copy must not unlock the child copy"
+        );
+        drop(inherited);
+        assert!(
+            try_acquire_lifecycle_guard(&run_dir, "worker")
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -616,5 +980,61 @@ mod tests {
 
         assert!(external.join("agent.sock").exists());
         assert!(std::fs::symlink_metadata(&paths.canonical_dir).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sandbox_cleanup_does_not_follow_owned_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::Builder::new()
+            .prefix("msb-ipc")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = temp.path().join("run");
+        let paths = sandbox_socket_paths(&run_dir, "parent-symlinks");
+        let external_agent = temp.path().join("external-agent");
+        let external_sandboxes = temp.path().join("external-sandboxes");
+        let external_canonical = external_sandboxes.join(
+            paths
+                .canonical_dir
+                .file_name()
+                .expect("canonical directory has a hash name"),
+        );
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&external_agent).unwrap();
+        std::fs::create_dir_all(&external_canonical).unwrap();
+        let legacy_agent = external_agent.join(paths.legacy_agent.file_name().unwrap());
+        let legacy_control = external_agent.join(paths.legacy_control.file_name().unwrap());
+        let canonical_agent = external_canonical.join("agent.sock");
+        let canonical_control = external_canonical.join("control.sock");
+        let _listeners = [
+            std::os::unix::net::UnixListener::bind(&legacy_agent).unwrap(),
+            std::os::unix::net::UnixListener::bind(&legacy_control).unwrap(),
+            std::os::unix::net::UnixListener::bind(&canonical_agent).unwrap(),
+            std::os::unix::net::UnixListener::bind(&canonical_control).unwrap(),
+        ];
+        symlink(&external_agent, run_dir.join("agent")).unwrap();
+        symlink(&external_sandboxes, run_dir.join("sandboxes")).unwrap();
+
+        assert_eq!(
+            remove_socket_pair(&paths.agent).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            remove_socket_pair(&paths.legacy_agent).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let error = remove_sandbox_socket_artifacts(&run_dir, "parent-symlinks").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        for endpoint in [
+            legacy_agent,
+            legacy_control,
+            canonical_agent,
+            canonical_control,
+        ] {
+            assert!(endpoint.exists(), "cleanup followed parent to {endpoint:?}");
+        }
     }
 }

@@ -18,10 +18,10 @@ pub(crate) mod spawn;
 pub use handle::ProcessHandle;
 pub use spawn::{SpawnMode, spawn_sandbox};
 pub(crate) use spawn::{
-    ensure_named_volumes, remove_sandbox_socket_artifacts_at, remove_sandbox_socket_artifacts_for,
-    resolve_sandbox_agent_socket_path, resolve_sandbox_agent_socket_path_for,
-    rollback_created_named_volumes, sandbox_agent_socket_path_candidates,
-    sandbox_agent_socket_path_candidates_for,
+    acquire_sandbox_lifecycle_guard, ensure_named_volumes, remove_sandbox_socket_artifacts_at,
+    remove_sandbox_socket_artifacts_for, resolve_sandbox_agent_socket_path,
+    resolve_sandbox_agent_socket_path_for, rollback_created_named_volumes,
+    sandbox_agent_socket_path_candidates, sandbox_agent_socket_path_candidates_for,
 };
 
 /// Resolve the host-side path of a sandbox's agentd relay socket by name.

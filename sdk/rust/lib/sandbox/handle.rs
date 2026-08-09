@@ -8,8 +8,6 @@
 
 use std::sync::Arc;
 
-use sea_orm::EntityTrait;
-
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     backend::{
@@ -647,15 +645,7 @@ impl SandboxHandle {
                 // it (identity-checked) or fail before touching any state.
                 #[cfg(windows)]
                 super::reap_leaked_runtime_process(local_backend, local.db_id, &self.name).await?;
-                let pools = local_backend.db().await?;
-
-                crate::runtime::remove_sandbox_socket_artifacts_for(local_backend, &self.name)?;
-                super::remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
-                sandbox_entity::Entity::delete_by_id(local.db_id)
-                    .exec(pools.write())
-                    .await?;
-
-                Ok(())
+                super::remove_local_persisted_sandbox(local_backend, &self.name, local.db_id).await
             }
             SandboxHandleInner::Cloud(_) => {
                 self.backend

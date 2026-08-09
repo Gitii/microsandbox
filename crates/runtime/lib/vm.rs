@@ -71,6 +71,10 @@ pub const PARENT_WATCH_FD: i32 = 97;
 /// Fixed fd used to pass startup JSON from `msb sandbox` to its launcher.
 pub const STARTUP_FD: i32 = 98;
 
+/// Fixed fd holding the inherited per-sandbox lifecycle ownership lock.
+#[cfg(unix)]
+pub const LIFECYCLE_LOCK_FD: i32 = 99;
+
 /// Control byte sent by the owner to stop parent-watch monitoring without stopping the sandbox.
 pub const PARENT_WATCH_DETACH: u8 = 1;
 
@@ -113,6 +117,9 @@ pub struct Config {
 
     /// Root directory holding ephemeral host-runtime artifacts.
     pub run_dir: PathBuf,
+
+    /// Process-lifetime ownership of this sandbox's runtime artifacts.
+    pub lifecycle_guard: crate::ipc::SandboxLifecycleGuard,
 
     /// Internal directory containing process-held CPU allocation leases.
     pub cpu_lease_dir: PathBuf,
@@ -599,7 +606,6 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             tracing::warn!(%release_error, "release CPU placement after legacy endpoint publication failure");
         }
         let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
-        let _ = crate::ipc::remove_socket_pair(&config.agent_sock_path);
         // Publication is no-replace. If it collided with another legacy
         // endpoint, clean only this runtime's canonical namespace.
         let _ =
@@ -706,6 +712,22 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     tracing::warn!(%error, "release CPU placement at VM exit");
                 }
 
+                // Runtime ownership remains live until this observer returns.
+                // Remove its deterministic endpoints before publishing a
+                // restartable terminal state; on failure, leave the active row
+                // for dead-PID maintenance to retry after the process exits.
+                let bound_result = crate::ipc::remove_socket_pair(&exit_sock_path);
+                let owned_result =
+                    crate::ipc::remove_sandbox_socket_artifacts(&exit_run_dir, &exit_sandbox_name);
+                if let Err(error) = bound_result.and(owned_result) {
+                    tracing::warn!(
+                        sandbox = %exit_sandbox_name,
+                        error = %error,
+                        "runtime exit socket cleanup failed; leaving lifecycle active for reaping"
+                    );
+                    return;
+                }
+
                 // Mark run as terminated with exit code and reason.
                 let _ = run_entity::Entity::update_many()
                     .col_expr(
@@ -740,7 +762,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 // discrete flags, not the full policy) and no-ops for
                 // persistent sandboxes. Best-effort; recovery sweeps from
                 // other runtimes cover any failure here.
-                match crate::maintenance::cleanup_terminal_ephemeral_sandbox(
+                match crate::maintenance::cleanup_terminal_ephemeral_sandbox_owned(
                     &exit_db,
                     &exit_sandboxes_dir,
                     &exit_run_dir,
@@ -775,12 +797,6 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             {
                 tracing::debug!(error = %err, slot = writer.slot(), "metrics slot release at exit");
             }
-
-            // The relay/control async cleanup cannot run because _exit() is
-            // called immediately after this observer returns. Remove the exact
-            // bound pair plus canonical and compatibility artifacts here.
-            let _ = crate::ipc::remove_socket_pair(&exit_sock_path);
-            let _ = crate::ipc::remove_sandbox_socket_artifacts(&exit_run_dir, &exit_sandbox_name);
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
@@ -851,15 +867,26 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             match crate::control::spawn_control_listener(control_sock_path.clone(), context) {
                 Ok(()) => {
                     #[cfg(unix)]
-                    if let Err(e) = crate::ipc::publish_legacy_control_link(
+                    if let Err(error) = crate::ipc::publish_legacy_control_link(
                         &config.run_dir,
                         &config.sandbox_name,
                         &control_sock_path,
                     ) {
-                        tracing::warn!(
-                            "failed to publish legacy runtime control endpoint for {}: {e}",
-                            config.sandbox_name
-                        );
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            tracing::warn!(
+                                "legacy runtime control endpoint is unavailable for {}: {error}",
+                                config.sandbox_name
+                            );
+                        } else {
+                            let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
+                            // Preserve the colliding compatibility entry. It
+                            // may belong to a still-live older runtime.
+                            let _ = crate::ipc::remove_canonical_socket_artifacts(
+                                &config.run_dir,
+                                &config.sandbox_name,
+                            );
+                            return Err(error.into());
+                        }
                     }
                 }
                 Err(e) => {

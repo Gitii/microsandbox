@@ -273,6 +273,7 @@ pub async fn spawn_sandbox(
     config: &SandboxConfig,
     sandbox_id: i32,
     mode: SpawnMode,
+    lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
     // Reference-model secrets store only a host-side source reference in the
     // durable config; resolve the actual values now so they travel to the
@@ -307,6 +308,34 @@ pub async fn spawn_sandbox(
     let scripts_dir = runtime_dir.join("scripts");
     let db_dir = global.home().join(DB_SUBDIR);
     let db_path = db_dir.join(DB_FILENAME);
+
+    // Own the sandbox's runtime namespace before touching any deterministic
+    // endpoint. The descriptor is duplicated into the child below and remains
+    // locked there for the runtime's entire lifetime.
+    #[cfg(unix)]
+    let lifecycle_guard = match lifecycle_guard {
+        Some(guard) => guard,
+        None => {
+            acquire_sandbox_lifecycle_guard(
+                &global.run_dir(),
+                &config.spec.name,
+                std::time::Duration::from_secs(5),
+            )
+            .await?
+        }
+    };
+
+    #[cfg(not(unix))]
+    let _ = lifecycle_guard;
+
+    // Lifecycle callers prove any previous owner dead before reaching spawn.
+    // With ownership now serialized, remove exact leftovers from that prior
+    // generation so compatibility-link publication cannot be masked by them.
+    remove_sandbox_socket_artifacts_at(
+        &global.run_dir(),
+        &global.sandboxes_dir(),
+        &config.spec.name,
+    )?;
 
     // Create directories concurrently.
     tokio::try_join!(
@@ -471,6 +500,10 @@ pub async fn spawn_sandbox(
         visible.push(OsString::from(
             microsandbox_runtime::vm::CONFIG_FD.to_string(),
         ));
+        visible.push(OsString::from("--lifecycle-lock-fd"));
+        visible.push(OsString::from(
+            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD.to_string(),
+        ));
     }
 
     #[cfg(windows)]
@@ -501,11 +534,12 @@ pub async fn spawn_sandbox(
     cmd.stdin(Stdio::null());
 
     #[cfg(unix)]
-    if parent_watchdog.is_some() || startup_pipe.is_some() {
+    {
         let parent_watch_fd = parent_watchdog
             .as_ref()
             .map(|pipe| pipe.read_fd.as_raw_fd());
         let startup_write_fd = startup_pipe.as_ref().map(|pipe| pipe.write_fd.as_raw_fd());
+        let lifecycle_lock_fd = lifecycle_guard.as_raw_fd();
         unsafe {
             cmd.pre_exec(move || {
                 if startup_write_fd.is_some() {
@@ -519,12 +553,16 @@ pub async fn spawn_sandbox(
                 });
                 let mut startup_mapping = startup_write_fd
                     .map(|fd| InheritedFdMapping::new(fd, microsandbox_runtime::vm::STARTUP_FD));
+                let mut lifecycle_mapping = InheritedFdMapping::new(
+                    lifecycle_lock_fd,
+                    microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+                );
 
                 // Parent runtimes such as Vitest or Go tests can have enough
                 // open files that pipe/tempfile allocation lands on one of the
                 // fixed inherited fd numbers. Move those sources away before
                 // any dup2 call can overwrite a later source fd.
-                let mut next_spare_fd = microsandbox_runtime::vm::STARTUP_FD + 1;
+                let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
                 move_reserved_source_fd(&mut config_mapping, &mut next_spare_fd)?;
                 if let Some(mapping) = parent_watch_mapping.as_mut() {
                     move_reserved_source_fd(mapping, &mut next_spare_fd)?;
@@ -532,6 +570,7 @@ pub async fn spawn_sandbox(
                 if let Some(mapping) = startup_mapping.as_mut() {
                     move_reserved_source_fd(mapping, &mut next_spare_fd)?;
                 }
+                move_reserved_source_fd(&mut lifecycle_mapping, &mut next_spare_fd)?;
 
                 dup_inherited_fd(config_mapping.src, config_mapping.dst)?;
                 if let Some(mapping) = parent_watch_mapping {
@@ -540,6 +579,7 @@ pub async fn spawn_sandbox(
                 if let Some(mapping) = startup_mapping {
                     dup_inherited_fd(mapping.src, mapping.dst)?;
                 }
+                dup_inherited_fd(lifecycle_mapping.src, lifecycle_mapping.dst)?;
 
                 Ok(())
             });
@@ -1175,6 +1215,7 @@ fn inherited_fd_source_needs_spare(src: i32, dst: i32) -> bool {
             microsandbox_runtime::vm::CONFIG_FD
                 | microsandbox_runtime::vm::PARENT_WATCH_FD
                 | microsandbox_runtime::vm::STARTUP_FD
+                | microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
         )
 }
 
@@ -1869,10 +1910,10 @@ pub(crate) fn resolve_sandbox_agent_socket_path_for(
     name: &str,
 ) -> MicrosandboxResult<PathBuf> {
     #[cfg(unix)]
-    let candidates = vec![
-        microsandbox_runtime::ipc::canonical_agent_endpoint(&local.config().run_dir(), name),
-        in_sandbox_agent_socket_path(&local.config().sandboxes_dir(), name),
-    ];
+    let candidates = vec![microsandbox_runtime::ipc::canonical_agent_endpoint(
+        &local.config().run_dir(),
+        name,
+    )];
     #[cfg(not(unix))]
     let candidates = sandbox_agent_socket_path_candidates_for(local, name);
     resolve_sandbox_agent_socket_path_from_candidates(candidates)
@@ -1921,7 +1962,7 @@ fn resolve_sandbox_agent_socket_path_from_candidates(
     Err(crate::MicrosandboxError::InvalidConfig(format!(
         "sandbox runtime socket path is too long: shortest derived path is {shortest} bytes, \
          but Unix socket paths on this platform must be shorter than {} bytes; set \
-         MSB_HOME or paths.sandboxes to a shorter directory",
+         MSB_HOME to a shorter directory",
         unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
             .sun_path
             .len()
@@ -2054,18 +2095,43 @@ pub(crate) fn remove_sandbox_socket_artifacts_at(
     sandboxes_dir: &Path,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, name)?;
+    let canonical_result =
+        microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, name);
 
     #[cfg(unix)]
-    microsandbox_runtime::ipc::remove_socket_pair(&in_sandbox_agent_socket_path(
-        sandboxes_dir,
-        name,
-    ))?;
+    let fallback_result = microsandbox_runtime::ipc::remove_socket_pair(
+        &in_sandbox_agent_socket_path(sandboxes_dir, name),
+    );
 
     #[cfg(not(unix))]
-    let _ = sandboxes_dir;
+    let fallback_result: std::io::Result<()> = {
+        let _ = sandboxes_dir;
+        Ok(())
+    };
 
+    canonical_result.and(fallback_result)?;
     Ok(())
+}
+
+/// Wait until no runtime generation owns a sandbox's deterministic namespace.
+pub(crate) async fn acquire_sandbox_lifecycle_guard(
+    run_dir: &Path,
+    name: &str,
+    timeout: std::time::Duration,
+) -> MicrosandboxResult<microsandbox_runtime::ipc::SandboxLifecycleGuard> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(guard) = microsandbox_runtime::ipc::try_acquire_lifecycle_guard(run_dir, name)?
+        {
+            return Ok(guard);
+        }
+        if started.elapsed() >= timeout {
+            return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+                "sandbox {name:?} runtime still owns its lifecycle lock"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn terminate_startup_process(
