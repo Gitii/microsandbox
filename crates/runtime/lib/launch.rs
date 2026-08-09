@@ -42,6 +42,10 @@ pub struct LaunchConfig {
     /// Root directory holding every sandbox's persisted state.
     pub sandboxes_dir: PathBuf,
 
+    /// Root directory holding ephemeral host-runtime artifacts.
+    #[serde(default)]
+    pub run_dir: PathBuf,
+
     /// Internal directory containing process-held CPU allocation leases.
     pub cpu_lease_dir: PathBuf,
 

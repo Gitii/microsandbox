@@ -72,7 +72,7 @@ impl LocalBackend {
         tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
         let pools = self.db().await?;
         let write_db = pools.write();
-        let model = Self::load_sandbox_record_reconciled(pools, name).await?;
+        let model = self.load_sandbox_record_reconciled(pools, name).await?;
         tracing::debug!(sandbox = name, status = ?model.status, "start_local: current status");
 
         if model.status == SandboxStatus::Running || model.status == SandboxStatus::Draining {
@@ -268,7 +268,7 @@ impl LocalBackend {
             .one(pools.read())
             .await?
             .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))?;
-        let model = Self::reconcile_sandbox_runtime_state(pools, model).await?;
+        let model = self.reconcile_sandbox_runtime_state(pools, model).await?;
         let run = Self::load_active_run(pools.read(), model.id).await?;
         let pid = Self::pid_from_run(run.as_ref());
         Ok((model, pid))
@@ -314,7 +314,7 @@ impl LocalBackend {
 
         let mut reconciled = Vec::with_capacity(sandboxes.len());
         for sandbox in sandboxes {
-            let model = Self::reconcile_sandbox_runtime_state(pools, sandbox).await?;
+            let model = self.reconcile_sandbox_runtime_state(pools, sandbox).await?;
             reconciled.push(model);
         }
 
@@ -390,18 +390,36 @@ impl LocalBackend {
 impl LocalBackend {
     /// Load a sandbox row by name and reconcile its runtime state.
     async fn load_sandbox_record_reconciled(
+        &self,
         pools: &DbPools,
         name: &str,
     ) -> MicrosandboxResult<sandbox_entity::Model> {
         let sandbox = load_sandbox_record(pools.read(), name).await?;
-        Self::reconcile_sandbox_runtime_state(pools, sandbox).await
+        self.reconcile_sandbox_runtime_state(pools, sandbox).await
     }
 
     /// Reconcile a Running/Draining row against the owning process's
     /// liveness, marking it terminal when the runtime is gone.
     async fn reconcile_sandbox_runtime_state(
+        &self,
         pools: &DbPools,
         sandbox: sandbox_entity::Model,
+    ) -> MicrosandboxResult<sandbox_entity::Model> {
+        let run_dir = self.config().run_dir();
+        let sandboxes_dir = self.config().sandboxes_dir();
+        Self::reconcile_sandbox_runtime_state_with_paths(
+            pools,
+            sandbox,
+            Some((&run_dir, &sandboxes_dir)),
+        )
+        .await
+    }
+
+    /// Reconcile runtime state with optional exact socket roots.
+    async fn reconcile_sandbox_runtime_state_with_paths(
+        pools: &DbPools,
+        sandbox: sandbox_entity::Model,
+        socket_roots: Option<(&Path, &Path)>,
     ) -> MicrosandboxResult<sandbox_entity::Model> {
         if !matches!(
             sandbox.status,
@@ -418,6 +436,13 @@ impl LocalBackend {
         // of view and should not keep stop callers polling forever.
         let Some(run) = run else {
             if sandbox.status == SandboxStatus::Draining {
+                if let Some((run_dir, sandboxes_dir)) = socket_roots {
+                    crate::runtime::remove_sandbox_socket_artifacts_at(
+                        run_dir,
+                        sandboxes_dir,
+                        &sandbox.name,
+                    )?;
+                }
                 let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
                 Self::mark_sandbox_runtime_stale(
                     pools.write(),
@@ -441,6 +466,13 @@ impl LocalBackend {
             return Ok(sandbox);
         }
 
+        if let Some((run_dir, sandboxes_dir)) = socket_roots {
+            crate::runtime::remove_sandbox_socket_artifacts_at(
+                run_dir,
+                sandboxes_dir,
+                &sandbox.name,
+            )?;
+        }
         let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
         Self::mark_sandbox_runtime_stale(
             pools.write(),
@@ -1063,6 +1095,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_sandbox_runtime_state_marks_dead_processes_crashed() {
+        #[cfg(unix)]
+        let temp = tempfile::Builder::new()
+            .prefix("msb-lazy-reap")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(not(unix))]
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("test.db");
         let pools = open_test_pools(&db_path).await;
@@ -1090,10 +1128,42 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let reconciled = LocalBackend::reconcile_sandbox_runtime_state(&pools, sandbox)
-            .await
+        let run_dir = temp.path().join("run");
+        let sandboxes_dir = temp.path().join("sandboxes");
+        #[cfg(unix)]
+        let socket_paths = {
+            let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "stale");
+            std::fs::create_dir_all(&paths.canonical_dir).unwrap();
+            std::fs::write(&paths.agent, b"stale").unwrap();
+            std::fs::write(&paths.control, b"stale").unwrap();
+            microsandbox_runtime::ipc::publish_legacy_agent_link(&run_dir, "stale", &paths.agent)
+                .unwrap();
+            microsandbox_runtime::ipc::publish_legacy_control_link(
+                &run_dir,
+                "stale",
+                &paths.control,
+            )
             .unwrap();
+            paths
+        };
+        let reconciled = LocalBackend::reconcile_sandbox_runtime_state_with_paths(
+            &pools,
+            sandbox,
+            Some((&run_dir, &sandboxes_dir)),
+        )
+        .await
+        .unwrap();
         assert_eq!(reconciled.status, SandboxStatus::Crashed);
+        #[cfg(unix)]
+        for path in [
+            &socket_paths.agent,
+            &socket_paths.control,
+            &socket_paths.legacy_agent,
+            &socket_paths.legacy_control,
+            &socket_paths.canonical_dir,
+        ] {
+            assert!(std::fs::symlink_metadata(path).is_err());
+        }
 
         let run = run_entity::Entity::find_by_id(run_id)
             .one(pools.write())
@@ -1139,9 +1209,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let reconciled = LocalBackend::reconcile_sandbox_runtime_state(&pools, sandbox)
-            .await
-            .unwrap();
+        let reconciled =
+            LocalBackend::reconcile_sandbox_runtime_state_with_paths(&pools, sandbox, None)
+                .await
+                .unwrap();
         assert_eq!(reconciled.status, SandboxStatus::Stopped);
 
         let run = run_entity::Entity::find_by_id(run_id)
@@ -1176,9 +1247,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let reconciled = LocalBackend::reconcile_sandbox_runtime_state(&pools, sandbox)
-            .await
-            .unwrap();
+        let reconciled =
+            LocalBackend::reconcile_sandbox_runtime_state_with_paths(&pools, sandbox, None)
+                .await
+                .unwrap();
 
         assert_eq!(reconciled.status, SandboxStatus::Stopped);
     }
@@ -1322,7 +1394,8 @@ mod tests {
             .unwrap();
 
         for sandbox in stale {
-            let _ = LocalBackend::reconcile_sandbox_runtime_state(&pools, sandbox).await;
+            let _ = LocalBackend::reconcile_sandbox_runtime_state_with_paths(&pools, sandbox, None)
+                .await;
         }
 
         // --- Assertions ---

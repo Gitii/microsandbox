@@ -592,9 +592,28 @@ async fn grow_root_disk_now(
 
 /// Path of the sandbox's host-side runtime control socket.
 fn control_socket_path(name: &str) -> MicrosandboxResult<std::path::PathBuf> {
+    #[cfg(unix)]
+    if let Some(path) =
+        first_existing_control_socket(crate::runtime::sandbox_agent_socket_path_candidates(name))
+    {
+        return Ok(path);
+    }
+
+    // With no live endpoint, retain the same forward-path behavior as the
+    // public agent resolver and return its corresponding control path.
     Ok(microsandbox_runtime::control::control_socket_path_for(
         &crate::runtime::agent_socket_path(name)?,
     ))
+}
+
+#[cfg(unix)]
+fn first_existing_control_socket(
+    agent_candidates: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    agent_candidates
+        .into_iter()
+        .map(|path| microsandbox_runtime::control::control_socket_path_for(&path))
+        .find(|path| path.exists())
 }
 
 /// Whether the running sandbox exposes the runtime control socket. Its absence
@@ -2245,6 +2264,26 @@ fn format_mib(mib: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn new_control_client_selects_old_runtime_socket() {
+        let temp = tempfile::Builder::new()
+            .prefix("msb-control")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = temp.path().join("run");
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "old-runtime");
+        std::fs::create_dir_all(paths.legacy_control.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&paths.legacy_control).unwrap();
+
+        let selected =
+            first_existing_control_socket(vec![paths.agent.clone(), paths.legacy_agent.clone()])
+                .unwrap();
+
+        assert_eq!(selected, paths.legacy_control);
+        std::os::unix::net::UnixStream::connect(selected).unwrap();
+    }
 
     fn config(cpus: u8, memory_mib: u32) -> SandboxConfig {
         let mut config = SandboxConfig::default();

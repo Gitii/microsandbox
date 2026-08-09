@@ -20,7 +20,6 @@ use std::os::windows::io::AsRawHandle;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
-    fmt::Write,
     fs::File,
     io::{Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
@@ -96,7 +95,6 @@ use crate::{
 #[cfg(target_os = "linux")]
 static SIGCHLD_ALT_STACK_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-const AGENT_SOCKET_HASH_HEX_LEN: usize = 32;
 #[cfg(windows)]
 const STARTUP_PIPE_HASH_HEX_LEN: usize = 32;
 #[cfg(target_os = "linux")]
@@ -1839,18 +1837,21 @@ fn sandbox_agent_socket_path_candidates_with_roots(
     sandboxes_dir: &Path,
     name: &str,
 ) -> Vec<PathBuf> {
-    let primary = sandbox_agent_socket_path(run_dir, name);
+    let primary = microsandbox_runtime::ipc::canonical_agent_endpoint(run_dir, name);
 
-    // On Unix a long sandbox name or a deep MSB_HOME can overflow the AF_UNIX
-    // `sun_path` limit, so keep the legacy
-    // `<sandboxes>/<name>/runtime/agent.sock` path as a fallback. Windows named
-    // pipes have no such length limit and never shipped a pre-hash naming
-    // scheme, so the primary pipe is the only candidate.
+    // New clients prefer the canonical per-sandbox endpoint, then the flat
+    // legacy path used by older runtimes, and finally the pre-hash in-sandbox
+    // fallback retained for unusually deep homes. Windows named pipes did not
+    // change layout, so the canonical endpoint is the only candidate there.
     #[cfg(unix)]
-    let candidates = vec![
-        primary,
-        legacy_sandbox_agent_socket_path(sandboxes_dir, name),
-    ];
+    let candidates = {
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, name);
+        vec![
+            primary,
+            paths.legacy_agent,
+            in_sandbox_agent_socket_path(sandboxes_dir, name),
+        ]
+    };
     #[cfg(not(unix))]
     let candidates = {
         let _ = sandboxes_dir;
@@ -1865,6 +1866,12 @@ pub(crate) fn resolve_sandbox_agent_socket_path_for(
     local: &LocalBackend,
     name: &str,
 ) -> MicrosandboxResult<PathBuf> {
+    #[cfg(unix)]
+    let candidates = vec![
+        microsandbox_runtime::ipc::canonical_agent_endpoint(&local.config().run_dir(), name),
+        in_sandbox_agent_socket_path(&local.config().sandboxes_dir(), name),
+    ];
+    #[cfg(not(unix))]
     let candidates = sandbox_agent_socket_path_candidates_for(local, name);
     resolve_sandbox_agent_socket_path_from_candidates(candidates)
 }
@@ -1872,7 +1879,18 @@ pub(crate) fn resolve_sandbox_agent_socket_path_for(
 /// Pick the first socket path usable on this platform.
 pub(crate) fn resolve_sandbox_agent_socket_path(name: &str) -> MicrosandboxResult<PathBuf> {
     let candidates = sandbox_agent_socket_path_candidates(name);
+
+    #[cfg(unix)]
+    if let Some(existing) = first_existing_socket_candidate(&candidates) {
+        return Ok(existing);
+    }
+
     resolve_sandbox_agent_socket_path_from_candidates(candidates)
+}
+
+#[cfg(unix)]
+fn first_existing_socket_candidate(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|path| path.exists()).cloned()
 }
 
 #[cfg(unix)]
@@ -1880,21 +1898,31 @@ fn resolve_sandbox_agent_socket_path_from_candidates(
     candidates: Vec<PathBuf>,
 ) -> MicrosandboxResult<PathBuf> {
     for path in &candidates {
-        if sandbox_agent_socket_path_fits(path) {
+        if microsandbox_runtime::ipc::validate_socket_pair(path).is_ok() {
             return Ok(path.clone());
         }
     }
 
     let shortest = candidates
         .iter()
-        .map(|path| sandbox_agent_socket_path_len(path))
+        .flat_map(|path| {
+            [
+                path.as_os_str().as_bytes().len(),
+                microsandbox_runtime::ipc::control_socket_path_for(path)
+                    .as_os_str()
+                    .as_bytes()
+                    .len(),
+            ]
+        })
         .min()
         .unwrap_or(0);
     Err(crate::MicrosandboxError::InvalidConfig(format!(
-        "agent relay socket path is too long: shortest derived path is {shortest} bytes, \
+        "sandbox runtime socket path is too long: shortest derived path is {shortest} bytes, \
          but Unix socket paths on this platform must be shorter than {} bytes; set \
          MSB_HOME or paths.sandboxes to a shorter directory",
-        unix_socket_path_capacity()
+        unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len()
     )))
 }
 
@@ -1909,30 +1937,6 @@ fn resolve_sandbox_agent_socket_path_from_candidates(
             "no agent relay socket candidates were derived".to_string(),
         )
     })
-}
-
-#[cfg(unix)]
-fn sandbox_agent_socket_path(run_dir: &Path, name: &str) -> PathBuf {
-    run_dir
-        .join("agent")
-        .join(format!("{}.sock", agent_socket_hash(name)))
-}
-
-#[cfg(windows)]
-fn sandbox_agent_socket_path(_run_dir: &Path, name: &str) -> PathBuf {
-    PathBuf::from(format!(r"\\.\pipe\msb-agent-{}", agent_socket_hash(name)))
-}
-
-fn agent_socket_hash(name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
-
-    let mut hash = String::with_capacity(AGENT_SOCKET_HASH_HEX_LEN);
-    for byte in digest.iter().take(AGENT_SOCKET_HASH_HEX_LEN / 2) {
-        let _ = Write::write_fmt(&mut hash, format_args!("{byte:02x}"));
-    }
-    hash
 }
 
 /// What a client-side open of the agent pipe name revealed.
@@ -2026,26 +2030,40 @@ fn probe_agent_pipe_server(pipe_path: &Path) -> std::io::Result<AgentPipeProbe> 
 // backward compatibility with the pre-hash Unix layout; Windows never shipped a
 // different agent-pipe scheme, so this is Unix-only.
 #[cfg(unix)]
-fn legacy_sandbox_agent_socket_path(sandboxes_dir: &Path, name: &str) -> PathBuf {
+fn in_sandbox_agent_socket_path(sandboxes_dir: &Path, name: &str) -> PathBuf {
     sandboxes_dir.join(name).join("runtime").join("agent.sock")
 }
 
-// Agent socket path length only constrains AF_UNIX `sun_path` on Unix; Windows
-// named pipes have no equivalent limit, so these helpers are Unix-only.
-#[cfg(unix)]
-fn sandbox_agent_socket_path_fits(path: &Path) -> bool {
-    sandbox_agent_socket_path_len(path) < unix_socket_path_capacity()
+/// Remove every Unix runtime socket artifact deterministically owned by a sandbox.
+pub(crate) fn remove_sandbox_socket_artifacts_for(
+    local: &LocalBackend,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    remove_sandbox_socket_artifacts_at(
+        &local.config().run_dir(),
+        &local.config().sandboxes_dir(),
+        name,
+    )
 }
 
-#[cfg(unix)]
-fn sandbox_agent_socket_path_len(path: &Path) -> usize {
-    path.as_os_str().as_bytes().len()
-}
+/// Remove runtime socket artifacts using explicit storage roots.
+pub(crate) fn remove_sandbox_socket_artifacts_at(
+    run_dir: &Path,
+    sandboxes_dir: &Path,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, name)?;
 
-#[cfg(unix)]
-fn unix_socket_path_capacity() -> usize {
-    let storage = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    storage.sun_path.len()
+    #[cfg(unix)]
+    microsandbox_runtime::ipc::remove_socket_pair(&in_sandbox_agent_socket_path(
+        sandboxes_dir,
+        name,
+    ))?;
+
+    #[cfg(not(unix))]
+    let _ = sandboxes_dir;
+
+    Ok(())
 }
 
 async fn terminate_startup_process(
@@ -2479,6 +2497,7 @@ fn sandbox_cli_args(
         log_dir: log_dir.to_path_buf(),
         runtime_dir: runtime_dir.to_path_buf(),
         sandboxes_dir: local.sandboxes_dir(),
+        run_dir: local.config().run_dir(),
         cpu_lease_dir: local.config().run_dir().join("cpu-leases"),
         writeback_lease_dir: local.config().run_dir().join("writeback-leases"),
         cpu_placement: config.spec.resources.cpu_placement,
@@ -3440,10 +3459,12 @@ mod tests {
 
         #[cfg(unix)]
         {
-            assert_eq!(candidates.len(), 2);
-            assert!(candidates[0].starts_with(backend.config().run_dir().join("agent")));
+            assert_eq!(candidates.len(), 3);
+            assert!(candidates[0].starts_with(backend.config().run_dir().join("sandboxes")));
+            assert_eq!(candidates[0].file_name().unwrap(), "agent.sock");
+            assert!(candidates[1].starts_with(backend.config().run_dir().join("agent")));
             assert_eq!(
-                candidates[1],
+                candidates[2],
                 backend
                     .config()
                     .sandboxes_dir()
@@ -3485,13 +3506,37 @@ mod tests {
             super::resolve_sandbox_agent_socket_path_for(&backend, "sdk-socket-test").unwrap();
 
         #[cfg(unix)]
-        assert!(resolved.starts_with(backend.config().run_dir().join("agent")));
+        assert!(resolved.starts_with(backend.config().run_dir().join("sandboxes")));
         #[cfg(windows)]
         assert!(
             resolved
                 .to_string_lossy()
                 .starts_with(r"\\.\pipe\msb-agent-")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_new_client_selects_old_runtime_socket_when_canonical_is_absent() {
+        let temp = tempfile::Builder::new()
+            .prefix("msb-compat")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = temp.path().join("run");
+        let sandboxes_dir = temp.path().join("sandboxes");
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "old-runtime");
+        std::fs::create_dir_all(paths.legacy_agent.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&paths.legacy_agent).unwrap();
+
+        let candidates = super::sandbox_agent_socket_path_candidates_with_roots(
+            &run_dir,
+            &sandboxes_dir,
+            "old-runtime",
+        );
+        let selected = super::first_existing_socket_candidate(&candidates).unwrap();
+
+        assert_eq!(selected, paths.legacy_agent);
+        std::os::unix::net::UnixStream::connect(selected).unwrap();
     }
 
     #[tokio::test]

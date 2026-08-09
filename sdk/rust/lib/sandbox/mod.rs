@@ -569,6 +569,7 @@ impl Sandbox {
         })?;
         let pools = local_backend.db().await?;
 
+        crate::runtime::remove_sandbox_socket_artifacts_for(local_backend, &self.name)?;
         remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
         sandbox_entity::Entity::delete_by_id(local.db_id)
             .exec(pools.write())

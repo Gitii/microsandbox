@@ -145,6 +145,7 @@ pub fn run(args: SandboxArgs) -> ! {
             std::process::exit(2);
         }
     };
+    let run_dir = launch_run_dir(&launch);
     // A user-supplied (disk-image) root disk carries an explicit format and
     // rides the typed UpperSpec; the managed ext4 fast path stays on
     // rootfs_upper. Exactly one of the two is populated.
@@ -225,6 +226,7 @@ pub fn run(args: SandboxArgs) -> ! {
         log_dir: launch.log_dir,
         runtime_dir: launch.runtime_dir,
         sandboxes_dir: launch.sandboxes_dir,
+        run_dir,
         cpu_lease_dir: launch.cpu_lease_dir,
         writeback_lease_dir: launch.writeback_lease_dir,
         block_writeback_pool_bytes: launch.block_writeback_pool_bytes,
@@ -249,6 +251,31 @@ pub fn run(args: SandboxArgs) -> ! {
     };
 
     microsandbox_runtime::vm::enter(config)
+}
+
+/// Resolve the runtime artifact root across launch-config generations.
+fn launch_run_dir(launch: &LaunchConfig) -> PathBuf {
+    if !launch.run_dir.as_os_str().is_empty() {
+        return launch.run_dir.clone();
+    }
+
+    // Older launchers bind `<run>/agent/<hash>.sock` and do not serialize a
+    // run root. Recover it from that stable legacy endpoint when possible.
+    if let Some(agent_dir) = launch.agent_sock.parent()
+        && agent_dir.file_name().is_some_and(|name| name == "agent")
+        && let Some(run_dir) = agent_dir.parent()
+    {
+        return run_dir.to_path_buf();
+    }
+
+    // The pre-hash deep-path fallback lives below the sandbox root, so it
+    // carries no run-root information. Existing homes colocate `run` beside
+    // `sandboxes`; this inference is only used for old launch payloads.
+    launch
+        .sandboxes_dir
+        .parent()
+        .map(|home| home.join(microsandbox_utils::RUN_SUBDIR))
+        .unwrap_or_default()
 }
 
 /// Load the JSON [`LaunchConfig`] for this sandbox from the inherited config
@@ -602,6 +629,39 @@ mod tests {
             loaded.writeback_lease_dir,
             PathBuf::from("/tmp/writeback-leases")
         );
+    }
+
+    #[test]
+    fn test_old_launch_config_without_run_dir_remains_readable() {
+        use std::io::Write;
+
+        let launch = LaunchConfig {
+            sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
+            agent_sock: PathBuf::from("/tmp/msb/run/agent/legacy.sock"),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(&launch).unwrap();
+        value.as_object_mut().unwrap().remove("run_dir");
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+
+        let args = args_with(None, Some(file.path().to_path_buf()));
+        let loaded = load_launch_config(&args).unwrap();
+
+        assert!(loaded.run_dir.as_os_str().is_empty());
+        assert_eq!(launch_run_dir(&loaded), PathBuf::from("/tmp/msb/run"));
+    }
+
+    #[test]
+    fn test_old_fallback_launch_config_infers_run_dir_from_sandbox_root() {
+        let launch = LaunchConfig {
+            sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
+            agent_sock: PathBuf::from("/tmp/msb/sandboxes/demo/runtime/agent.sock"),
+            ..Default::default()
+        };
+
+        assert_eq!(launch_run_dir(&launch), PathBuf::from("/tmp/msb/run"));
     }
 
     #[test]

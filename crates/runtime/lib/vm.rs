@@ -111,6 +111,9 @@ pub struct Config {
     /// inferring the path from `log_dir`.
     pub sandboxes_dir: PathBuf,
 
+    /// Root directory holding ephemeral host-runtime artifacts.
+    pub run_dir: PathBuf,
+
     /// Internal directory containing process-held CPU allocation leases.
     pub cpu_lease_dir: PathBuf,
 
@@ -524,6 +527,13 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     // Heartbeats are per boot, while the runtime directory persists across starts.
     heartbeat::clear_stale(&config.runtime_dir)?;
 
+    #[cfg(unix)]
+    crate::ipc::prepare_canonical_socket_dir(
+        &config.run_dir,
+        &config.sandbox_name,
+        &config.agent_sock_path,
+    )?;
+
     // Create the relay and persist the run record with a single runtime hop.
     let (mut relay, db, run_db_id) = tokio_rt.block_on(async {
         let relay = AgentRelay::new(&config.agent_sock_path, Arc::clone(&shared));
@@ -576,6 +586,27 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         }
     };
 
+    #[cfg(unix)]
+    if let Err(error) = crate::ipc::publish_legacy_agent_link(
+        &config.run_dir,
+        &config.sandbox_name,
+        &config.agent_sock_path,
+    ) {
+        if let Err(release_error) = tokio_rt.block_on(writeback_guard.release(&db)) {
+            tracing::warn!(%release_error, "release writeback admission after legacy endpoint publication failure");
+        }
+        if let Err(release_error) = tokio_rt.block_on(cpu_guard.release(&db)) {
+            tracing::warn!(%release_error, "release CPU placement after legacy endpoint publication failure");
+        }
+        let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
+        let _ = crate::ipc::remove_socket_pair(&config.agent_sock_path);
+        // Publication is no-replace. If it collided with another legacy
+        // endpoint, clean only this runtime's canonical namespace.
+        let _ =
+            crate::ipc::remove_canonical_socket_artifacts(&config.run_dir, &config.sandbox_name);
+        return Err(error.into());
+    }
+
     // Attach the exec.log writer so the ring reader can capture the
     // primary session's stdout/stderr. Failure to open the file is
     // non-fatal — log capture is best-effort and must not block boot.
@@ -626,6 +657,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_run_id = run_db_id;
     let exit_reason_for_observer = Arc::clone(&exit_reason);
     let exit_sock_path = config.agent_sock_path.clone();
+    let exit_run_dir = config.run_dir.clone();
+    let exit_sandbox_name = config.sandbox_name.clone();
     let exit_sandboxes_dir = config.sandboxes_dir.clone();
     let exit_log_writer = exec_log_writer.clone();
     // Capture the activated writer so the exit observer can release the slot
@@ -710,6 +743,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 match crate::maintenance::cleanup_terminal_ephemeral_sandbox(
                     &exit_db,
                     &exit_sandboxes_dir,
+                    &exit_run_dir,
                     exit_sandbox_id,
                 )
                 .await
@@ -742,9 +776,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 tracing::debug!(error = %err, slot = writer.slot(), "metrics slot release at exit");
             }
 
-            // Clean up agent.sock — the relay's async cleanup won't run because
-            // _exit() is called immediately after this observer returns.
-            let _ = std::fs::remove_file(&exit_sock_path);
+            // The relay/control async cleanup cannot run because _exit() is
+            // called immediately after this observer returns. Remove the exact
+            // bound pair plus canonical and compatibility artifacts here.
+            let _ = crate::ipc::remove_socket_pair(&exit_sock_path);
+            let _ = crate::ipc::remove_sandbox_socket_artifacts(&exit_run_dir, &exit_sandbox_name);
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
@@ -774,6 +810,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             } else {
                 release_reserved_metrics_slot(config.metrics_slot.as_ref());
             }
+            let _ = crate::ipc::remove_socket_pair(&config.agent_sock_path);
+            let _ =
+                crate::ipc::remove_sandbox_socket_artifacts(&config.run_dir, &config.sandbox_name);
             return Err(e);
         }
     };
@@ -809,13 +848,26 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 #[cfg(feature = "net")]
                 secrets,
             };
-            if let Err(e) =
-                crate::control::spawn_control_listener(control_sock_path.clone(), context)
-            {
-                tracing::warn!(
-                    "failed to start runtime control listener at {}: {e}",
-                    control_sock_path.display()
-                );
+            match crate::control::spawn_control_listener(control_sock_path.clone(), context) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    if let Err(e) = crate::ipc::publish_legacy_control_link(
+                        &config.run_dir,
+                        &config.sandbox_name,
+                        &control_sock_path,
+                    ) {
+                        tracing::warn!(
+                            "failed to publish legacy runtime control endpoint for {}: {e}",
+                            config.sandbox_name
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to start runtime control listener at {}: {e}",
+                        control_sock_path.display()
+                    );
+                }
             }
         }
     }
@@ -838,7 +890,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             } else {
                 release_reserved_metrics_slot(config.metrics_slot.as_ref());
             }
-            let _ = std::fs::remove_file(&config.agent_sock_path);
+            let _ = crate::ipc::remove_socket_pair(&config.agent_sock_path);
+            let _ =
+                crate::ipc::remove_sandbox_socket_artifacts(&config.run_dir, &config.sandbox_name);
             return Err(e);
         }
     }
@@ -903,8 +957,14 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     {
         let maintenance_db = db.clone();
         let maintenance_dir = config.sandboxes_dir.clone();
+        let maintenance_run_dir = config.run_dir.clone();
         tokio_rt.spawn(async move {
-            crate::maintenance::run_startup_maintenance(&maintenance_db, &maintenance_dir).await;
+            crate::maintenance::run_startup_maintenance(
+                &maintenance_db,
+                &maintenance_dir,
+                &maintenance_run_dir,
+            )
+            .await;
         });
     }
 

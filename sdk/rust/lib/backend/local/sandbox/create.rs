@@ -112,7 +112,7 @@ impl LocalBackend {
         // fail fast on conflicting persisted sandbox state.
         let db = self.db().await?;
         let sandbox_dir = self.sandboxes_dir().join(&config.spec.name);
-        Self::prepare_create_target(db, &config, &sandbox_dir).await?;
+        Self::prepare_create_target(db, &config, &sandbox_dir, &self.config().run_dir()).await?;
 
         // Resolve OCI images before spawning the sandbox process.
         if let RootfsSource::Oci(oci) = config.spec.image.clone() {
@@ -917,6 +917,7 @@ impl LocalBackend {
         pools: &DbPools,
         config: &SandboxConfig,
         sandbox_dir: &Path,
+        run_dir: &Path,
     ) -> MicrosandboxResult<()> {
         let existing = sandbox_entity::Entity::find()
             .filter(sandbox_entity::Column::Name.eq(&config.spec.name))
@@ -936,7 +937,18 @@ impl LocalBackend {
         }
 
         if let Some(model) = existing {
-            let model = Self::reconcile_sandbox_runtime_state(pools, model).await?;
+            let sandboxes_dir = sandbox_dir.parent().ok_or_else(|| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "sandbox directory has no storage root: {}",
+                    sandbox_dir.display()
+                ))
+            })?;
+            let model = Self::reconcile_sandbox_runtime_state_with_paths(
+                pools,
+                model,
+                Some((run_dir, sandboxes_dir)),
+            )
+            .await?;
             let active = matches!(
                 model.status,
                 SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused
@@ -946,11 +958,16 @@ impl LocalBackend {
                     .await?;
             }
 
+            microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, &config.spec.name)?;
+            remove_dir_if_exists(sandbox_dir)?;
+
             sandbox_entity::Entity::delete_by_id(model.id)
                 .exec(pools.write())
                 .await?;
+            return Ok(());
         }
 
+        microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, &config.spec.name)?;
         remove_dir_if_exists(sandbox_dir)?;
         Ok(())
     }
@@ -1564,7 +1581,8 @@ mod tests {
 
         let config = test_config("existing");
 
-        let err = LocalBackend::prepare_create_target(&pools, &config, &sandbox_dir)
+        let run_dir = temp.path().join("run");
+        let err = LocalBackend::prepare_create_target(&pools, &config, &sandbox_dir, &run_dir)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -1572,6 +1590,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_create_target_force_replaces_stopped_sandbox_state() {
+        #[cfg(unix)]
+        let temp = tempfile::Builder::new()
+            .prefix("msb-replace")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(not(unix))]
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("test.db");
         let pools = open_test_pools(&db_path).await;
@@ -1589,11 +1613,42 @@ mod tests {
         let mut forced = test_config("replaceable");
         forced.replace_existing = true;
 
-        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir)
+        let run_dir = temp.path().join("run");
+        #[cfg(unix)]
+        let socket_paths = {
+            let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "replaceable");
+            fs::create_dir_all(&paths.canonical_dir).unwrap();
+            fs::write(&paths.agent, b"stale").unwrap();
+            fs::write(&paths.control, b"stale").unwrap();
+            microsandbox_runtime::ipc::publish_legacy_agent_link(
+                &run_dir,
+                "replaceable",
+                &paths.agent,
+            )
+            .unwrap();
+            microsandbox_runtime::ipc::publish_legacy_control_link(
+                &run_dir,
+                "replaceable",
+                &paths.control,
+            )
+            .unwrap();
+            paths
+        };
+        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir, &run_dir)
             .await
             .unwrap();
 
         assert!(!sandbox_dir.exists());
+        #[cfg(unix)]
+        for path in [
+            &socket_paths.agent,
+            &socket_paths.control,
+            &socket_paths.legacy_agent,
+            &socket_paths.legacy_control,
+            &socket_paths.canonical_dir,
+        ] {
+            assert!(std::fs::symlink_metadata(path).is_err());
+        }
         assert!(
             sandbox_entity::Entity::find_by_id(sandbox_id)
                 .one(pools.write())
@@ -1630,7 +1685,8 @@ mod tests {
         let mut forced = test_config("stale-running");
         forced.replace_existing = true;
 
-        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir)
+        let run_dir = temp.path().join("run");
+        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir, &run_dir)
             .await
             .unwrap();
 
@@ -1678,7 +1734,8 @@ mod tests {
         let mut forced = test_config("running");
         forced.replace_existing = true;
 
-        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir)
+        let run_dir = temp.path().join("run");
+        LocalBackend::prepare_create_target(&pools, &forced, &sandbox_dir, &run_dir)
             .await
             .unwrap();
 
