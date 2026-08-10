@@ -1126,6 +1126,10 @@ export declare class SandboxBuilder {
   portUdp(hostPort: number, guestPort: number): this
   /** Publish a UDP port from host -> guest on a specific host bind address. */
   portUdpBind(bind: string, hostPort: number, guestPort: number): this
+  /** Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port. */
+  vsock(hostPath: string, port: number): this
+  /** Expose a host Unix datagram socket on a guest-to-host vsock port. */
+  vsockDgram(hostPath: string, port: number): this
   /** Add a secret via a callback. */
   secret(configure: (arg: JsSecretBuilder) => JsSecretBuilder): this
   /**
@@ -1585,7 +1589,7 @@ export declare class Volume {
   static remove(name: string): Promise<void>
   get name(): string
   get path(): string
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolume = Volume
@@ -1664,7 +1668,7 @@ export declare class VolumeHandle {
   get labels(): Record<string, string>
   get createdAt(): number | null
   remove(): Promise<void>
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolumeHandle = VolumeHandle

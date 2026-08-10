@@ -28,6 +28,10 @@ use microsandbox_protocol::{
     message::{Message, MessageType},
 };
 use microsandbox_types::CpuPlacement;
+#[cfg(windows)]
+use microsandbox_vsock::WindowsNamedPipePortBackend;
+#[cfg(unix)]
+use microsandbox_vsock::{UnixDatagramPortBackend, UnixStreamPortBackend};
 use msb_krun::VmBuilder;
 use sea_orm::{ColumnTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
@@ -333,6 +337,9 @@ pub struct VmConfig {
 
     /// Disk-image volume mounts attached as extra virtio-blk devices.
     pub disks: Vec<DiskMountSpec>,
+
+    /// Host Unix sockets exposed through virtio-vsock.
+    pub vsock: Vec<microsandbox_types::VsockRouteSpec>,
 
     /// Pre-built filesystem backends as `(tag, backend)` pairs.
     #[cfg(unix)]
@@ -1559,6 +1566,97 @@ fn build_vm(
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
+
+    // Vsock routes are independent of virtio-net. Microsandbox owns the host
+    // local IPC endpoints while libkrun retains framing, queues and credits.
+    #[cfg(unix)]
+    if !vm.vsock.is_empty() {
+        #[cfg(feature = "net")]
+        if vm.deployment_profile == microsandbox_types::DeploymentProfile::MultiTenant {
+            return Err(RuntimeError::Custom(
+                "host vsock routes are disabled for multi-tenant deployments".to_string(),
+            ));
+        }
+
+        let mut streams: Vec<(u32, Arc<dyn msb_krun::backends::vsock::VsockPortBackend>)> =
+            Vec::new();
+        let mut datagrams: Vec<(
+            u32,
+            Arc<dyn msb_krun::backends::vsock::VsockDatagramPortBackend>,
+        )> = Vec::new();
+
+        for route in &vm.vsock {
+            match route.socket_type {
+                microsandbox_types::VsockSocketType::Stream => {
+                    let backend =
+                        UnixStreamPortBackend::new(&route.host_socket).map_err(|err| {
+                            RuntimeError::Custom(format!(
+                                "initialize stream vsock route {}:{}: {err}",
+                                route.host_socket.display(),
+                                route.port
+                            ))
+                        })?;
+                    streams.push((route.port, Arc::new(backend)));
+                }
+                microsandbox_types::VsockSocketType::Dgram => {
+                    let backend =
+                        UnixDatagramPortBackend::new(&route.host_socket).map_err(|err| {
+                            RuntimeError::Custom(format!(
+                                "initialize datagram vsock route {}:{}: {err}",
+                                route.host_socket.display(),
+                                route.port
+                            ))
+                        })?;
+                    datagrams.push((route.port, Arc::new(backend)));
+                }
+            }
+        }
+
+        builder = builder.vsock(move |mut vsock| {
+            for (port, backend) in streams {
+                vsock = vsock.custom(port, backend);
+            }
+            for (port, backend) in datagrams {
+                vsock = vsock.custom_dgram(port, backend);
+            }
+            vsock
+        });
+    }
+
+    #[cfg(windows)]
+    if !vm.vsock.is_empty() {
+        #[cfg(feature = "net")]
+        if vm.deployment_profile == microsandbox_types::DeploymentProfile::MultiTenant {
+            return Err(RuntimeError::Custom(
+                "host vsock routes are disabled for multi-tenant deployments".to_string(),
+            ));
+        }
+
+        let mut streams: Vec<(u32, Arc<dyn msb_krun::backends::vsock::VsockPortBackend>)> =
+            Vec::new();
+        for route in &vm.vsock {
+            if route.socket_type == microsandbox_types::VsockSocketType::Dgram {
+                return Err(RuntimeError::Custom(
+                    "vsock datagram routes are not supported on Windows".to_string(),
+                ));
+            }
+            let backend = WindowsNamedPipePortBackend::new(&route.host_socket).map_err(|err| {
+                RuntimeError::Custom(format!(
+                    "initialize stream vsock route {}:{}: {err}",
+                    route.host_socket.display(),
+                    route.port
+                ))
+            })?;
+            streams.push((route.port, Arc::new(backend)));
+        }
+
+        builder = builder.vsock(move |mut vsock| {
+            for (port, backend) in streams {
+                vsock = vsock.custom(port, backend);
+            }
+            vsock
+        });
+    }
 
     // Network.
     #[cfg(feature = "net")]

@@ -37,7 +37,8 @@ pub use domain::{
     SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec, ScopedUpstreamCaCert,
     ScopedVerifyUpstream, SecretConfigError, SecretEntry, SecretInjection, SecretsConfig,
     SecurityProfile, SnapshotSpec, StatVirtualization, TlsConfig, TransparentHugePagePolicy,
-    ViolationAction, VolumeKind, VolumeMount, VolumeSpec,
+    ViolationAction, VolumeKind, VolumeMount, VolumeSpec, VsockRouteSpec, VsockSocketType,
+    VsockSpec,
 };
 pub use error::{TypesError, TypesResult};
 pub use modify::{

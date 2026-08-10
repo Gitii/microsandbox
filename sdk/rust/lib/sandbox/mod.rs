@@ -120,7 +120,7 @@ pub use microsandbox_types::{CpuPlacement, PullPolicy};
 pub use microsandbox_types::{
     EnvVar, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec, PortProtocol,
     PublishedPortSpec, SandboxLogLevel, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
-    TransparentHugePagePolicy,
+    TransparentHugePagePolicy, VsockRouteSpec, VsockSocketType, VsockSpec,
 };
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,

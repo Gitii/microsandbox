@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use microsandbox_types::{CpuPlacement, DeploymentProfile};
+use microsandbox_types::{CpuPlacement, DeploymentProfile, VsockRouteSpec};
 use serde::{Deserialize, Serialize};
 
 use microsandbox_types::TransparentHugePagePolicy;
@@ -118,6 +118,10 @@ pub struct LaunchConfig {
     /// Sandbox slot for deterministic network address derivation.
     #[cfg(feature = "net")]
     pub sandbox_slot: u64,
+
+    /// Host Unix sockets exposed through virtio-vsock.
+    #[serde(default)]
+    pub vsock: Vec<VsockRouteSpec>,
 }
 
 /// Lifetime bounds for the sandbox.
