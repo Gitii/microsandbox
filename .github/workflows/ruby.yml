@@ -44,6 +44,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # The Ruby extension is its own Cargo project and must keep an exact crates.io
+      # dependency for source-gem releases. Until the matching core crate is published,
+      # patch CI to the checkout so new Ruby bindings can be tested in the same PR.
       - name: Use checkout Rust SDK
         shell: bash
         run: |
