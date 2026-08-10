@@ -60,6 +60,9 @@ const EXIT_REASON_AGENT_UNRESPONSIVE: u8 = 5;
 const EXIT_REASON_SHUTDOWN_REQUESTED: u8 = 6;
 const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
 
+/// Bounds how long an existing VMM can retain an obsolete fair share after membership changes.
+const WRITEBACK_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Fixed fd carrying the bulk `msb sandbox` config (argv overflow) as
 /// NUL-terminated argument records. Keeps the network-config blob and the
 /// repeated `--env` flags off the process argv — see issue #997.
@@ -114,10 +117,10 @@ pub struct Config {
     /// Internal directory containing process-held CPU allocation leases.
     pub cpu_lease_dir: PathBuf,
 
-    /// Internal directory containing process-held writeback admission leases.
+    /// Internal directory containing process-held writeback pressure leases.
     pub writeback_lease_dir: PathBuf,
 
-    /// Host-global dirty-credit pool used for spawn-time admission.
+    /// Host-global dirty-credit pool shared fairly by live writable disks.
     pub block_writeback_pool_bytes: Option<u64>,
 
     /// Path to the Unix domain socket for the agent relay.
@@ -566,15 +569,24 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         config.vm.block_writeback_limit_bytes,
         &writeback_disk_paths,
     )) {
-        Ok(guard) => Arc::new(guard),
+        Ok(guard) => guard,
         Err(error) => {
             if let Err(release_error) = tokio_rt.block_on(cpu_guard.release(&db)) {
-                tracing::warn!(%release_error, "release CPU placement after writeback admission failure");
+                tracing::warn!(%release_error, "release CPU placement after writeback pressure setup failure");
             }
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
     };
+    let writeback_guard = Arc::new(writeback_guard);
+    let writeback_limit = writeback_guard.limit();
+    if writeback_guard.is_managed() {
+        let pressure_guard = Arc::clone(&writeback_guard);
+        let pressure_db = db.clone();
+        tokio_rt.spawn(async move {
+            monitor_writeback_pressure(pressure_guard, pressure_db).await;
+        });
+    }
 
     // Attach the exec.log writer so the ring reader can capture the
     // primary session's stdout/stderr. Failure to open the file is
@@ -667,7 +679,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 let now = chrono::Utc::now().naive_utc();
 
                 if let Err(error) = exit_writeback_guard.release(&exit_db).await {
-                    tracing::warn!(%error, "release writeback admission at VM exit");
+                    tracing::warn!(%error, "release writeback pressure membership at VM exit");
                 }
                 if let Err(error) = exit_cpu_guard.release(&exit_db).await {
                     tracing::warn!(%error, "release CPU placement at VM exit");
@@ -748,6 +760,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
+        writeback_limit.as_ref(),
     );
     let (
         vm,
@@ -759,7 +772,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         Ok(vm) => vm,
         Err(e) => {
             if let Err(error) = tokio_rt.block_on(writeback_guard.release(&db)) {
-                tracing::warn!(%error, "release writeback admission after VM build failure");
+                tracing::warn!(%error, "release writeback pressure membership after VM build failure");
             }
             if let Err(error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM build failure");
@@ -1141,7 +1154,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         Ok(infallible) => Ok(infallible),
         Err(e) => {
             if let Err(error) = cleanup_rt_handle.block_on(writeback_guard.release(&db)) {
-                tracing::warn!(%error, "release writeback admission after VM enter failure");
+                tracing::warn!(%error, "release writeback pressure membership after VM enter failure");
             }
             if let Err(error) = cleanup_rt_handle.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM enter failure");
@@ -1179,13 +1192,13 @@ fn apply_block_writeback_limit(
     mut disk: msb_krun::DiskBuilder,
     format: msb_krun::DiskImageFormat,
     read_only: bool,
-    limit_bytes: Option<u64>,
+    limit: Option<&msb_krun::WritebackLimit>,
 ) -> msb_krun::DiskBuilder {
     if !read_only
         && matches!(format, msb_krun::DiskImageFormat::Raw)
-        && let Some(limit_bytes) = limit_bytes
+        && let Some(limit) = limit
     {
-        disk = disk.writeback_limit_bytes(limit_bytes);
+        disk = disk.writeback_limit(limit.clone());
     }
     disk
 }
@@ -1234,6 +1247,7 @@ fn build_vm(
     on_exit: impl Fn(i32) + Send + 'static,
     tokio_handle: tokio::runtime::Handle,
     vcpu_targets: Option<&[crate::cpu::LogicalCpuId]>,
+    writeback_limit: Option<&msb_krun::WritebackLimit>,
 ) -> RuntimeResult<VmBuildOutput> {
     let mut exec_env = config.vm.env.clone();
     let vm = &config.vm;
@@ -1334,18 +1348,18 @@ fn build_vm(
             let primary = spec.primary.clone();
             let format = spec.format;
             let read_only = spec.read_only;
-            let writeback_limit_bytes = vm.block_writeback_limit_bytes;
+            let writeback_limit = writeback_limit.cloned();
             builder = builder.disk(move |d| {
                 let d = d.path(&primary).format(format).read_only(read_only);
-                apply_block_writeback_limit(d, format, read_only, writeback_limit_bytes)
+                apply_block_writeback_limit(d, format, read_only, writeback_limit.as_ref())
             });
         } else if let Some(ref upper) = vm.rootfs_upper {
             let upper = upper.clone();
             let format = msb_krun::DiskImageFormat::Raw;
-            let writeback_limit_bytes = vm.block_writeback_limit_bytes;
+            let writeback_limit = writeback_limit.cloned();
             builder = builder.disk(move |d| {
                 let d = d.path(&upper).format(format).read_only(false);
-                apply_block_writeback_limit(d, format, false, writeback_limit_bytes)
+                apply_block_writeback_limit(d, format, false, writeback_limit.as_ref())
             });
         }
 
@@ -1376,10 +1390,10 @@ fn build_vm(
             .map_err(|e| RuntimeError::Custom(format!("disk format: {e}")))?;
         let disk_path = disk_path.clone();
         let readonly = vm.rootfs_disk_readonly;
-        let writeback_limit_bytes = vm.block_writeback_limit_bytes;
+        let writeback_limit = writeback_limit.cloned();
         builder = builder.disk(move |d| {
             let d = d.path(&disk_path).format(format).read_only(readonly);
-            apply_block_writeback_limit(d, format, readonly, writeback_limit_bytes)
+            apply_block_writeback_limit(d, format, readonly, writeback_limit.as_ref())
         });
         append_block_root_env(&mut exec_env);
     }
@@ -1456,7 +1470,7 @@ fn build_vm(
         let host = disk.host.clone();
         let format = disk.format;
         let readonly = disk.readonly;
-        let writeback_limit_bytes = vm.block_writeback_limit_bytes;
+        let writeback_limit = writeback_limit.cloned();
         builder = builder.disk(move |d| {
             let mut d = d.id(&id).path(&host).format(format).read_only(readonly);
             if readonly {
@@ -1465,7 +1479,7 @@ fn build_vm(
                     .cache(msb_krun::CacheMode::Unsafe)
                     .sync(msb_krun::SyncMode::None);
             }
-            apply_block_writeback_limit(d, format, readonly, writeback_limit_bytes)
+            apply_block_writeback_limit(d, format, readonly, writeback_limit.as_ref())
         });
     }
 
@@ -1585,6 +1599,37 @@ fn build_vm(
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+async fn monitor_writeback_pressure(
+    guard: Arc<crate::writeback::WritebackPressureGuard>,
+    db: DbWriteConnection,
+) {
+    let mut interval = tokio::time::interval(WRITEBACK_PRESSURE_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Acquisition already installed the initial target, so avoid an unnecessary immediate query.
+    interval.tick().await;
+    let mut coordination_failed = false;
+
+    loop {
+        interval.tick().await;
+        match guard.refresh(&db).await {
+            Ok(()) if coordination_failed => {
+                tracing::info!("writeback pressure coordination recovered");
+                coordination_failed = false;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                // Losing the coordinator must reduce throughput, never silently restore the full
+                // per-disk window while the active host membership is unknown.
+                guard.fail_closed();
+                if !coordination_failed {
+                    tracing::warn!(%error, "writeback pressure coordination failed closed");
+                    coordination_failed = true;
+                }
+            }
+        }
+    }
+}
 
 /// Raise `RLIMIT_NOFILE` to the hard limit, capped at 1M (the reference virtiofsd default). On macOS the soft limit is additionally clamped to
 /// `kern.maxfilesperproc`, which `setrlimit` enforces even when the hard limit is unlimited.
