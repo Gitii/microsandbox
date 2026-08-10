@@ -1,6 +1,8 @@
 use std::io;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
