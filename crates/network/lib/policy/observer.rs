@@ -16,7 +16,10 @@
 //! blocks guest traffic. Timestamps are left to the observer so the
 //! evaluation path does not read the clock on every denied packet.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::types::{Direction, Protocol};
 
@@ -81,23 +84,68 @@ pub trait PolicyObserver: Send + Sync {
 /// the default text layer renders it as `key=value` pairs.
 ///
 /// The field set is a contract for those consumers: `event`, `direction`,
-/// `protocol`, `target_kind`, `target`, `port`, `hostname`, `verdict`.
-/// Fields are always present; unknown values are logged as the empty
-/// string rather than omitted, so a parser never has to handle a missing
-/// key. The timestamp is supplied by the subscriber, not by this event.
+/// `protocol`, `peer_kind`, `peer`, `port`, `hostname`, `verdict`,
+/// `suppressed`. Fields are always present; unknown values are logged as
+/// the empty string rather than omitted, so a parser never has to handle a
+/// missing key. The peer is deliberately not called `target`: a JSON layer
+/// configured with `flatten_event` puts the `tracing` metadata target at
+/// that key, and one of the two would silently win.
 ///
 /// `WARN` is chosen so the line survives the sandbox subprocess's default
 /// filter, which is `INFO` — that subprocess is where the network stack
 /// runs and its stderr is captured into `runtime.log`, so a denial reaches
 /// the file a host consumer reads without anyone passing a verbosity flag.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LoggingPolicyObserver;
+///
+/// Denials are rate limited, because they are decided per *packet*: a
+/// deny-by-default sandbox with a chatty guest denies every datagram, every
+/// echo and every SYN retransmit, and `runtime.log` rotates at 10 MiB with
+/// the lifecycle and VMM diagnostics other tooling reads. The first denial
+/// for a destination is logged immediately; further denials of the same
+/// destination inside [`SUPPRESSION_WINDOW`] are counted, not logged, and
+/// the count is reported as `suppressed` on the next line for that
+/// destination. So a consumer counting denied packets adds `suppressed + 1`
+/// per line rather than counting lines. That also collapses the duplicate a
+/// packet produces when a platform policy and a tenant policy both deny it.
+#[derive(Debug, Default)]
+pub struct LoggingPolicyObserver {
+    /// Destinations logged recently, and how many denials each has
+    /// swallowed since its last line. Bounded by [`MAX_TRACKED_PEERS`].
+    recent: Mutex<HashMap<DenialKey, Suppression>>,
+}
+
+/// Identity a denial is rate limited by: one line per distinct destination
+/// per window, rather than one per packet.
+///
+/// Keyed on the wire labels rather than the enums so that `Direction` and
+/// `Protocol` do not have to grow a public `Hash` derive for an internal
+/// rate limiter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DenialKey {
+    direction: &'static str,
+    protocol: &'static str,
+    peer: String,
+    port: Option<u16>,
+}
+
+/// Rate-limiter state for one destination.
+#[derive(Debug)]
+struct Suppression {
+    /// When the window this destination is currently inside opened.
+    window_start: Instant,
+
+    /// Denials swallowed since the last line for this destination.
+    count: u64,
+}
 
 impl PolicyObserver for LoggingPolicyObserver {
     fn on_denied(&self, denial: &PolicyDenial) {
-        let (target_kind, target) = match &denial.target {
+        let (peer_kind, peer) = match &denial.target {
             DenialTarget::Address(addr) => ("address", addr.to_string()),
             DenialTarget::Domain(domain) => ("domain", domain.clone()),
+        };
+
+        let Some(suppressed) = self.admit(denial, &peer) else {
+            return;
         };
 
         tracing::warn!(
@@ -105,15 +153,73 @@ impl PolicyObserver for LoggingPolicyObserver {
             event = DENIAL_LOG_EVENT,
             direction = direction_label(denial.direction),
             protocol = protocol_label(denial.protocol),
-            target_kind = target_kind,
-            // Recorded as a string, not via `%`, so the text layer quotes it
-            // like every other field rather than emitting it bare.
-            target = target.as_str(),
+            peer_kind = peer_kind,
+            // Recorded as a string, not via `%`, so the text layer quotes and
+            // escapes it like every other field rather than emitting it bare —
+            // a peer name comes from guest-controlled DNS or SNI.
+            peer = peer.as_str(),
             port = denial.port.map(|p| p.to_string()).unwrap_or_default(),
             hostname = denial.hostname.as_deref().unwrap_or_default(),
             verdict = "deny",
+            suppressed = suppressed,
             "network policy denied traffic"
         );
+    }
+}
+
+impl LoggingPolicyObserver {
+    /// Decide whether this denial gets a line, and with what `suppressed`
+    /// count. `None` means the denial was swallowed into a running count.
+    fn admit(&self, denial: &PolicyDenial, peer: &str) -> Option<u64> {
+        let key = DenialKey {
+            direction: direction_label(denial.direction),
+            protocol: protocol_label(denial.protocol),
+            peer: peer.to_owned(),
+            port: denial.port,
+        };
+
+        let now = Instant::now();
+        let mut recent = self.recent.lock().unwrap();
+
+        match recent.get_mut(&key) {
+            Some(entry) if now.duration_since(entry.window_start) < SUPPRESSION_WINDOW => {
+                entry.count += 1;
+                None
+            }
+            Some(entry) => {
+                // The window closed: this denial gets the line, and carries
+                // the tally of everything swallowed while it was open.
+                let suppressed = std::mem::replace(&mut entry.count, 0);
+                entry.window_start = now;
+                Some(suppressed)
+            }
+            None => {
+                // Drop destinations whose window has closed before growing,
+                // so a guest spraying distinct addresses cannot grow this map
+                // without bound.
+                if recent.len() >= MAX_TRACKED_PEERS {
+                    recent.retain(|_, entry| {
+                        now.duration_since(entry.window_start) < SUPPRESSION_WINDOW
+                    });
+                }
+
+                // Still full: every tracked destination is inside its window,
+                // which is the flood this limiter exists for. Stay silent
+                // rather than let an untracked destination log unbounded.
+                if recent.len() >= MAX_TRACKED_PEERS {
+                    return None;
+                }
+
+                recent.insert(
+                    key,
+                    Suppression {
+                        window_start: now,
+                        count: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
     }
 }
 
@@ -128,6 +234,16 @@ pub const DENIAL_LOG_TARGET: &str = "microsandbox::network::policy::denial";
 /// Value of the `event` field on the denial log line. Stable: consumers
 /// match on it.
 pub const DENIAL_LOG_EVENT: &str = "network_policy_denied";
+
+/// How long one destination stays quiet after it is logged. Long enough to
+/// collapse a burst of retransmits, short enough that a consumer sees a
+/// still-blocked destination reappear.
+pub const SUPPRESSION_WINDOW: Duration = Duration::from_secs(10);
+
+/// Destinations the rate limiter tracks at once. A guest spraying more
+/// distinct destinations than this inside one window is the flood the
+/// limiter exists for, and the excess is dropped rather than logged.
+const MAX_TRACKED_PEERS: usize = 1024;
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -331,7 +447,7 @@ mod tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            LoggingPolicyObserver.on_denied(denial);
+            LoggingPolicyObserver::default().on_denied(denial);
         });
 
         let line = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
@@ -348,7 +464,7 @@ mod tests {
             .finish();
 
         tracing::subscriber::with_default(subscriber, || {
-            LoggingPolicyObserver.on_denied(denial);
+            LoggingPolicyObserver::default().on_denied(denial);
         });
 
         String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
@@ -375,11 +491,12 @@ mod tests {
             r#"event="network_policy_denied""#,
             r#"direction="egress""#,
             r#"protocol="tcp""#,
-            r#"target_kind="address""#,
-            r#"target="1.2.3.4""#,
+            r#"peer_kind="address""#,
+            r#"peer="1.2.3.4""#,
             r#"port="443""#,
             r#"hostname="example.com""#,
             r#"verdict="deny""#,
+            "suppressed=0",
         ] {
             assert!(line.contains(pair), "missing {pair} in {line}");
         }
@@ -408,8 +525,9 @@ mod tests {
         assert_eq!(fields["event"], DENIAL_LOG_EVENT);
         assert_eq!(fields["direction"], "egress");
         assert_eq!(fields["protocol"], "tcp");
-        assert_eq!(fields["target_kind"], "address");
-        assert_eq!(fields["target"], "1.2.3.4");
+        assert_eq!(fields["peer_kind"], "address");
+        assert_eq!(fields["peer"], "1.2.3.4");
+        assert_eq!(fields["suppressed"], 0);
         assert_eq!(fields["port"], "443");
         assert_eq!(fields["hostname"], "example.com");
         assert_eq!(fields["verdict"], "deny");
@@ -424,10 +542,83 @@ mod tests {
         let logged = logged_denial(&denial);
         let fields = &logged["fields"];
 
-        assert_eq!(fields["target_kind"], "domain");
-        assert_eq!(fields["target"], "blocked.example");
+        assert_eq!(fields["peer_kind"], "domain");
+        assert_eq!(fields["peer"], "blocked.example");
         assert_eq!(fields["port"], "");
         assert_eq!(fields["hostname"], "");
+    }
+
+    #[test]
+    fn a_repeated_denial_is_suppressed_and_counted_on_the_next_line() {
+        // A denied destination is re-evaluated per packet — every retransmit
+        // of one blocked connection lands here — so only the first gets a
+        // line, and the rest are tallied onto the line that opens the next
+        // window.
+        let observer = LoggingPolicyObserver::default();
+        let denial = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(443),
+        );
+
+        assert_eq!(observer.admit(&denial, "1.2.3.4"), Some(0));
+        for _ in 0..99 {
+            assert_eq!(observer.admit(&denial, "1.2.3.4"), None);
+        }
+
+        // Force the window shut rather than sleeping through it.
+        observer
+            .recent
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|entry| entry.window_start -= SUPPRESSION_WINDOW);
+
+        assert_eq!(observer.admit(&denial, "1.2.3.4"), Some(99));
+        // The tally resets with the new window.
+        assert_eq!(observer.admit(&denial, "1.2.3.4"), None);
+    }
+
+    #[test]
+    fn distinct_destinations_are_rate_limited_independently() {
+        let observer = LoggingPolicyObserver::default();
+        let denial = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(443),
+        );
+        let other_port = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(80),
+        );
+
+        assert_eq!(observer.admit(&denial, "1.2.3.4"), Some(0));
+        assert_eq!(observer.admit(&other_port, "1.2.3.4"), Some(0));
+        assert_eq!(observer.admit(&denial, "5.6.7.8"), Some(0));
+        assert_eq!(observer.admit(&denial, "1.2.3.4"), None);
+    }
+
+    #[test]
+    fn the_rate_limiter_does_not_grow_without_bound() {
+        // A guest spraying distinct destinations must not turn the limiter
+        // into a leak.
+        let observer = LoggingPolicyObserver::default();
+        let denial = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(443),
+        );
+
+        for i in 0..(MAX_TRACKED_PEERS * 3) {
+            observer.admit(&denial, &format!("peer-{i}"));
+        }
+
+        assert!(observer.recent.lock().unwrap().len() <= MAX_TRACKED_PEERS);
     }
 
     #[test]
@@ -435,7 +626,7 @@ mod tests {
         // The wiring, not just the formatting: a denial decided by the
         // policy engine reaches the log when this observer is installed.
         let shared = SharedState::new(4);
-        shared.set_policy_observer(Arc::new(LoggingPolicyObserver));
+        shared.set_policy_observer(Arc::new(LoggingPolicyObserver::default()));
 
         let action = NetworkPolicy::none().evaluate_egress(dst(443), Protocol::Tcp, &shared);
 

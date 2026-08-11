@@ -231,7 +231,7 @@ impl SmoltcpNetwork {
         // process through the log, and a supervising daemon reading the
         // runtime's output cannot install an observer of its own. An embedder
         // that wants the denials programmatically replaces this one.
-        shared.set_policy_observer(Arc::new(LoggingPolicyObserver));
+        shared.set_policy_observer(Arc::new(LoggingPolicyObserver::default()));
         let backend = SmoltcpBackend::new(shared.clone());
 
         let secrets = SecretsHandle::new(config.secrets.clone());

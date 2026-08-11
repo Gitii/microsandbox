@@ -68,7 +68,12 @@ pub struct SharedState {
     termination_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 
     /// Optional host-side observer notified of every policy denial.
-    policy_observer: Mutex<Option<Arc<dyn PolicyObserver>>>,
+    ///
+    /// An `RwLock`, not a `Mutex` like the termination hook beside it: this
+    /// is read on every denied evaluation, from the poll loop, the proxy
+    /// tasks, the ICMP relay and the publisher at once, and written once at
+    /// construction.
+    policy_observer: RwLock<Option<Arc<dyn PolicyObserver>>>,
 
     /// Resolved hostname index used to map destination IPs back to queried hostnames.
     resolved_hostnames: RwLock<TtlReverseIndex<ResolvedHostnameKey, IpAddr>>,
@@ -122,7 +127,7 @@ impl SharedState {
             tx_wake: WakePipe::new(),
             proxy_wake: WakePipe::new(),
             termination_hook: Mutex::new(None),
-            policy_observer: Mutex::new(None),
+            policy_observer: RwLock::new(None),
             resolved_hostnames: RwLock::new(TtlReverseIndex::default()),
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
@@ -164,20 +169,28 @@ impl SharedState {
         }
     }
 
-    /// Install a host-side observer for policy denials.
+    /// Install a host-side observer for policy denials, replacing any
+    /// previously installed one.
+    ///
+    /// `SmoltcpNetwork` installs a logging observer at construction, so an
+    /// embedder calling this displaces the log line rather than adding to
+    /// it. That is deliberate: an embedder that wants both can wrap the
+    /// logging observer in its own.
     pub fn set_policy_observer(&self, observer: Arc<dyn PolicyObserver>) {
-        *self.policy_observer.lock().unwrap() = Some(observer);
+        *self.policy_observer.write() = Some(observer);
     }
 
     /// Report a policy denial to the installed observer, if any.
     ///
     /// Called from the policy evaluation choke points. The denial is built
-    /// lazily so no allocation happens when no observer is installed.
+    /// lazily, so a build with no observer installed — a bare `SharedState`,
+    /// as the tests construct — allocates nothing. The shipped runtime always
+    /// installs one, so there the closure always runs.
     pub fn report_policy_denial<F>(&self, denial: F)
     where
         F: FnOnce() -> PolicyDenial,
     {
-        let observer = self.policy_observer.lock().unwrap().clone();
+        let observer = self.policy_observer.read().clone();
         if let Some(observer) = observer {
             observer.on_denied(&denial());
         }
