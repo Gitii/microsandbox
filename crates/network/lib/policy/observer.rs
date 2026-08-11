@@ -69,6 +69,59 @@ pub trait PolicyObserver: Send + Sync {
     fn on_denied(&self, denial: &PolicyDenial);
 }
 
+/// Observer that writes each denial to the runtime's log output as a
+/// structured `tracing` event.
+///
+/// This is the observer a host process gets without asking: embedders that
+/// link the crate can install their own, but a consumer outside the process
+/// — a supervising daemon reading the runtime's logs — has no other way to
+/// see a denial. The event is emitted at `WARN` on the
+/// [`DENIAL_LOG_TARGET`] target, carrying one field per denial component so
+/// that a `tracing` JSON layer renders it as a machine-readable object and
+/// the default text layer renders it as `key=value` pairs.
+///
+/// The field set is a contract for those consumers: `event`, `direction`,
+/// `protocol`, `target_kind`, `target`, `port`, `hostname`, `verdict`.
+/// Fields are always present; unknown values are logged as the empty
+/// string rather than omitted, so a parser never has to handle a missing
+/// key. The timestamp is supplied by the subscriber, not by this event.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoggingPolicyObserver;
+
+impl PolicyObserver for LoggingPolicyObserver {
+    fn on_denied(&self, denial: &PolicyDenial) {
+        let (target_kind, target) = match &denial.target {
+            DenialTarget::Address(addr) => ("address", addr.to_string()),
+            DenialTarget::Domain(domain) => ("domain", domain.clone()),
+        };
+
+        tracing::warn!(
+            target: DENIAL_LOG_TARGET,
+            event = DENIAL_LOG_EVENT,
+            direction = direction_label(denial.direction),
+            protocol = protocol_label(denial.protocol),
+            target_kind = target_kind,
+            target = %target,
+            port = denial.port.map(|p| p.to_string()).unwrap_or_default(),
+            hostname = denial.hostname.as_deref().unwrap_or_default(),
+            verdict = "deny",
+            "network policy denied traffic"
+        );
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// `tracing` target the denial event is emitted on. Stable: consumers
+/// filter on it.
+pub const DENIAL_LOG_TARGET: &str = "microsandbox::network::policy::denial";
+
+/// Value of the `event` field on the denial log line. Stable: consumers
+/// match on it.
+pub const DENIAL_LOG_EVENT: &str = "network_policy_denied";
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -105,6 +158,30 @@ impl PolicyDenial {
     pub fn with_hostname(mut self, hostname: Option<String>) -> Self {
         self.hostname = hostname;
         self
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Stable wire label for a direction. Deliberately not `Debug`, which is
+/// free to change with the enum's spelling.
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Egress => "egress",
+        Direction::Ingress => "ingress",
+        Direction::Any => "any",
+    }
+}
+
+/// Stable wire label for a protocol. See [`direction_label`].
+fn protocol_label(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Icmpv4 => "icmpv4",
+        Protocol::Icmpv6 => "icmpv6",
     }
 }
 
@@ -212,6 +289,102 @@ mod tests {
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0].direction, Direction::Ingress);
         assert_eq!(denials[0].port, Some(8080));
+    }
+
+    /// Capture the JSON the logging observer writes for one denial.
+    fn logged_denial(denial: &PolicyDenial) -> serde_json::Value {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            LoggingPolicyObserver.on_denied(denial);
+        });
+
+        let line = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        serde_json::from_str(line.trim()).expect("the denial log line is not valid JSON")
+    }
+
+    #[test]
+    fn the_logged_denial_carries_every_contract_field() {
+        let denial = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(443),
+        )
+        .with_hostname(Some("example.com".to_owned()));
+
+        let logged = logged_denial(&denial);
+
+        assert_eq!(logged["target"], DENIAL_LOG_TARGET);
+        assert_eq!(logged["level"], "WARN");
+        assert!(
+            logged["timestamp"].is_string(),
+            "the subscriber must stamp the line: {logged}"
+        );
+
+        let fields = &logged["fields"];
+        assert_eq!(fields["event"], DENIAL_LOG_EVENT);
+        assert_eq!(fields["direction"], "egress");
+        assert_eq!(fields["protocol"], "tcp");
+        assert_eq!(fields["target_kind"], "address");
+        assert_eq!(fields["target"], "1.2.3.4");
+        assert_eq!(fields["port"], "443");
+        assert_eq!(fields["hostname"], "example.com");
+        assert_eq!(fields["verdict"], "deny");
+    }
+
+    #[test]
+    fn the_logged_denial_keeps_unknown_fields_present_and_empty() {
+        // A parser must never have to handle a missing key, so an absent
+        // port or hostname is the empty string rather than an omission.
+        let denial = PolicyDenial::to_domain(Protocol::Udp, "blocked.example", None);
+
+        let logged = logged_denial(&denial);
+        let fields = &logged["fields"];
+
+        assert_eq!(fields["target_kind"], "domain");
+        assert_eq!(fields["target"], "blocked.example");
+        assert_eq!(fields["port"], "");
+        assert_eq!(fields["hostname"], "");
+    }
+
+    #[test]
+    fn the_logging_observer_reports_a_denial_from_the_evaluation_path() {
+        // The wiring, not just the formatting: a denial decided by the
+        // policy engine reaches the log when this observer is installed.
+        let shared = SharedState::new(4);
+        shared.set_policy_observer(Arc::new(LoggingPolicyObserver));
+
+        let action = NetworkPolicy::none().evaluate_egress(dst(443), Protocol::Tcp, &shared);
+
+        assert_eq!(action, Action::Deny);
     }
 
     #[test]

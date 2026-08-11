@@ -16,7 +16,7 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::backend::SmoltcpBackend;
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
-use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::policy::{LoggingPolicyObserver, NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 use crate::stack::{self, GatewayIps, PollLoopConfig};
@@ -227,6 +227,11 @@ impl SmoltcpNetwork {
             .unwrap_or(DEFAULT_QUEUE_CAPACITY)
             .max(DEFAULT_QUEUE_CAPACITY);
         let shared = Arc::new(SharedState::new(queue_capacity));
+        // Installed unconditionally: a denial is only observable outside this
+        // process through the log, and a supervising daemon reading the
+        // runtime's output cannot install an observer of its own. An embedder
+        // that wants the denials programmatically replaces this one.
+        shared.set_policy_observer(Arc::new(LoggingPolicyObserver));
         let backend = SmoltcpBackend::new(shared.clone());
 
         let secrets = SecretsHandle::new(config.secrets.clone());

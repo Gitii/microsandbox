@@ -17,5 +17,8 @@ mod types;
 pub use builder::{BuildError, NetworkPolicyBuilder, RuleBuilder, RuleDestinationBuilder};
 pub use destination::*;
 pub use name::{DomainName, DomainNameError};
-pub use observer::{DenialTarget, PolicyDenial, PolicyObserver};
+pub use observer::{
+    DENIAL_LOG_EVENT, DENIAL_LOG_TARGET, DenialTarget, LoggingPolicyObserver, PolicyDenial,
+    PolicyObserver,
+};
 pub use types::*;

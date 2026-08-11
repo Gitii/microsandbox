@@ -76,3 +76,4 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Netwo
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
