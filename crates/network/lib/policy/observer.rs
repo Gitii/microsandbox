@@ -85,6 +85,11 @@ pub trait PolicyObserver: Send + Sync {
 /// Fields are always present; unknown values are logged as the empty
 /// string rather than omitted, so a parser never has to handle a missing
 /// key. The timestamp is supplied by the subscriber, not by this event.
+///
+/// `WARN` is chosen so the line survives the sandbox subprocess's default
+/// filter, which is `INFO` — that subprocess is where the network stack
+/// runs and its stderr is captured into `runtime.log`, so a denial reaches
+/// the file a host consumer reads without anyone passing a verbosity flag.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoggingPolicyObserver;
 
@@ -101,7 +106,9 @@ impl PolicyObserver for LoggingPolicyObserver {
             direction = direction_label(denial.direction),
             protocol = protocol_label(denial.protocol),
             target_kind = target_kind,
-            target = %target,
+            // Recorded as a string, not via `%`, so the text layer quotes it
+            // like every other field rather than emitting it bare.
+            target = target.as_str(),
             port = denial.port.map(|p| p.to_string()).unwrap_or_default(),
             hostname = denial.hostname.as_deref().unwrap_or_default(),
             verdict = "deny",
@@ -291,30 +298,31 @@ mod tests {
         assert_eq!(denials[0].port, Some(8080));
     }
 
+    /// In-memory writer the format tests point a subscriber at.
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     /// Capture the JSON the logging observer writes for one denial.
     fn logged_denial(denial: &PolicyDenial) -> serde_json::Value {
-        #[derive(Clone, Default)]
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Buffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -328,6 +336,53 @@ mod tests {
 
         let line = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         serde_json::from_str(line.trim()).expect("the denial log line is not valid JSON")
+    }
+
+    /// Capture the default text layer's rendering of one denial.
+    fn logged_denial_text(denial: &PolicyDenial) -> String {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            LoggingPolicyObserver.on_denied(denial);
+        });
+
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn the_text_layer_renders_every_field_as_a_quoted_key_value_pair() {
+        // The sandbox subprocess logs through the default text layer, so
+        // this — not the JSON rendering — is what a consumer reading
+        // `runtime.log` actually parses.
+        let denial = PolicyDenial::to_address(
+            Direction::Egress,
+            Protocol::Tcp,
+            Ipv4Addr::new(1, 2, 3, 4).into(),
+            Some(443),
+        )
+        .with_hostname(Some("example.com".to_owned()));
+
+        let line = logged_denial_text(&denial);
+
+        assert!(line.contains(DENIAL_LOG_TARGET), "{line}");
+        assert!(line.contains(" WARN "), "{line}");
+        for pair in [
+            r#"event="network_policy_denied""#,
+            r#"direction="egress""#,
+            r#"protocol="tcp""#,
+            r#"target_kind="address""#,
+            r#"target="1.2.3.4""#,
+            r#"port="443""#,
+            r#"hostname="example.com""#,
+            r#"verdict="deny""#,
+        ] {
+            assert!(line.contains(pair), "missing {pair} in {line}");
+        }
     }
 
     #[test]
