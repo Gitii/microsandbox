@@ -102,6 +102,13 @@ pub struct MetricsHandle {
     shared: Arc<SharedState>,
 }
 
+/// Handle for flushing the policy-denial observer on the runtime's
+/// synchronous shutdown path, where the observer's `Drop` never runs.
+#[derive(Clone)]
+pub struct PolicyDenialFlushHandle {
+    shared: Arc<SharedState>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -402,6 +409,13 @@ impl SmoltcpNetwork {
         }
     }
 
+    /// Create a handle for flushing the policy-denial observer at shutdown.
+    pub fn policy_flush_handle(&self) -> PolicyDenialFlushHandle {
+        PolicyDenialFlushHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// Live-swappable view of the secrets configuration. The runtime control
     /// socket uses it to apply secret rotation, removal, and allowed-host
     /// updates without restarting the sandbox.
@@ -414,6 +428,13 @@ impl TerminationHandle {
     /// Install the termination hook.
     pub fn set_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.shared.set_termination_hook(hook);
+    }
+}
+
+impl PolicyDenialFlushHandle {
+    /// Flush the policy-denial observer's pending state.
+    pub fn flush(&self) {
+        self.shared.flush_policy_observer();
     }
 }
 

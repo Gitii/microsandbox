@@ -196,6 +196,18 @@ impl SharedState {
         }
     }
 
+    /// Flush the installed policy observer's pending state, if any.
+    ///
+    /// Called on the runtime's synchronous shutdown path, where a batching
+    /// observer's `Drop` never runs — the sandbox process leaves via
+    /// `_exit`. No-op when no observer is installed.
+    pub fn flush_policy_observer(&self) {
+        let observer = self.policy_observer.read().clone();
+        if let Some(observer) = observer {
+            observer.flush();
+        }
+    }
+
     /// Replace the resolved addresses for a hostname within the given address family.
     pub fn cache_resolved_hostname(
         &self,

@@ -634,6 +634,14 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_metrics_writer = metrics_writer.clone();
     let exit_cpu_guard = Arc::clone(&cpu_guard);
     let exit_writeback_guard = Arc::clone(&writeback_guard);
+    // Slot the exit hook reads to flush pending policy-denial tallies. The
+    // network installs the flush into it once built; the hook runs it on the
+    // synchronous teardown path, where the observer's Drop never fires
+    // because the sandbox process leaves via `_exit`. Type-erased so this
+    // stays free of the `net` feature gate.
+    let policy_flush_slot: Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let exit_policy_flush = Arc::clone(&policy_flush_slot);
     #[cfg(windows)]
     let _agent_console_pipe_bridge = AgentConsolePipeBridge::spawn(
         agent_console_pipe_name(config.sandbox_id),
@@ -742,12 +750,21 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 tracing::debug!(error = %err, slot = writer.slot(), "metrics slot release at exit");
             }
 
+            // Flush any pending policy-denial tallies to runtime.log. The
+            // observer batches denials to rate-limit them, and its Drop never
+            // runs here — _exit() bypasses destructors — so this hook is the
+            // only place a destination's trailing denials reach the log.
+            if let Some(flush) = exit_policy_flush.get() {
+                flush();
+            }
+
             // Clean up agent.sock — the relay's async cleanup won't run because
             // _exit() is called immediately after this observer returns.
             let _ = std::fs::remove_file(&exit_sock_path);
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
+        policy_flush_slot,
     );
     let (
         vm,
@@ -1234,6 +1251,10 @@ fn build_vm(
     on_exit: impl Fn(i32) + Send + 'static,
     tokio_handle: tokio::runtime::Handle,
     vcpu_targets: Option<&[crate::cpu::LogicalCpuId]>,
+    // Populated with the network's policy-denial flush once the stack is
+    // built, for the exit hook to run at teardown. Unused without the `net`
+    // feature or when networking is disabled.
+    _policy_flush_slot: Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>,
 ) -> RuntimeResult<VmBuildOutput> {
     let mut exec_env = config.vm.env.clone();
     let vm = &config.vm;
@@ -1490,6 +1511,11 @@ fn build_vm(
         .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
+        // Hand the exit hook a way to flush the policy-denial observer at
+        // teardown; the observer's Drop never runs under the runtime's
+        // `_exit` path.
+        let flush_handle = network.policy_flush_handle();
+        let _ = _policy_flush_slot.set(Box::new(move || flush_handle.flush()));
         // Only sandboxes that booted with secrets can be live-reconfigured:
         // new placeholders cannot be introduced into a running guest, so a
         // secret-free boot never needs the secrets side of the control socket.

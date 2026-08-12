@@ -72,6 +72,16 @@ pub struct PolicyDenial {
 pub trait PolicyObserver: Send + Sync {
     /// Called once per denied evaluation.
     fn on_denied(&self, denial: &PolicyDenial);
+
+    /// Emit anything the observer is still holding.
+    ///
+    /// An observer that batches — as [`LoggingPolicyObserver`] does, to rate
+    /// limit — must report its pending state here, because the shipped
+    /// runtime tears the network down along a path that never drops it: the
+    /// sandbox process leaves via `_exit`, which runs no destructors. The
+    /// runtime calls this from its synchronous exit hook. The default is a
+    /// no-op, for an observer that holds nothing.
+    fn flush(&self) {}
 }
 
 /// Observer that writes each denial to the runtime's log output as a
@@ -134,8 +144,11 @@ pub trait PolicyObserver: Send + Sync {
 /// itself — at most once per [`SUPPRESSION_WINDOW`], so the flood path stays
 /// a hash lookup rather than a scan of the map. A tally therefore ships on
 /// the next denial *anywhere*, not on the next denial of its own
-/// destination. If the guest stops being denied entirely, [`Drop`] flushes
-/// what is left when the network shuts down.
+/// destination. If the guest stops being denied entirely, nothing swept the
+/// last tally out — so [`PolicyObserver::flush`] ships it, called by the
+/// runtime from the synchronous exit hook it runs before `_exit`. That hook,
+/// not [`Drop`], is the shipped teardown path: the sandbox process exits via
+/// `_exit`, which runs no destructors at all.
 #[derive(Debug, Default)]
 pub struct LoggingPolicyObserver {
     /// Rate-limiter state. One lock: `on_denied` touches all of it, and a
@@ -244,6 +257,10 @@ impl PolicyObserver for LoggingPolicyObserver {
             );
         }
     }
+
+    fn flush(&self) {
+        self.flush_pending();
+    }
 }
 
 impl LoggingPolicyObserver {
@@ -324,10 +341,14 @@ impl LoggingPolicyObserver {
         lines
     }
 
-    /// Emit whatever the limiter is still holding. Called from [`Drop`], so
-    /// a sandbox that stops being denied and then shuts down still reports
-    /// its last tallies.
-    fn flush(&self) {
+    /// Emit whatever the limiter is still holding.
+    ///
+    /// Reached through the [`PolicyObserver::flush`] trait method, which the
+    /// runtime calls from its synchronous exit hook — the shipped teardown
+    /// leaves via `_exit` and never drops the observer. Also called from
+    /// [`Drop`], which covers the tests and any embedder that does let the
+    /// value drop, but is not what the runtime relies on.
+    fn flush_pending(&self) {
         let mut state = self.state.lock().unwrap();
         let mut lines: Vec<Line> = state
             .recent
@@ -439,8 +460,12 @@ impl LimiterState {
 }
 
 impl Drop for LoggingPolicyObserver {
+    /// A backstop for the tests and for embedders that drop the observer
+    /// normally. The shipped runtime does **not** reach this — its sandbox
+    /// process exits via `_exit`, which runs no destructors — so it flushes
+    /// through [`PolicyObserver::flush`] on its exit hook instead.
     fn drop(&mut self) {
-        self.flush();
+        self.flush_pending();
     }
 }
 
@@ -895,15 +920,26 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_observer_flushes_what_is_left() {
+    fn the_shutdown_flush_reports_what_is_left_without_dropping_the_observer() {
         // Nothing sweeps once the guest stops being denied entirely, so
-        // shutdown is the last chance to report.
-        let observer = LoggingPolicyObserver::default();
-        let denial = tcp_denial(443);
+        // shutdown is the last chance to report. The shipped runtime reaches
+        // that flush through the observer trait on a `SharedState` — its
+        // sandbox process exits via `_exit`, so a test that relied on `Drop`
+        // would be green exactly where the runtime is broken. Drive the real
+        // path: install on a `SharedState`, deny, then call the same flush
+        // the exit hook calls, and hold the `Arc` across it so nothing is
+        // dropped.
+        let shared = SharedState::new(4);
+        let observer = Arc::new(LoggingPolicyObserver::default());
+        shared.set_policy_observer(observer.clone());
 
-        admitted(&observer, &denial, "1.2.3.4");
-        for _ in 0..4 {
-            admitted(&observer, &denial, "1.2.3.4");
+        // Five denials of one destination: one line, four swallowed.
+        let dst = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 443));
+        for _ in 0..5 {
+            assert_eq!(
+                NetworkPolicy::none().evaluate_egress(dst, Protocol::Tcp, &shared),
+                Action::Deny
+            );
         }
 
         let buffer = Buffer::default();
@@ -912,7 +948,10 @@ mod tests {
             .with_writer(buffer.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        tracing::subscriber::with_default(subscriber, || drop(observer));
+        tracing::subscriber::with_default(subscriber, || shared.flush_policy_observer());
+
+        // The observer is still alive: the flush did not depend on a drop.
+        assert_eq!(Arc::strong_count(&observer), 2);
 
         let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(logged.contains(DENIAL_FLUSH_EVENT), "{logged}");
