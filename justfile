@@ -49,7 +49,7 @@ _install-dev-deps:
     set -euo pipefail
 
     echo "==> Installing system dependencies..."
-    sudo apt install build-essential musl-tools flex bison libelf-dev \
+    sudo apt install build-essential flex bison libelf-dev \
         python3-pyelftools pkg-config libcap-ng-dev pre-commit
 
     echo "==> Checking Rust toolchain..."
@@ -84,10 +84,12 @@ _install-dev-deps:
 # Build all binary dependencies (agentd + libkrunfw).
 build-deps: build-agentd build-libkrunfw
 
-# Build agentd as a static Linux/musl binary. Requires: musl-tools (apt) or musl-dev (apk).
+# rustup's musl target links self-contained: the crt objects and libc.a ship with
+# its rust-std and the host cc only drives the link, so musl-gcc is never invoked.
+# Installing one system-wide breaks host glibc linking under Nix.
+# Build agentd as a static Linux/musl binary. No system musl toolchain required.
 [linux]
 build-agentd:
-    @command -v musl-gcc >/dev/null || { echo "error: musl-gcc not found. Install your distro's musl toolchain."; exit 1; }
     rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
     cargo build --release --manifest-path crates/agentd/Cargo.toml --target-dir target --target x86_64-unknown-linux-musl
     mkdir -p build

@@ -16,7 +16,7 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::backend::SmoltcpBackend;
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
-use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::policy::{LoggingPolicyObserver, NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 use crate::stack::{self, GatewayIps, PollLoopConfig};
@@ -99,6 +99,13 @@ pub struct TerminationHandle {
 /// Read-only view of aggregate network byte counters.
 #[derive(Clone)]
 pub struct MetricsHandle {
+    shared: Arc<SharedState>,
+}
+
+/// Handle for flushing the policy-denial observer on the runtime's
+/// synchronous shutdown path, where the observer's `Drop` never runs.
+#[derive(Clone)]
+pub struct PolicyDenialFlushHandle {
     shared: Arc<SharedState>,
 }
 
@@ -227,6 +234,11 @@ impl SmoltcpNetwork {
             .unwrap_or(DEFAULT_QUEUE_CAPACITY)
             .max(DEFAULT_QUEUE_CAPACITY);
         let shared = Arc::new(SharedState::new(queue_capacity));
+        // Installed unconditionally: a denial is only observable outside this
+        // process through the log, and a supervising daemon reading the
+        // runtime's output cannot install an observer of its own. An embedder
+        // that wants the denials programmatically replaces this one.
+        shared.set_policy_observer(Arc::new(LoggingPolicyObserver::default()));
         let backend = SmoltcpBackend::new(shared.clone());
 
         let secrets = SecretsHandle::new(config.secrets.clone());
@@ -397,6 +409,13 @@ impl SmoltcpNetwork {
         }
     }
 
+    /// Create a handle for flushing the policy-denial observer at shutdown.
+    pub fn policy_flush_handle(&self) -> PolicyDenialFlushHandle {
+        PolicyDenialFlushHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// Live-swappable view of the secrets configuration. The runtime control
     /// socket uses it to apply secret rotation, removal, and allowed-host
     /// updates without restarting the sandbox.
@@ -409,6 +428,13 @@ impl TerminationHandle {
     /// Install the termination hook.
     pub fn set_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.shared.set_termination_hook(hook);
+    }
+}
+
+impl PolicyDenialFlushHandle {
+    /// Flush the policy-denial observer's pending state.
+    pub fn flush(&self) {
+        self.shared.flush_policy_observer();
     }
 }
 

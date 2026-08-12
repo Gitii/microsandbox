@@ -46,3 +46,7 @@ __pycache__/
 env/
 venv/
 .venv/
+
+# devbox / direnv
+.devbox/
+.direnv/

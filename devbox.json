@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": {
+    "rustup": "1.28.2",
+    "just": "1.42.4",
+    "pre-commit": "4.3.0",
+    "gcc": "14.3.0",
+    "gnumake": "4.4.1",
+    "pkg-config": "0.29.2",
+    "libcap_ng": {
+      "version": "0.8.5",
+      "outputs": ["out", "dev"]
+    },
+    "openssl": {
+      "version": "3.5.1",
+      "outputs": ["out", "dev"]
+    },
+    "elfutils": {
+      "version": "0.192",
+      "outputs": ["out", "dev"]
+    },
+    "flex": "2.6.4",
+    "bison": "3.8.2",
+    "bc": "1.08.1",
+    "python": "3.13.14",
+    "python313Packages.pyelftools": "0.32",
+    "patch": "2.8",
+    "xz": "5.8.1",
+    "perl": "5.40.0",
+    "git": "2.50.1"
+  },
+  "env": {
+    "RUSTUP_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/rustup",
+    "CARGO_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/cargo",
+    "RUST_TOOLCHAIN_VERSION": "1.94.0",
+    "PATH": "$DEVBOX_PROJECT_ROOT/.devbox/cargo/bin:$PATH"
+  },
+  "shell": {
+    "init_hook": [
+      "rustup toolchain list | grep -q \"^$RUST_TOOLCHAIN_VERSION-\" || rustup toolchain install \"$RUST_TOOLCHAIN_VERSION\" --profile minimal --component clippy --component rustfmt",
+      "rustup default \"$RUST_TOOLCHAIN_VERSION\" >/dev/null"
+    ]
+  }
+}

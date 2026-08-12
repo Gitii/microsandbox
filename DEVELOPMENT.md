@@ -17,6 +17,24 @@ For contribution guidelines (forking, commit signing, pull requests), see [CONTR
 - **Linux build backend** (macOS and Windows): Required for building the Linux guest `agentd` binary from non-Linux hosts and for building the libkrunfw kernel bundle when it has not already been generated. On Windows, Docker Desktop with Linux containers is preferred when available; Windows Server can use Ubuntu WSL instead.
 - **Rust**: Installed automatically by `just setup` if missing, or install via [rustup](https://rustup.rs)
 
+## Reproducible Environment with Devbox (Linux)
+
+Instead of installing the prerequisites system-wide, a Linux host can get every
+native tool from [devbox](https://www.jetify.com/devbox) (Nix), pinned at exact
+versions in [`devbox.json`](./devbox.json) and locked in `devbox.lock`:
+
+```bash
+devbox shell          # or: devbox run -- <command>
+```
+
+The shell provides `just`, `pre-commit`, `gcc`, `make`, `pkg-config`, `libcap_ng`,
+`openssl`, `elfutils`, `flex`, `bison`, `bc`, `python` with `pyelftools`, `patch`,
+`xz`, `perl` and `git` — the toolchain the CLI, the guest `agentd` and the
+libkrunfw kernel build need. Rust comes from a project-local `rustup` under
+`.devbox/`, pinned by `RUST_TOOLCHAIN_VERSION` in `devbox.json`; nothing is
+written outside the repository. With [direnv](https://direnv.net), the checked-in
+`.envrc` activates it on `cd`.
+
 ## Initial Setup
 
 Clone the repository and run the one-time setup:

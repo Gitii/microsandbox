@@ -860,11 +860,16 @@ fn handle_gateway_icmp_echo(
     let tenant_denied = network_policy
         .evaluate_egress_ip(reply.dst, reply.protocol, shared)
         .is_deny();
-    let platform_denied = platform_policy.is_some_and(|policy| {
-        policy
-            .evaluate_egress_ip(reply.dst, reply.protocol, shared)
-            .is_deny()
-    });
+    // Only consulted when the tenant policy allowed, so that a packet both
+    // policies deny is evaluated once and reported to the policy observer
+    // once. The other three platform-floor sites already short-circuit this
+    // way; this one did not, and double-counted the denial.
+    let platform_denied = !tenant_denied
+        && platform_policy.is_some_and(|policy| {
+            policy
+                .evaluate_egress_ip(reply.dst, reply.protocol, shared)
+                .is_deny()
+        });
     if tenant_denied || platform_denied {
         tracing::debug!(
             dst = %reply.dst,
