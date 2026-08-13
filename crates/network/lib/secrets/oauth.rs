@@ -30,7 +30,6 @@ pub(crate) struct OAuthConnection {
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
     exchanges: VecDeque<Option<usize>>,
-    token_host: bool,
 }
 
 struct LoadedGrant {
@@ -110,9 +109,6 @@ impl OAuthConnection {
             });
         }
         Ok(Self {
-            token_host: grants
-                .iter()
-                .any(|grant| grant.endpoint_host.eq_ignore_ascii_case(sni)),
             grants,
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
@@ -122,10 +118,6 @@ impl OAuthConnection {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.grants.is_empty()
-    }
-
-    pub(crate) fn is_token_host(&self) -> bool {
-        self.token_host
     }
 
     /// Transform complete HTTP/1.1 requests and record token exchanges.
@@ -180,18 +172,32 @@ impl OAuthConnection {
                 grant.generation = loaded.generation;
                 grant.lease = Some(lease);
             }
-            for (index, grant) in self.grants.iter().enumerate() {
+            for (index, grant) in self.grants.iter_mut().enumerate() {
                 let inject = grant
                     .config
                     .inject_hosts
                     .iter()
                     .any(|host| host.matches(sni));
+                if inject && token_grant != Some(index) {
+                    let loaded = broker_load(&grant.config).await?;
+                    grant.access = Zeroizing::new(loaded.access);
+                    grant.refresh = Zeroizing::new(loaded.refresh);
+                    grant.generation = loaded.generation;
+                }
                 if inject || token_grant == Some(index) {
-                    rewritten = replace_all(
-                        &rewritten,
-                        grant.config.access_sentinel.as_bytes(),
-                        grant.access.as_bytes(),
-                    );
+                    rewritten = if inject && token_grant != Some(index) {
+                        replace_bearer_header(
+                            &rewritten,
+                            grant.config.access_sentinel.as_bytes(),
+                            grant.access.as_bytes(),
+                        )
+                    } else {
+                        replace_all(
+                            &rewritten,
+                            grant.config.access_sentinel.as_bytes(),
+                            grant.access.as_bytes(),
+                        )
+                    };
                 }
                 if token_grant == Some(index) {
                     rewritten = replace_all(
@@ -230,14 +236,25 @@ impl OAuthConnection {
                 io::Error::new(io::ErrorKind::InvalidData, "OAuth response without request")
             })?;
             let response = self.response_buffer[..total_len].to_vec();
+            let status = response_status(&headers)?;
+            if (100..200).contains(&status) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OAuth informational responses are unsupported",
+                ));
+            }
             let rewritten = match exchange {
-                Some(index) if successful_response(&headers)? => {
+                Some(index) if (200..300).contains(&status) => {
                     self.sanitize_token_response(index, &headers, &body).await?
                 }
-                Some(index) => self.sanitize_token_error(index, &headers, &body)?,
+                Some(index) => {
+                    let rewritten = self.sanitize_token_error(index, &headers, &body)?;
+                    self.grants[index].lease = None;
+                    rewritten
+                }
                 _ => response,
             };
-            output.extend_from_slice(&rewritten);
+            output.extend_from_slice(&self.scrub_tokens(rewritten));
             self.response_buffer.drain(..total_len);
         }
         Ok(output)
@@ -323,6 +340,22 @@ impl OAuthConnection {
             grant.config.refresh_sentinel.as_bytes(),
         );
         update_content_length(&response)
+    }
+
+    fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
+        for grant in &self.grants {
+            response = replace_all(
+                &response,
+                grant.access.as_bytes(),
+                grant.config.access_sentinel.as_bytes(),
+            );
+            response = replace_all(
+                &response,
+                grant.refresh.as_bytes(),
+                grant.config.refresh_sentinel.as_bytes(),
+            );
+        }
+        response
     }
 }
 
@@ -488,6 +521,28 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> {
+    let marker = [b"authorization: bearer ".as_slice(), sentinel].concat();
+    let marker = marker
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let Some(start) = lower
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
+        return data.to_vec();
+    };
+    let value_start = start + b"authorization: bearer ".len();
+    let mut output = data.to_vec();
+    output.splice(
+        value_start..value_start + sentinel.len(),
+        token.iter().copied(),
+    );
+    output
+}
+
 fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
     let Some(boundary) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
         return Ok(None);
@@ -538,6 +593,16 @@ fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
 
 fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    if text.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue")
+        })
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth Expect: 100-continue is unsupported",
+        ));
+    }
     let supported = text.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.eq_ignore_ascii_case("content-type")
@@ -555,14 +620,14 @@ fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
     })
 }
 
-fn successful_response(headers: &[u8]) -> io::Result<bool> {
+fn response_status(headers: &[u8]) -> io::Result<u16> {
     let status = first_header_line(headers)?
         .split_whitespace()
         .nth(1)
         .ok_or_else(invalid_http)?
         .parse::<u16>()
         .map_err(|_| invalid_http())?;
-    Ok((200..300).contains(&status))
+    Ok(status)
 }
 
 fn first_header_line(headers: &[u8]) -> io::Result<&str> {
@@ -674,7 +739,6 @@ mod tests {
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
-            token_host: true,
         }
     }
 
@@ -692,8 +756,31 @@ mod tests {
 
     #[tokio::test]
     async fn substitutes_access_only_on_inject_host() {
+        let socket = std::env::temp_dir().join(format!(
+            "msb-oauth-load-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = tokio::spawn(async move {
+            for _ in 0..1 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                stream
+                    .get_mut()
+                    .write_all(
+                        b"{\"access\":\"real-access\",\"refresh\":\"real-refresh\",\"generation\":4}\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
         let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
-        let output = connection()
+        let mut allowed = connection();
+        allowed.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
+        let output = allowed
             .transform_requests(request, "api.example.com")
             .await
             .unwrap();
@@ -703,7 +790,9 @@ mod tests {
                 .contains("Bearer real-access")
         );
 
-        let output = connection()
+        let mut denied = connection();
+        denied.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
+        let output = denied
             .transform_requests(request, "evil.example.com")
             .await
             .unwrap();
@@ -712,6 +801,8 @@ mod tests {
                 .unwrap()
                 .contains("$MSB_OAUTH_ACCESS_123")
         );
+        broker.await.unwrap();
+        std::fs::remove_file(socket).ok();
     }
 
     #[tokio::test]
@@ -915,6 +1006,34 @@ mod tests {
         assert!(!output.contains("real-refresh"));
     }
 
+    #[test]
+    fn api_response_echoes_are_scrubbed() {
+        let connection = connection();
+        let output = connection.scrub_tokens(b"echoed real-access and real-refresh".to_vec());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(output.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(!output.contains("real-access"));
+        assert!(!output.contains("real-refresh"));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_releases_lease() {
+        let mut connection = connection();
+        connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
+        connection.exchanges.push_back(Some(0));
+        let body = r#"{"error":"invalid_grant"}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        connection
+            .transform_responses(response.as_bytes())
+            .await
+            .unwrap();
+        assert!(connection.grants[0].lease.is_none());
+    }
+
     #[tokio::test]
     async fn shared_endpoint_selects_the_grant_whose_sentinel_is_present() {
         let first = config();
@@ -927,7 +1046,6 @@ mod tests {
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
-            token_host: true,
         };
         connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
         let body = "refresh_token=$OTHER_REFRESH";

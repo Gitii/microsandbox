@@ -392,7 +392,7 @@ pub(crate) async fn intercept_relay(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        let data = if oauth.is_token_host() {
+                    let data = if !oauth.is_empty() {
                             oauth.transform_responses(&server_buf[..n]).await?
                         } else {
                             server_buf[..n].to_vec()
