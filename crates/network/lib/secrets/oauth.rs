@@ -2,13 +2,12 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use super::config::OAuthSecret;
@@ -18,6 +17,8 @@ use super::config::OAuthSecret;
 //--------------------------------------------------------------------------------------------------
 
 const MAX_OAUTH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BROKER_RESPONSE_BYTES: u64 = 1024 * 1024;
+const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -39,6 +40,7 @@ struct LoadedGrant {
     access: Zeroizing<String>,
     refresh: Zeroizing<String>,
     generation: u64,
+    lease: Option<UnixStream>,
 }
 
 #[derive(Serialize)]
@@ -47,11 +49,16 @@ enum BrokerRequest<'a> {
     Load {
         grant_id: &'a str,
     },
+    Acquire {
+        grant_id: &'a str,
+    },
     Commit {
         grant_id: &'a str,
         generation: u64,
         access: &'a str,
         refresh: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
     },
 }
 
@@ -99,6 +106,7 @@ impl OAuthConnection {
                 access: Zeroizing::new(loaded.access),
                 refresh: Zeroizing::new(loaded.refresh),
                 generation: loaded.generation,
+                lease: None,
             });
         }
         Ok(Self {
@@ -121,7 +129,11 @@ impl OAuthConnection {
     }
 
     /// Transform complete HTTP/1.1 requests and record token exchanges.
-    pub(crate) fn transform_requests(&mut self, data: &[u8], sni: &str) -> io::Result<Vec<u8>> {
+    pub(crate) async fn transform_requests(
+        &mut self,
+        data: &[u8],
+        sni: &str,
+    ) -> io::Result<Vec<u8>> {
         self.request_buffer.extend_from_slice(data);
         enforce_limit(&self.request_buffer)?;
         let mut output = Vec::new();
@@ -135,10 +147,39 @@ impl OAuthConnection {
                 .split_whitespace()
                 .nth(1)
                 .ok_or_else(invalid_http)?;
-            let token_grant = self.grants.iter().position(|grant| {
-                grant.endpoint_host.eq_ignore_ascii_case(sni) && grant.endpoint_target == target
-            });
+            let endpoint_grants = self
+                .grants
+                .iter()
+                .enumerate()
+                .filter(|(_, grant)| {
+                    grant.endpoint_host.eq_ignore_ascii_case(sni) && grant.endpoint_target == target
+                })
+                .collect::<Vec<_>>();
+            let matching_grants = endpoint_grants
+                .iter()
+                .filter(|(_, grant)| {
+                    contains_bytes(request, grant.config.access_sentinel.as_bytes())
+                        || contains_bytes(request, grant.config.refresh_sentinel.as_bytes())
+                })
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>();
+            let token_grant = match matching_grants.as_slice() {
+                [index] => Some(*index),
+                [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
+                [] => None,
+                _ => return Err(invalid_http()),
+            };
             let mut rewritten = request.to_vec();
+            if let Some(index) = token_grant
+                && self.grants[index].lease.is_none()
+            {
+                let (loaded, lease) = broker_acquire(&self.grants[index].config).await?;
+                let grant = &mut self.grants[index];
+                grant.access = Zeroizing::new(loaded.access);
+                grant.refresh = Zeroizing::new(loaded.refresh);
+                grant.generation = loaded.generation;
+                grant.lease = Some(lease);
+            }
             for (index, grant) in self.grants.iter().enumerate() {
                 let inject = grant
                     .config
@@ -234,10 +275,21 @@ impl OAuthConnection {
             }
             None => grant.refresh.to_string(),
         };
-        let generation = broker_commit(grant, &access, &refresh).await?;
+        let expires_at = object
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .map(|seconds| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+                    + seconds.saturating_mul(1000)
+            });
+        let generation = broker_commit(grant, &access, &refresh, expires_at).await?;
         grant.access = Zeroizing::new(access);
         grant.refresh = Zeroizing::new(refresh);
         grant.generation = generation;
+        grant.lease = None;
         object.insert(
             grant.config.access_token_field.clone(),
             Value::String(grant.config.access_sentinel.clone()),
@@ -259,28 +311,18 @@ impl OAuthConnection {
         body: &[u8],
     ) -> io::Result<Vec<u8>> {
         let grant = &self.grants[index];
-        let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
-            return rebuild_message(headers, body);
-        };
-        let Some(object) = json.as_object_mut() else {
-            return rebuild_message(headers, body);
-        };
-        if object.contains_key(&grant.config.access_token_field) {
-            object.insert(
-                grant.config.access_token_field.clone(),
-                Value::String(grant.config.access_sentinel.clone()),
-            );
-        }
-        if object.contains_key(&grant.config.refresh_token_field) {
-            object.insert(
-                grant.config.refresh_token_field.clone(),
-                Value::String(grant.config.refresh_sentinel.clone()),
-            );
-        }
-        rebuild_message(
-            headers,
-            &serde_json::to_vec(&json).map_err(io::Error::other)?,
-        )
+        let mut response = [headers, body].concat();
+        response = replace_all(
+            &response,
+            grant.access.as_bytes(),
+            grant.config.access_sentinel.as_bytes(),
+        );
+        response = replace_all(
+            &response,
+            grant.refresh.as_bytes(),
+            grant.config.refresh_sentinel.as_bytes(),
+        );
+        update_content_length(&response)
     }
 }
 
@@ -298,11 +340,6 @@ pub(crate) fn ensure_sentinels(oauth: &mut OAuthSecret) {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-fn broker_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 async fn broker_load(config: &OAuthSecret) -> io::Result<LoadResponse> {
     broker_call(
         &config.broker_endpoint,
@@ -313,14 +350,38 @@ async fn broker_load(config: &OAuthSecret) -> io::Result<LoadResponse> {
     .await
 }
 
-async fn broker_commit(grant: &LoadedGrant, access: &str, refresh: &str) -> io::Result<u64> {
-    let response: CommitResponse = broker_call(
-        &grant.config.broker_endpoint,
+async fn broker_acquire(config: &OAuthSecret) -> io::Result<(LoadResponse, UnixStream)> {
+    let mut stream = broker_connect(
+        &config.broker_endpoint,
+        &BrokerRequest::Acquire {
+            grant_id: &config.grant_id,
+        },
+    )
+    .await?;
+    let response = broker_read(&mut stream).await?;
+    Ok((response, stream))
+}
+
+async fn broker_commit(
+    grant: &mut LoadedGrant,
+    access: &str,
+    refresh: &str,
+    expires_at: Option<u64>,
+) -> io::Result<u64> {
+    let stream = grant.lease.as_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth grant has no refresh lease",
+        )
+    })?;
+    let response: CommitResponse = broker_exchange(
+        stream,
         &BrokerRequest::Commit {
             grant_id: &grant.config.grant_id,
             generation: grant.generation,
             access,
             refresh,
+            expires_at,
         },
     )
     .await?;
@@ -342,20 +403,60 @@ async fn broker_call<T: for<'de> Deserialize<'de>>(
     endpoint: &str,
     request: &BrokerRequest<'_>,
 ) -> io::Result<T> {
-    let _guard = broker_lock().lock().await;
-    let mut stream = UnixStream::connect(endpoint).await?;
+    let mut stream = broker_connect(endpoint, request).await?;
+    broker_read(&mut stream).await
+}
+
+async fn broker_connect(endpoint: &str, request: &BrokerRequest<'_>) -> io::Result<UnixStream> {
+    tokio::time::timeout(BROKER_TIMEOUT, async {
+        let mut stream = UnixStream::connect(endpoint).await?;
+        broker_write(&mut stream, request).await?;
+        Ok::<_, io::Error>(stream)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OAuth broker timed out"))?
+}
+
+async fn broker_exchange<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    request: &BrokerRequest<'_>,
+) -> io::Result<T> {
+    tokio::time::timeout(BROKER_TIMEOUT, async {
+        broker_write(stream, request).await?;
+        broker_read(stream).await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OAuth broker timed out"))?
+}
+
+async fn broker_write(stream: &mut UnixStream, request: &BrokerRequest<'_>) -> io::Result<()> {
     let mut line = serde_json::to_vec(request).map_err(io::Error::other)?;
     line.push(b'\n');
-    stream.write_all(&line).await?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
-    if response.len() > 1024 * 1024 || !response.ends_with('\n') {
+    stream.write_all(&line).await
+}
+
+async fn broker_read<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io::Result<T> {
+    let response = tokio::time::timeout(BROKER_TIMEOUT, async {
+        let mut response = String::new();
+        BufReader::new(&mut *stream)
+            .take(MAX_BROKER_RESPONSE_BYTES + 1)
+            .read_line(&mut response)
+            .await?;
+        Ok::<_, io::Error>(response)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OAuth broker timed out"))??;
+    parse_broker_response(&response)
+}
+
+fn parse_broker_response<T: for<'de> Deserialize<'de>>(response: &str) -> io::Result<T> {
+    if response.len() as u64 > MAX_BROKER_RESPONSE_BYTES || !response.ends_with('\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid OAuth broker response",
         ));
     }
-    serde_json::from_str(&response).map_err(|_| {
+    serde_json::from_str(response).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "malformed OAuth broker response",
@@ -378,6 +479,13 @@ fn parse_https_endpoint(endpoint: &str) -> io::Result<(String, String)> {
         ));
     }
     Ok((host.to_ascii_lowercase(), format!("/{target}")))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
@@ -562,14 +670,7 @@ mod tests {
 
     fn connection() -> OAuthConnection {
         OAuthConnection {
-            grants: vec![LoadedGrant {
-                config: config(),
-                endpoint_host: "auth.example.com".into(),
-                endpoint_target: "/oauth/token".into(),
-                access: Zeroizing::new("real-access".into()),
-                refresh: Zeroizing::new("real-refresh".into()),
-                generation: 4,
-            }],
+            grants: vec![loaded(config())],
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
@@ -577,11 +678,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn substitutes_access_only_on_inject_host() {
+    fn loaded(config: OAuthSecret) -> LoadedGrant {
+        LoadedGrant {
+            config,
+            endpoint_host: "auth.example.com".into(),
+            endpoint_target: "/oauth/token".into(),
+            access: Zeroizing::new("real-access".into()),
+            refresh: Zeroizing::new("real-refresh".into()),
+            generation: 4,
+            lease: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn substitutes_access_only_on_inject_host() {
         let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
         let output = connection()
             .transform_requests(request, "api.example.com")
+            .await
             .unwrap();
         assert!(
             String::from_utf8(output)
@@ -591,6 +705,7 @@ mod tests {
 
         let output = connection()
             .transform_requests(request, "evil.example.com")
+            .await
             .unwrap();
         assert!(
             String::from_utf8(output)
@@ -599,15 +714,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_json_request_replaces_both_sentinels_and_length() {
+    #[tokio::test]
+    async fn token_json_request_replaces_both_sentinels_and_length() {
         let body = r#"{"access":"$MSB_OAUTH_ACCESS_123","refresh":"$MSB_OAUTH_REFRESH_123"}"#;
         let request = format!(
             "POST /oauth/token HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        let output = connection()
+        let mut connection = connection();
+        connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
+        let output = connection
             .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
             .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("real-access"));
@@ -615,15 +733,18 @@ mod tests {
         assert!(!output.contains("$MSB_OAUTH_"));
     }
 
-    #[test]
-    fn token_form_request_replaces_refresh_sentinel() {
+    #[tokio::test]
+    async fn token_form_request_replaces_refresh_sentinel() {
         let body = "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123";
         let request = format!(
             "POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        let output = connection()
+        let mut connection = connection();
+        connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
+        let output = connection
             .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
             .unwrap();
         assert!(
             String::from_utf8(output)
@@ -632,12 +753,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_token_endpoint_does_not_match_other_path() {
+    #[tokio::test]
+    async fn exact_token_endpoint_does_not_match_other_path() {
         let request = b"POST /oauth/token/other HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let mut connection = connection();
         connection
             .transform_requests(request, "auth.example.com")
+            .await
             .unwrap();
         assert_eq!(connection.exchanges.pop_front(), Some(None));
     }
@@ -706,8 +828,22 @@ mod tests {
                 .unwrap();
 
             let (stream, _) = listener.accept().await.unwrap();
-            let mut line = String::new();
+            line.clear();
             let mut stream = BufReader::new(stream);
+            stream.read_line(&mut line).await.unwrap();
+            let acquire: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                acquire,
+                serde_json::json!({"action":"acquire","grant_id":"opaque-grant"})
+            );
+            stream
+                .get_mut()
+                .write_all(
+                    b"{\"access\":\"old-access\",\"refresh\":\"old-refresh\",\"generation\":7}\n",
+                )
+                .await
+                .unwrap();
+            line.clear();
             stream.read_line(&mut line).await.unwrap();
             let commit: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(commit["action"], "commit");
@@ -734,6 +870,7 @@ mod tests {
         );
         let upstream = connection
             .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
             .unwrap();
         assert!(String::from_utf8(upstream).unwrap().contains("old-refresh"));
 
@@ -768,13 +905,41 @@ mod tests {
     fn error_response_token_fields_are_never_released() {
         let connection = connection();
         let headers = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n";
-        let body = br#"{"error":"invalid_grant","access_token":"leaked-access","refresh_token":"leaked-refresh"}"#;
+        let body = br#"{"error":"invalid_grant","error_description":"real-access and real-refresh","nested":{"access":"real-access"}}"#;
         let output = connection.sanitize_token_error(0, headers, body).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("invalid_grant"));
         assert!(output.contains("$MSB_OAUTH_ACCESS_123"));
         assert!(output.contains("$MSB_OAUTH_REFRESH_123"));
-        assert!(!output.contains("leaked-access"));
-        assert!(!output.contains("leaked-refresh"));
+        assert!(!output.contains("real-access"));
+        assert!(!output.contains("real-refresh"));
+    }
+
+    #[tokio::test]
+    async fn shared_endpoint_selects_the_grant_whose_sentinel_is_present() {
+        let first = config();
+        let mut second = config();
+        second.grant_id = "other-grant".into();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        let mut connection = OAuthConnection {
+            grants: vec![loaded(first), loaded(second)],
+            request_buffer: Vec::new(),
+            response_buffer: Vec::new(),
+            exchanges: VecDeque::new(),
+            token_host: true,
+        };
+        connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
+        let body = "refresh_token=$OTHER_REFRESH";
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let output = connection
+            .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("real-refresh"));
+        assert_eq!(connection.exchanges.pop_front(), Some(Some(1)));
     }
 }

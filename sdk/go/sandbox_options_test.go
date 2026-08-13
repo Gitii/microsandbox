@@ -679,12 +679,10 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 			t.Fatalf("%s = %v, want %q", key, grant[key], want)
 		}
 	}
-	wire, err := json.Marshal(got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(wire), "real-access") || strings.Contains(string(wire), "real-refresh") {
-		t.Fatalf("wire contains token material: %s", wire)
+	for _, forbidden := range []string{"access", "refresh", "value"} {
+		if _, ok := grant[forbidden]; ok {
+			t.Fatalf("OAuth wire has token-bearing field %q: %+v", forbidden, grant)
+		}
 	}
 }
 

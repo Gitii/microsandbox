@@ -481,7 +481,7 @@ async fn forward_plaintext(
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
-                let data = oauth.transform_requests(&data, sni)?;
+                let data = oauth.transform_requests(&data, sni).await?;
                 if !data.is_empty() {
                     server_tls.write_all(&data).await?;
                     wrote_plaintext = true;
