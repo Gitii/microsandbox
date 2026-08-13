@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ use tokio::net::UnixStream;
 use zeroize::Zeroizing;
 
 use super::config::OAuthSecret;
+use super::handler::host_pattern_allowed_for_tls;
+use crate::shared::SharedState;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -31,6 +34,8 @@ pub(crate) struct OAuthConnection {
     response_buffer: Vec<u8>,
     exchanges: VecDeque<Option<usize>>,
     token_host: bool,
+    response_scrub_tail: Vec<u8>,
+    seen_tokens: Vec<Zeroizing<String>>,
 }
 
 struct LoadedGrant {
@@ -89,16 +94,53 @@ struct HttpMessage<'a> {
 
 impl OAuthConnection {
     /// Load grants relevant to this TLS SNI. Broker failures reject the connection.
-    pub(crate) async fn new(configs: &[OAuthSecret], sni: &str) -> io::Result<Self> {
+    pub(crate) async fn new_tls_intercepted(
+        configs: &[OAuthSecret],
+        sni: &str,
+        guest_ip: IpAddr,
+        shared: &SharedState,
+    ) -> io::Result<Self> {
+        Self::new(configs, sni, Some((guest_ip, shared))).await
+    }
+
+    pub(crate) async fn new_tls_intercepted_via_connect(
+        configs: &[OAuthSecret],
+        sni: &str,
+    ) -> io::Result<Self> {
+        Self::new(configs, sni, None).await
+    }
+
+    async fn new(
+        configs: &[OAuthSecret],
+        sni: &str,
+        identity: Option<(IpAddr, &SharedState)>,
+    ) -> io::Result<Self> {
         let mut grants = Vec::new();
+        let mut seen_tokens = Vec::new();
         for config in configs {
             let (endpoint_host, endpoint_target) = parse_https_endpoint(&config.token_endpoint)?;
-            let relevant = endpoint_host.eq_ignore_ascii_case(sni)
-                || config.inject_hosts.iter().any(|host| host.matches(sni));
+            let host_allowed = |matches: bool| {
+                matches
+                    && identity.is_none_or(|(guest_ip, shared)| {
+                        shared.any_resolved_hostname(guest_ip, |hostname| {
+                            hostname.eq_ignore_ascii_case(sni)
+                        })
+                    })
+            };
+            let endpoint_relevant = host_allowed(endpoint_host.eq_ignore_ascii_case(sni));
+            let inject_relevant = config.inject_hosts.iter().any(|host| {
+                identity.map_or_else(
+                    || host.matches(sni),
+                    |(guest_ip, shared)| host_pattern_allowed_for_tls(host, sni, guest_ip, shared),
+                )
+            });
+            let relevant = endpoint_relevant || inject_relevant;
             if !relevant {
                 continue;
             }
             let loaded = broker_load(config).await?;
+            remember_token(&mut seen_tokens, &loaded.access);
+            remember_token(&mut seen_tokens, &loaded.refresh);
             grants.push(LoadedGrant {
                 config: config.clone(),
                 endpoint_host,
@@ -117,6 +159,8 @@ impl OAuthConnection {
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
+            response_scrub_tail: Vec::new(),
+            seen_tokens,
         })
     }
 
@@ -128,12 +172,26 @@ impl OAuthConnection {
         self.token_host
     }
 
-    pub(crate) fn scrub_response_chunk(&self, mut data: Vec<u8>) -> Vec<u8> {
-        for grant in &self.grants {
-            data = replace_same_length(&data, grant.access.as_bytes());
-            data = replace_same_length(&data, grant.refresh.as_bytes());
-        }
-        data
+    pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> Vec<u8> {
+        self.response_scrub_tail.extend_from_slice(data);
+        let keep = self
+            .seen_tokens
+            .iter()
+            .map(|token| token.len().saturating_sub(1))
+            .max()
+            .unwrap_or(0)
+            .min(self.response_scrub_tail.len());
+        let emit = self.response_scrub_tail.len() - keep;
+        let mut buffered = std::mem::take(&mut self.response_scrub_tail);
+        scrub_seen_tokens(&mut buffered, &self.seen_tokens);
+        self.response_scrub_tail = buffered.split_off(emit);
+        buffered
+    }
+
+    pub(crate) fn finish_response_scrubbing(&mut self) -> Vec<u8> {
+        let mut tail = std::mem::take(&mut self.response_scrub_tail);
+        scrub_seen_tokens(&mut tail, &self.seen_tokens);
+        tail
     }
 
     /// Transform complete HTTP/1.1 requests and record token exchanges.
@@ -142,12 +200,6 @@ impl OAuthConnection {
         data: &[u8],
         sni: &str,
     ) -> io::Result<Vec<u8>> {
-        if !self.exchanges.is_empty() && !data.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "OAuth HTTP/1 pipelining is unsupported",
-            ));
-        }
         self.request_buffer.extend_from_slice(data);
         enforce_limit(&self.request_buffer)?;
         let mut output = Vec::new();
@@ -177,17 +229,31 @@ impl OAuthConnection {
                 })
                 .map(|(index, _)| *index)
                 .collect::<Vec<_>>();
+            if self.token_host && endpoint_grants.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-token requests on an OAuth token host are unsupported",
+                ));
+            }
             let token_grant = match matching_grants.as_slice() {
                 [index] => Some(*index),
                 [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
                 [] => None,
                 _ => return Err(invalid_http()),
             };
+            if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OAuth token request pipelining is unsupported",
+                ));
+            }
             let mut rewritten = request.to_vec();
             if let Some(index) = token_grant
                 && self.grants[index].lease.is_none()
             {
                 let (loaded, lease) = broker_acquire(&self.grants[index].config).await?;
+                remember_token(&mut self.seen_tokens, &loaded.access);
+                remember_token(&mut self.seen_tokens, &loaded.refresh);
                 let grant = &mut self.grants[index];
                 grant.access = Zeroizing::new(loaded.access);
                 grant.refresh = Zeroizing::new(loaded.refresh);
@@ -202,6 +268,8 @@ impl OAuthConnection {
                     .any(|host| host.matches(sni));
                 if inject && token_grant != Some(index) {
                     let loaded = broker_load(&grant.config).await?;
+                    remember_token(&mut self.seen_tokens, &loaded.access);
+                    remember_token(&mut self.seen_tokens, &loaded.refresh);
                     grant.access = Zeroizing::new(loaded.access);
                     grant.refresh = Zeroizing::new(loaded.refresh);
                     grant.generation = loaded.generation;
@@ -233,8 +301,6 @@ impl OAuthConnection {
                 validate_token_request_content_type(message.headers)?;
                 rewritten = update_content_length(&rewritten)?;
                 self.exchanges.push_back(Some(index));
-            } else {
-                self.exchanges.push_back(None);
             }
             output.extend_from_slice(&rewritten);
             self.request_buffer.drain(..message.total_len);
@@ -325,6 +391,8 @@ impl OAuthConnection {
                     + seconds.saturating_mul(1000)
             });
         let generation = broker_commit(grant, &access, &refresh, expires_at).await?;
+        remember_token(&mut self.seen_tokens, &access);
+        remember_token(&mut self.seen_tokens, &refresh);
         grant.access = Zeroizing::new(access);
         grant.refresh = Zeroizing::new(refresh);
         grant.generation = generation;
@@ -365,19 +433,20 @@ impl OAuthConnection {
     }
 
     fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
-        for grant in &self.grants {
-            response = replace_all(
-                &response,
-                grant.access.as_bytes(),
-                grant.config.access_sentinel.as_bytes(),
-            );
-            response = replace_all(
-                &response,
-                grant.refresh.as_bytes(),
-                grant.config.refresh_sentinel.as_bytes(),
-            );
-        }
+        scrub_seen_tokens(&mut response, &self.seen_tokens);
         response
+    }
+}
+
+fn remember_token(tokens: &mut Vec<Zeroizing<String>>, token: &str) {
+    if !token.is_empty() && !tokens.iter().any(|seen| seen.as_str() == token) {
+        tokens.push(Zeroizing::new(token.to_string()));
+    }
+}
+
+fn scrub_seen_tokens(data: &mut Vec<u8>, tokens: &[Zeroizing<String>]) {
+    for token in tokens {
+        *data = replace_same_length(data, token.as_bytes());
     }
 }
 
@@ -770,6 +839,11 @@ mod tests {
             response_buffer: vec![],
             exchanges: VecDeque::new(),
             token_host: true,
+            response_scrub_tail: Vec::new(),
+            seen_tokens: vec![
+                Zeroizing::new("real-access".into()),
+                Zeroizing::new("real-refresh".into()),
+            ],
         }
     }
 
@@ -810,6 +884,7 @@ mod tests {
         });
         let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
         let mut allowed = connection();
+        allowed.token_host = false;
         allowed.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
         let output = allowed
             .transform_requests(request, "api.example.com")
@@ -822,6 +897,7 @@ mod tests {
         );
 
         let mut denied = connection();
+        denied.token_host = false;
         denied.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
         let output = denied
             .transform_requests(request, "evil.example.com")
@@ -876,14 +952,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_token_request_in_one_buffer_is_rejected() {
+        let body = "refresh_token=$MSB_OAUTH_REFRESH_123";
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut connection = connection();
+        connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
+        let error = connection
+            .transform_requests(format!("{request}{request}").as_bytes(), "auth.example.com")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn api_keep_alive_does_not_wait_for_response_parsing() {
+        let request = b"GET /v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let mut connection = connection();
+        connection.token_host = false;
+        let output = connection
+            .transform_requests(
+                &[request.as_slice(), request.as_slice()].concat(),
+                "other.example.com",
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.len(), request.len() * 2);
+        assert!(connection.exchanges.is_empty());
+    }
+
+    #[tokio::test]
     async fn exact_token_endpoint_does_not_match_other_path() {
         let request = b"POST /oauth/token/other HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let mut connection = connection();
-        connection
+        let error = connection
             .transform_requests(request, "auth.example.com")
             .await
-            .unwrap();
-        assert_eq!(connection.exchanges.pop_front(), Some(None));
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -982,7 +1090,7 @@ mod tests {
 
         let mut oauth = config();
         oauth.broker_endpoint = socket.to_string_lossy().into_owned();
-        let mut connection = OAuthConnection::new(&[oauth], "auth.example.com")
+        let mut connection = OAuthConnection::new(&[oauth], "auth.example.com", None)
             .await
             .unwrap();
         let request_body = "refresh_token=$MSB_OAUTH_REFRESH_123";
@@ -1039,11 +1147,13 @@ mod tests {
 
     #[test]
     fn api_response_echoes_are_scrubbed() {
-        let connection = connection();
-        let output = connection.scrub_tokens(b"echoed real-access and real-refresh".to_vec());
+        let mut connection = connection();
+        let mut output = connection.scrub_response_chunk(b"echoed real-ac");
+        output.extend(connection.scrub_response_chunk(b"cess and real-refresh"));
+        output.extend(connection.finish_response_scrubbing());
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("$MSB_OAUTH_ACCESS_123"));
-        assert!(output.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(output.contains("***********"));
+        assert!(output.contains("************"));
         assert!(!output.contains("real-access"));
         assert!(!output.contains("real-refresh"));
     }
@@ -1078,6 +1188,11 @@ mod tests {
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
             token_host: true,
+            response_scrub_tail: Vec::new(),
+            seen_tokens: vec![
+                Zeroizing::new("real-access".into()),
+                Zeroizing::new("real-refresh".into()),
+            ],
         };
         connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
         let body = "refresh_token=$OTHER_REFRESH";

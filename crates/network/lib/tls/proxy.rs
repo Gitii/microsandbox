@@ -264,7 +264,12 @@ pub(crate) async fn intercept_relay(
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
-    let mut oauth = OAuthConnection::new(&secrets.oauth, sni_name).await?;
+    let mut oauth = if via_connect {
+        OAuthConnection::new_tls_intercepted_via_connect(&secrets.oauth, sni_name).await?
+    } else {
+        OAuthConnection::new_tls_intercepted(&secrets.oauth, sni_name, guest_dst.ip(), &shared)
+            .await?
+    };
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -390,12 +395,19 @@ pub(crate) async fn intercept_relay(
             // Server → guest: read plaintext, encrypt, send via channel.
             result = server_tls.read(&mut server_buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        let tail = oauth.finish_response_scrubbing();
+                        if !tail.is_empty() {
+                            guest_tls.writer().write_all(&tail).map_err(io::Error::other)?;
+                            flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+                        }
+                        break;
+                    },
                     Ok(n) => {
                     let data = if oauth.is_token_host() {
                             oauth.transform_responses(&server_buf[..n]).await?
                         } else if !oauth.is_empty() {
-                            oauth.scrub_response_chunk(server_buf[..n].to_vec())
+                            oauth.scrub_response_chunk(&server_buf[..n])
                         } else {
                             server_buf[..n].to_vec()
                         };

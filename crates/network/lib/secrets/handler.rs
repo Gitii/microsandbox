@@ -2304,6 +2304,15 @@ fn host_pattern_allowed(
             .any_resolved_hostname(identity.guest_ip, |hostname| pattern.matches(hostname))
 }
 
+pub(crate) fn host_pattern_allowed_for_tls(
+    pattern: &HostPattern,
+    sni: &str,
+    guest_ip: IpAddr,
+    shared: &SharedState,
+) -> bool {
+    host_pattern_allowed(pattern, sni, Some(&SecretHostIdentity { guest_ip, shared }))
+}
+
 fn host_alias_matches(pattern: &HostPattern, sni: &str, identity: &SecretHostIdentity<'_>) -> bool {
     if !sni.eq_ignore_ascii_case(crate::HOST_ALIAS) || !pattern.matches(crate::HOST_ALIAS) {
         return false;
