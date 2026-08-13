@@ -915,6 +915,20 @@ struct SecretOpts {
 }
 
 #[derive(serde::Deserialize)]
+struct OAuthSecretOpts {
+    broker_endpoint: String,
+    grant_id: String,
+    token_endpoint: String,
+    inject_hosts: Vec<String>,
+    access_token_field: String,
+    refresh_token_field: String,
+    access_env_var: String,
+    refresh_env_var: String,
+    access_sentinel: String,
+    refresh_sentinel: String,
+}
+
+#[derive(serde::Deserialize)]
 struct PatchOpts {
     kind: String,
     // text / append / mkdir / remove / symlink / copy_file / copy_dir
@@ -1039,6 +1053,8 @@ struct SandboxCreateOpts {
     port_bindings: Vec<PortBindingOpts>,
     #[serde(default)]
     secrets: Vec<SecretOpts>,
+    #[serde(default)]
+    oauth_secrets: Vec<OAuthSecretOpts>,
     #[serde(default)]
     patches: Vec<PatchOpts>,
     /// Volume mounts: guest_path → MountSpec.
@@ -1704,6 +1720,31 @@ fn apply_secret(
     Ok(builder)
 }
 
+fn apply_oauth_secret(
+    builder: microsandbox::sandbox::SandboxBuilder,
+    oauth: OAuthSecretOpts,
+) -> microsandbox::sandbox::SandboxBuilder {
+    use microsandbox::sandbox::OAuthSecret;
+    use microsandbox_network::secrets::config::HostPattern;
+
+    builder.oauth_secret(OAuthSecret {
+        broker_endpoint: oauth.broker_endpoint,
+        grant_id: oauth.grant_id,
+        token_endpoint: oauth.token_endpoint,
+        inject_hosts: oauth
+            .inject_hosts
+            .iter()
+            .map(|host| HostPattern::parse(host))
+            .collect(),
+        access_token_field: oauth.access_token_field,
+        refresh_token_field: oauth.refresh_token_field,
+        access_env_var: oauth.access_env_var,
+        refresh_env_var: oauth.refresh_env_var,
+        access_sentinel: oauth.access_sentinel,
+        refresh_sentinel: oauth.refresh_sentinel,
+    })
+}
+
 fn apply_patch(
     builder: microsandbox::sandbox::SandboxBuilder,
     p: &PatchOpts,
@@ -2214,6 +2255,9 @@ pub unsafe extern "C" fn msb_sandbox_create(
             // Secrets.
             for s in &opts.secrets {
                 builder = apply_secret(builder, s)?;
+            }
+            for oauth in opts.oauth_secrets {
+                builder = apply_oauth_secret(builder, oauth);
             }
             // Patches.
             for p in &opts.patches {

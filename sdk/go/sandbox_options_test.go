@@ -646,6 +646,48 @@ func TestFFIWireShape_Secrets(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_OAuthSecrets(t *testing.T) {
+	got := marshalCreateOptions(t, WithOAuthSecrets(OAuthSecretConfig{
+		BrokerEndpoint:    "/run/msb/oauth.sock",
+		GrantID:           "opaque-42",
+		TokenEndpoint:     "https://login.example.com/oauth/token",
+		InjectHosts:       []string{"api.example.com", "*.service.example.com"},
+		AccessTokenField:  "access_token",
+		RefreshTokenField: "refresh_token",
+		AccessEnvVar:      "OAUTH_ACCESS_TOKEN",
+		RefreshEnvVar:     "OAUTH_REFRESH_TOKEN",
+		AccessSentinel:    "$MSB_OAUTH_ACCESS_abc",
+		RefreshSentinel:   "$MSB_OAUTH_REFRESH_abc",
+	}))
+	grants := mustField(t, got, "oauth_secrets").([]any)
+	if len(grants) != 1 {
+		t.Fatalf("oauth_secrets length = %d", len(grants))
+	}
+	grant := grants[0].(map[string]any)
+	for key, want := range map[string]string{
+		"broker_endpoint":     "/run/msb/oauth.sock",
+		"grant_id":            "opaque-42",
+		"token_endpoint":      "https://login.example.com/oauth/token",
+		"access_token_field":  "access_token",
+		"refresh_token_field": "refresh_token",
+		"access_env_var":      "OAUTH_ACCESS_TOKEN",
+		"refresh_env_var":     "OAUTH_REFRESH_TOKEN",
+		"access_sentinel":     "$MSB_OAUTH_ACCESS_abc",
+		"refresh_sentinel":    "$MSB_OAUTH_REFRESH_abc",
+	} {
+		if grant[key] != want {
+			t.Fatalf("%s = %v, want %q", key, grant[key], want)
+		}
+	}
+	wire, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), "real-access") || strings.Contains(string(wire), "real-refresh") {
+		t.Fatalf("wire contains token material: %s", wire)
+	}
+}
+
 func TestFFIWireShape_NetworkProfile(t *testing.T) {
 	got := marshalCreateOptions(t,
 		WithImage("alpine"),

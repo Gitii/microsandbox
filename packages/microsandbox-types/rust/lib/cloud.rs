@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::domain::{
     CpuPlacement, DeploymentProfile, DiskImageFormat, EnvVar, HandoffInit, HostPattern,
-    HostPermissions, MountOptions, NetworkPolicy, NetworkSpec, OciRootfsSource, Patch, PullPolicy,
-    Rlimit, RlimitResource, RootDisk, RootfsSource, SandboxLogLevel, SandboxPolicy,
+    HostPermissions, MountOptions, NetworkPolicy, NetworkSpec, OAuthSecret, OciRootfsSource, Patch,
+    PullPolicy, Rlimit, RlimitResource, RootDisk, RootfsSource, SandboxLogLevel, SandboxPolicy,
     SandboxResources, SandboxRuntimeOptions, SandboxSpec, SecretEntry, SecretInjection,
     SecretsConfig, SecurityProfile, StatVirtualization, TransparentHugePagePolicy, ViolationAction,
     VolumeMount, default_private, default_strict,
@@ -1159,6 +1159,9 @@ pub struct CloudSecretsConfig {
     /// Secrets to inject.
     #[serde(default)]
     pub entries: Vec<CloudSecretEntry>,
+    /// Broker-backed OAuth grants.
+    #[serde(default)]
+    pub oauth: Vec<OAuthSecret>,
     /// Default action when a placeholder leaks to a disallowed host.
     #[serde(default)]
     pub on_violation: CloudViolationAction,
@@ -1359,6 +1362,7 @@ impl From<SecretsConfig> for CloudSecretsConfig {
     fn from(config: SecretsConfig) -> Self {
         Self {
             entries: config.secrets.into_iter().map(Into::into).collect(),
+            oauth: config.oauth,
             on_violation: config.on_violation.into(),
         }
     }
@@ -1368,6 +1372,7 @@ impl From<CloudSecretsConfig> for SecretsConfig {
     fn from(config: CloudSecretsConfig) -> Self {
         Self {
             secrets: config.entries.into_iter().map(Into::into).collect(),
+            oauth: config.oauth,
             on_violation: config.on_violation.into(),
         }
     }
@@ -1473,6 +1478,7 @@ mod tests {
                 on_violation: Some(CloudViolationAction::BlockAndTerminate),
                 require_tls_identity: true,
             }],
+            oauth: vec![],
             on_violation: CloudViolationAction::BlockAndLog,
         };
 

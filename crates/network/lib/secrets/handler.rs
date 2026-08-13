@@ -3066,6 +3066,7 @@ mod tests {
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
             secrets,
+            oauth: vec![],
             on_violation: ViolationAction::Block,
         }
     }

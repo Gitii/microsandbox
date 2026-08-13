@@ -370,6 +370,13 @@ impl SmoltcpNetwork {
         for secret in &self.config.secrets.secrets {
             vars.push((secret.env_var.clone(), secret.placeholder.clone()));
         }
+        for oauth in &self.config.secrets.oauth {
+            vars.push((oauth.access_env_var.clone(), oauth.access_sentinel.clone()));
+            vars.push((
+                oauth.refresh_env_var.clone(),
+                oauth.refresh_sentinel.clone(),
+            ));
+        }
 
         vars
     }
