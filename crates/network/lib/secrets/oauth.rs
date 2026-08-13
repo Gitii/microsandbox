@@ -33,7 +33,7 @@ pub(crate) struct OAuthConnection {
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
     exchanges: VecDeque<Option<usize>>,
-    token_host: bool,
+    token_connection: Option<bool>,
     response_scrub_tail: Vec<u8>,
     seen_tokens: Vec<Zeroizing<String>>,
 }
@@ -152,9 +152,7 @@ impl OAuthConnection {
             });
         }
         Ok(Self {
-            token_host: grants
-                .iter()
-                .any(|grant| grant.endpoint_host.eq_ignore_ascii_case(sni)),
+            token_connection: None,
             grants,
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
@@ -169,7 +167,7 @@ impl OAuthConnection {
     }
 
     pub(crate) fn is_token_host(&self) -> bool {
-        self.token_host
+        self.token_connection == Some(true)
     }
 
     pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> Vec<u8> {
@@ -229,18 +227,23 @@ impl OAuthConnection {
                 })
                 .map(|(index, _)| *index)
                 .collect::<Vec<_>>();
-            if self.token_host && endpoint_grants.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "non-token requests on an OAuth token host are unsupported",
-                ));
-            }
             let token_grant = match matching_grants.as_slice() {
                 [index] => Some(*index),
                 [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
                 [] => None,
                 _ => return Err(invalid_http()),
             };
+            let is_token_request = token_grant.is_some();
+            if self
+                .token_connection
+                .is_some_and(|token_connection| token_connection != is_token_request)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mixing OAuth API and token requests on one connection is unsupported",
+                ));
+            }
+            self.token_connection = Some(is_token_request);
             if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -838,7 +841,7 @@ mod tests {
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
-            token_host: true,
+            token_connection: None,
             response_scrub_tail: Vec::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
@@ -884,7 +887,7 @@ mod tests {
         });
         let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
         let mut allowed = connection();
-        allowed.token_host = false;
+        allowed.token_connection = None;
         allowed.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
         let output = allowed
             .transform_requests(request, "api.example.com")
@@ -897,7 +900,7 @@ mod tests {
         );
 
         let mut denied = connection();
-        denied.token_host = false;
+        denied.token_connection = None;
         denied.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
         let output = denied
             .transform_requests(request, "evil.example.com")
@@ -971,7 +974,7 @@ mod tests {
     async fn api_keep_alive_does_not_wait_for_response_parsing() {
         let request = b"GET /v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let mut connection = connection();
-        connection.token_host = false;
+        connection.token_connection = None;
         let output = connection
             .transform_requests(
                 &[request.as_slice(), request.as_slice()].concat(),
@@ -987,11 +990,12 @@ mod tests {
     async fn exact_token_endpoint_does_not_match_other_path() {
         let request = b"POST /oauth/token/other HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let mut connection = connection();
-        let error = connection
+        let output = connection
             .transform_requests(request, "auth.example.com")
             .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            .unwrap();
+        assert_eq!(output, request);
+        assert_eq!(connection.token_connection, Some(false));
     }
 
     #[test]
@@ -1187,7 +1191,7 @@ mod tests {
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
-            token_host: true,
+            token_connection: None,
             response_scrub_tail: Vec::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
