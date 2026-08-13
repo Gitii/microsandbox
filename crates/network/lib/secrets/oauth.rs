@@ -30,6 +30,7 @@ pub(crate) struct OAuthConnection {
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
     exchanges: VecDeque<Option<usize>>,
+    token_host: bool,
 }
 
 struct LoadedGrant {
@@ -109,6 +110,9 @@ impl OAuthConnection {
             });
         }
         Ok(Self {
+            token_host: grants
+                .iter()
+                .any(|grant| grant.endpoint_host.eq_ignore_ascii_case(sni)),
             grants,
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
@@ -120,12 +124,30 @@ impl OAuthConnection {
         self.grants.is_empty()
     }
 
+    pub(crate) fn is_token_host(&self) -> bool {
+        self.token_host
+    }
+
+    pub(crate) fn scrub_response_chunk(&self, mut data: Vec<u8>) -> Vec<u8> {
+        for grant in &self.grants {
+            data = replace_same_length(&data, grant.access.as_bytes());
+            data = replace_same_length(&data, grant.refresh.as_bytes());
+        }
+        data
+    }
+
     /// Transform complete HTTP/1.1 requests and record token exchanges.
     pub(crate) async fn transform_requests(
         &mut self,
         data: &[u8],
         sni: &str,
     ) -> io::Result<Vec<u8>> {
+        if !self.exchanges.is_empty() && !data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth HTTP/1 pipelining is unsupported",
+            ));
+        }
         self.request_buffer.extend_from_slice(data);
         enforce_limit(&self.request_buffer)?;
         let mut output = Vec::new();
@@ -521,6 +543,14 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn replace_same_length(data: &[u8], token: &[u8]) -> Vec<u8> {
+    if token.is_empty() {
+        return data.to_vec();
+    }
+    let replacement = vec![b'*'; token.len()];
+    replace_all(data, token, &replacement)
+}
+
 fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> {
     let marker = [b"authorization: bearer ".as_slice(), sentinel].concat();
     let marker = marker
@@ -739,6 +769,7 @@ mod tests {
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
+            token_host: true,
         }
     }
 
@@ -1046,6 +1077,7 @@ mod tests {
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
+            token_host: true,
         };
         connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
         let body = "refresh_token=$OTHER_REFRESH";
