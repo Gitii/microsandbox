@@ -22,6 +22,8 @@ use crate::shared::SharedState;
 const MAX_OAUTH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BROKER_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTSTANDING_API_REQUESTS: usize = 1024;
+const MAX_RESPONSE_SCRUB_FRAMING_BYTES: usize = MAX_OAUTH_MESSAGE_BYTES;
+const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 //--------------------------------------------------------------------------------------------------
@@ -177,8 +179,8 @@ impl OAuthConnection {
                 continue;
             }
             let loaded = broker_load(config).await?;
-            remember_token(&mut seen_tokens, &loaded.access);
-            remember_token(&mut seen_tokens, &loaded.refresh);
+            remember_token(&mut seen_tokens, &loaded.access)?;
+            remember_token(&mut seen_tokens, &loaded.refresh)?;
             grants.push(LoadedGrant {
                 config: config.clone(),
                 endpoint_host,
@@ -284,7 +286,7 @@ impl OAuthConnection {
                     {
                         output.extend_from_slice(&line);
                     } else {
-                        self.response_scrub_framing.extend_from_slice(&line);
+                        extend_response_scrub_framing(&mut self.response_scrub_framing, &line)?;
                     }
                     self.response_scrub_state = if size == 0 {
                         ResponseScrubState::ChunkTrailers
@@ -311,7 +313,7 @@ impl OAuthConnection {
                     if !self.response_scrub_buffer.starts_with(b"\r\n") {
                         return Err(invalid_http());
                     }
-                    self.response_scrub_framing.extend_from_slice(b"\r\n");
+                    extend_response_scrub_framing(&mut self.response_scrub_framing, b"\r\n")?;
                     pending = self.response_scrub_buffer.split_off(2);
                     self.response_scrub_buffer.clear();
                     self.response_scrub_state = ResponseScrubState::ChunkSize;
@@ -463,19 +465,24 @@ impl OAuthConnection {
                             break;
                         }
                     }
-                    let matching_grants = endpoint_grants
-                        .iter()
-                        .filter(|(_, grant)| {
-                            contains_bytes(
-                                &self.request_buffer,
-                                grant.config.access_sentinel.as_bytes(),
-                            ) || contains_bytes(
-                                &self.request_buffer,
-                                grant.config.refresh_sentinel.as_bytes(),
-                            )
-                        })
-                        .map(|(index, _)| *index)
-                        .collect::<Vec<_>>();
+                    let matching_grants = if endpoint_request {
+                        let framed_request = &self.request_buffer[..total_len];
+                        endpoint_grants
+                            .iter()
+                            .filter(|(_, grant)| {
+                                contains_bytes(
+                                    framed_request,
+                                    grant.config.access_sentinel.as_bytes(),
+                                ) || contains_bytes(
+                                    framed_request,
+                                    grant.config.refresh_sentinel.as_bytes(),
+                                )
+                            })
+                            .map(|(index, _)| *index)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                     let token_grant = match matching_grants.as_slice() {
                         [index] => Some(*index),
                         [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
@@ -522,8 +529,8 @@ impl OAuthConnection {
                         && self.grants[index].lease.is_none()
                     {
                         let (loaded, lease) = broker_acquire(&self.grants[index].config).await?;
-                        remember_token(&mut self.seen_tokens, &loaded.access);
-                        remember_token(&mut self.seen_tokens, &loaded.refresh);
+                        remember_token(&mut self.seen_tokens, &loaded.access)?;
+                        remember_token(&mut self.seen_tokens, &loaded.refresh)?;
                         let grant = &mut self.grants[index];
                         grant.access = Zeroizing::new(loaded.access);
                         grant.refresh = Zeroizing::new(loaded.refresh);
@@ -538,8 +545,8 @@ impl OAuthConnection {
                             .any(|host| host.matches(sni));
                         if inject && token_grant != Some(index) {
                             let loaded = broker_load(&grant.config).await?;
-                            remember_token(&mut self.seen_tokens, &loaded.access);
-                            remember_token(&mut self.seen_tokens, &loaded.refresh);
+                            remember_token(&mut self.seen_tokens, &loaded.access)?;
+                            remember_token(&mut self.seen_tokens, &loaded.refresh)?;
                             grant.access = Zeroizing::new(loaded.access);
                             grant.refresh = Zeroizing::new(loaded.refresh);
                             grant.generation = loaded.generation;
@@ -746,8 +753,8 @@ impl OAuthConnection {
                     + seconds.saturating_mul(1000)
             });
         let generation = broker_commit(grant, &access, &refresh, expires_at).await?;
-        remember_token(&mut self.seen_tokens, &access);
-        remember_token(&mut self.seen_tokens, &refresh);
+        remember_token(&mut self.seen_tokens, &access)?;
+        remember_token(&mut self.seen_tokens, &refresh)?;
         grant.access = Zeroizing::new(access);
         grant.refresh = Zeroizing::new(refresh);
         grant.generation = generation;
@@ -806,10 +813,18 @@ impl OAuthConnection {
     }
 }
 
-fn remember_token(tokens: &mut Vec<Zeroizing<String>>, token: &str) {
-    if !token.is_empty() && !tokens.iter().any(|seen| seen.as_str() == token) {
-        tokens.push(Zeroizing::new(token.to_string()));
+fn remember_token(tokens: &mut Vec<Zeroizing<String>>, token: &str) -> io::Result<()> {
+    if token.is_empty() || tokens.iter().any(|seen| seen.as_str() == token) {
+        return Ok(());
     }
+    if tokens.len() >= MAX_SEEN_TOKENS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "too many OAuth tokens seen on one connection",
+        ));
+    }
+    tokens.push(Zeroizing::new(token.to_string()));
+    Ok(())
 }
 
 fn scrub_seen_tokens(data: &mut Vec<u8>, tokens: &[Zeroizing<String>]) {
@@ -1339,6 +1354,21 @@ fn enforce_limit(buffer: &[u8]) -> io::Result<()> {
             "OAuth HTTP message exceeds limit",
         ));
     }
+    Ok(())
+}
+
+fn extend_response_scrub_framing(buffer: &mut Vec<u8>, data: &[u8]) -> io::Result<()> {
+    let length = buffer
+        .len()
+        .checked_add(data.len())
+        .ok_or_else(invalid_http)?;
+    if length > MAX_RESPONSE_SCRUB_FRAMING_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth response scrub framing exceeds limit",
+        ));
+    }
+    buffer.extend_from_slice(data);
     Ok(())
 }
 
@@ -2054,6 +2084,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_endpoint_ignores_sentinel_in_partial_pipelined_request() {
+        let first = config();
+        let mut second = config();
+        second.grant_id = "other-grant".into();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        let mut connection = OAuthConnection {
+            grants: vec![loaded(first), loaded(second)],
+            request_buffer: Vec::new(),
+            response_buffer: Vec::new(),
+            exchanges: VecDeque::new(),
+            token_connection: None,
+            connection_port: 443,
+            response_scrub_buffer: Vec::new(),
+            response_scrub_framing: Vec::new(),
+            response_scrub_tail: Vec::new(),
+            response_scrub_state: ResponseScrubState::Headers,
+            response_head_requests: VecDeque::new(),
+            seen_tokens: Vec::new(),
+            request_state: RequestState::Headers,
+        };
+        let first_request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let partial_second = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 64\r\n\r\nrefresh_token=$OTHER_REFRESH";
+
+        let error = connection
+            .transform_requests(
+                &[first_request.as_slice(), partial_second.as_slice()].concat(),
+                "auth.example.com",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(connection.exchanges.is_empty());
+    }
+
+    #[tokio::test]
     async fn expect_continue_is_rejected_after_headers_without_waiting_for_body() {
         let request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
         let mut connection = connection();
@@ -2129,6 +2196,53 @@ mod tests {
                 .unwrap()
                 .contains("token=***********")
         );
+    }
+
+    #[test]
+    fn unresolved_token_prefix_cannot_grow_chunk_framing_past_limit() {
+        let mut connection = connection();
+        connection.seen_tokens = vec![Zeroizing::new("aaa".into())];
+        let extension = "x".repeat(MAX_RESPONSE_SCRUB_FRAMING_BYTES / 2);
+        let chunk = format!("1;x={extension}\r\na\r\n");
+
+        connection
+            .scrub_response_chunk(
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{chunk}").as_bytes(),
+            )
+            .unwrap();
+        connection.scrub_response_chunk(chunk.as_bytes()).unwrap();
+        let framing_len = connection.response_scrub_framing.len();
+        let error = connection
+            .scrub_response_chunk(chunk.as_bytes())
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth response scrub framing exceeds limit"
+        );
+        assert_eq!(connection.response_scrub_framing.len(), framing_len);
+        assert!(framing_len <= MAX_RESPONSE_SCRUB_FRAMING_BYTES);
+    }
+
+    #[test]
+    fn seen_token_limit_fails_closed_without_evicting_redaction_history() {
+        let mut tokens = Vec::new();
+        for index in 0..MAX_SEEN_TOKENS {
+            remember_token(&mut tokens, &format!("token-{index}")).unwrap();
+        }
+
+        let error = remember_token(&mut tokens, "overflow-token").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "too many OAuth tokens seen on one connection"
+        );
+        assert_eq!(tokens.len(), MAX_SEEN_TOKENS);
+        let mut response = b"token-0 overflow-token".to_vec();
+        scrub_seen_tokens(&mut response, &tokens);
+        assert_eq!(response, b"******* overflow-token");
     }
 
     #[test]
