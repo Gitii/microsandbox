@@ -41,6 +41,7 @@ pub(crate) struct OAuthConnection {
     response_scrub_state: ResponseScrubState,
     response_head_requests: VecDeque<bool>,
     seen_tokens: Vec<Zeroizing<String>>,
+    request_state: RequestState,
 }
 
 struct LoadedGrant {
@@ -102,6 +103,21 @@ enum ResponseScrubState {
     ChunkDataEnd,
     ChunkTrailers,
     CloseDelimited,
+}
+
+enum RequestState {
+    Headers,
+    ContentLength(usize),
+    ChunkSize,
+    ChunkData(usize),
+    ChunkDataEnd,
+    ChunkTrailers,
+}
+
+enum RequestBodyFraming {
+    None,
+    ContentLength(usize),
+    Chunked,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -186,6 +202,7 @@ impl OAuthConnection {
             response_scrub_state: ResponseScrubState::Headers,
             response_head_requests: VecDeque::new(),
             seen_tokens,
+            request_state: RequestState::Headers,
         })
     }
 
@@ -212,8 +229,6 @@ impl OAuthConnection {
                     let headers = self.response_scrub_buffer[..boundary].to_vec();
                     pending = self.response_scrub_buffer.split_off(boundary);
                     self.response_scrub_buffer.clear();
-                    self.scrub_stream_bytes(&headers, &mut output);
-                    self.flush_scrub_tail(&mut output);
                     let status = response_status(&headers)?;
                     self.response_scrub_state = response_body_state(
                         &headers,
@@ -222,6 +237,8 @@ impl OAuthConnection {
                             .copied()
                             .unwrap_or(false),
                     )?;
+                    self.scrub_stream_bytes(&headers, &mut output);
+                    self.flush_scrub_tail(&mut output);
                     if !(100..200).contains(&status) {
                         self.response_head_requests.pop_front();
                     }
@@ -251,10 +268,11 @@ impl OAuthConnection {
                     let Some(end) = line_boundary(&self.response_scrub_buffer) else {
                         break;
                     };
-                    let line = self.response_scrub_buffer[..end].to_vec();
+                    let mut line = self.response_scrub_buffer[..end].to_vec();
                     pending = self.response_scrub_buffer.split_off(end);
                     self.response_scrub_buffer.clear();
                     let size = parse_chunk_size(&line)?;
+                    scrub_seen_tokens(&mut line, &self.seen_tokens);
                     if self.response_scrub_tail.is_empty() && self.response_scrub_framing.is_empty()
                     {
                         output.extend_from_slice(&line);
@@ -320,12 +338,34 @@ impl OAuthConnection {
         Ok(output)
     }
 
-    pub(crate) fn finish_response_scrubbing(&mut self) -> Vec<u8> {
+    pub(crate) fn finish_response_scrubbing(&mut self) -> io::Result<Vec<u8>> {
+        if self.token_connection == Some(true) {
+            if !self.response_buffer.is_empty() || !self.exchanges.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete OAuth token response",
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        if !self.response_scrub_buffer.is_empty()
+            || matches!(
+                self.response_scrub_state,
+                ResponseScrubState::ContentLength(_)
+                    | ResponseScrubState::ChunkSize
+                    | ResponseScrubState::ChunkData(_)
+                    | ResponseScrubState::ChunkDataEnd
+                    | ResponseScrubState::ChunkTrailers
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete OAuth API response",
+            ));
+        }
         let mut output = Vec::new();
-        let buffered = std::mem::take(&mut self.response_scrub_buffer);
-        self.scrub_stream_bytes(&buffered, &mut output);
         self.flush_scrub_tail(&mut output);
-        output
+        Ok(output)
     }
 
     fn scrub_stream_bytes(&mut self, data: &[u8], output: &mut Vec<u8>) {
@@ -360,132 +400,251 @@ impl OAuthConnection {
         data: &[u8],
         sni: &str,
     ) -> io::Result<Vec<u8>> {
-        self.request_buffer.extend_from_slice(data);
-        enforce_limit(&self.request_buffer)?;
         let mut output = Vec::new();
-        loop {
-            reject_token_endpoint_expect(
-                &self.request_buffer,
-                &self.grants,
-                sni,
-                self.connection_port,
-            )?;
-            let Some(message) = parse_http_message(&self.request_buffer)? else {
-                break;
-            };
-            let request = &self.request_buffer[..message.total_len];
-            let request_line = first_header_line(message.headers)?;
-            let method = request_line
-                .split_whitespace()
-                .next()
-                .ok_or_else(invalid_http)?;
-            let target = request_line
-                .split_whitespace()
-                .nth(1)
-                .ok_or_else(invalid_http)?;
-            let endpoint_grants = self
-                .grants
-                .iter()
-                .enumerate()
-                .filter(|(_, grant)| {
-                    grant.endpoint_host.eq_ignore_ascii_case(sni)
-                        && grant.endpoint_port == self.connection_port
-                        && grant.endpoint_target == target
-                })
-                .collect::<Vec<_>>();
-            let matching_grants = endpoint_grants
-                .iter()
-                .filter(|(_, grant)| {
-                    contains_bytes(request, grant.config.access_sentinel.as_bytes())
-                        || contains_bytes(request, grant.config.refresh_sentinel.as_bytes())
-                })
-                .map(|(index, _)| *index)
-                .collect::<Vec<_>>();
-            let token_grant = match matching_grants.as_slice() {
-                [index] => Some(*index),
-                [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
-                [] if endpoint_grants.is_empty() => None,
-                [] => return Err(invalid_http()),
-                _ => return Err(invalid_http()),
-            };
-            let is_token_request = token_grant.is_some();
-            if self
-                .token_connection
-                .is_some_and(|token_connection| token_connection != is_token_request)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "mixing OAuth API and token requests on one connection is unsupported",
-                ));
-            }
-            self.token_connection = Some(is_token_request);
-            if !is_token_request {
-                self.response_head_requests
-                    .push_back(method.eq_ignore_ascii_case("HEAD"));
-            }
-            if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "OAuth token request pipelining is unsupported",
-                ));
-            }
-            let mut rewritten = request.to_vec();
-            if let Some(index) = token_grant
-                && self.grants[index].lease.is_none()
-            {
-                let (loaded, lease) = broker_acquire(&self.grants[index].config).await?;
-                remember_token(&mut self.seen_tokens, &loaded.access);
-                remember_token(&mut self.seen_tokens, &loaded.refresh);
-                let grant = &mut self.grants[index];
-                grant.access = Zeroizing::new(loaded.access);
-                grant.refresh = Zeroizing::new(loaded.refresh);
-                grant.generation = loaded.generation;
-                grant.lease = Some(lease);
-            }
-            for (index, grant) in self.grants.iter_mut().enumerate() {
-                let inject = grant
-                    .config
-                    .inject_hosts
-                    .iter()
-                    .any(|host| host.matches(sni));
-                if inject && token_grant != Some(index) {
-                    let loaded = broker_load(&grant.config).await?;
-                    remember_token(&mut self.seen_tokens, &loaded.access);
-                    remember_token(&mut self.seen_tokens, &loaded.refresh);
-                    grant.access = Zeroizing::new(loaded.access);
-                    grant.refresh = Zeroizing::new(loaded.refresh);
-                    grant.generation = loaded.generation;
-                }
-                if inject || token_grant == Some(index) {
-                    rewritten = if inject && token_grant != Some(index) {
-                        replace_bearer_header(
-                            &rewritten,
-                            grant.config.access_sentinel.as_bytes(),
-                            grant.access.as_bytes(),
-                        )
+        let mut pending = data.to_vec();
+        while !pending.is_empty() {
+            match self.request_state {
+                RequestState::Headers => {
+                    self.request_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.request_buffer)?;
+                    let Some(header_end) = header_boundary(&self.request_buffer) else {
+                        break;
+                    };
+                    let headers = self.request_buffer[..header_end].to_vec();
+                    let request_line = first_header_line(&headers)?;
+                    let method = request_line
+                        .split_whitespace()
+                        .next()
+                        .ok_or_else(invalid_http)?;
+                    let target = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .ok_or_else(invalid_http)?;
+                    let endpoint_grants = self
+                        .grants
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, grant)| {
+                            grant.endpoint_host.eq_ignore_ascii_case(sni)
+                                && grant.endpoint_port == self.connection_port
+                                && grant.endpoint_target == target
+                        })
+                        .collect::<Vec<_>>();
+                    let framing = request_body_framing(&headers)?;
+                    let body_len = match framing {
+                        RequestBodyFraming::None | RequestBodyFraming::Chunked => 0,
+                        RequestBodyFraming::ContentLength(length) => length,
+                    };
+                    let total_len = header_end.checked_add(body_len).ok_or_else(invalid_http)?;
+                    let endpoint_request = !endpoint_grants.is_empty();
+                    if endpoint_request {
+                        if !method.eq_ignore_ascii_case("POST") {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "OAuth token endpoint requests must use POST",
+                            ));
+                        }
+                        reject_expect_100_continue(&headers)?;
+                        if matches!(framing, RequestBodyFraming::Chunked) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "OAuth token endpoint chunked requests are unsupported",
+                            ));
+                        }
+                        if self.request_buffer.len() < total_len {
+                            break;
+                        }
+                    }
+                    let matching_grants = endpoint_grants
+                        .iter()
+                        .filter(|(_, grant)| {
+                            contains_bytes(
+                                &self.request_buffer,
+                                grant.config.access_sentinel.as_bytes(),
+                            ) || contains_bytes(
+                                &self.request_buffer,
+                                grant.config.refresh_sentinel.as_bytes(),
+                            )
+                        })
+                        .map(|(index, _)| *index)
+                        .collect::<Vec<_>>();
+                    let token_grant = match matching_grants.as_slice() {
+                        [index] => Some(*index),
+                        [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
+                        [] if endpoint_grants.is_empty() => None,
+                        [] => return Err(invalid_http()),
+                        _ => return Err(invalid_http()),
+                    };
+                    let is_token_request = token_grant.is_some();
+                    if self
+                        .token_connection
+                        .is_some_and(|token_connection| token_connection != is_token_request)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "mixing OAuth API and token requests on one connection is unsupported",
+                        ));
+                    }
+                    self.token_connection = Some(is_token_request);
+                    if !is_token_request {
+                        self.response_head_requests
+                            .push_back(method.eq_ignore_ascii_case("HEAD"));
+                    }
+                    if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "OAuth token request pipelining is unsupported",
+                        ));
+                    }
+                    let request_len = if is_token_request {
+                        total_len
                     } else {
-                        replace_all(
-                            &rewritten,
-                            grant.config.access_sentinel.as_bytes(),
-                            grant.access.as_bytes(),
-                        )
+                        header_end
+                    };
+                    let mut rewritten =
+                        remove_header(&self.request_buffer[..request_len], "accept-encoding")?;
+                    if let Some(index) = token_grant
+                        && self.grants[index].lease.is_none()
+                    {
+                        let (loaded, lease) = broker_acquire(&self.grants[index].config).await?;
+                        remember_token(&mut self.seen_tokens, &loaded.access);
+                        remember_token(&mut self.seen_tokens, &loaded.refresh);
+                        let grant = &mut self.grants[index];
+                        grant.access = Zeroizing::new(loaded.access);
+                        grant.refresh = Zeroizing::new(loaded.refresh);
+                        grant.generation = loaded.generation;
+                        grant.lease = Some(lease);
+                    }
+                    for (index, grant) in self.grants.iter_mut().enumerate() {
+                        let inject = grant
+                            .config
+                            .inject_hosts
+                            .iter()
+                            .any(|host| host.matches(sni));
+                        if inject && token_grant != Some(index) {
+                            let loaded = broker_load(&grant.config).await?;
+                            remember_token(&mut self.seen_tokens, &loaded.access);
+                            remember_token(&mut self.seen_tokens, &loaded.refresh);
+                            grant.access = Zeroizing::new(loaded.access);
+                            grant.refresh = Zeroizing::new(loaded.refresh);
+                            grant.generation = loaded.generation;
+                        }
+                        if inject || token_grant == Some(index) {
+                            rewritten = if inject && token_grant != Some(index) {
+                                replace_bearer_header(
+                                    &rewritten,
+                                    grant.config.access_sentinel.as_bytes(),
+                                    grant.access.as_bytes(),
+                                )
+                            } else {
+                                replace_all(
+                                    &rewritten,
+                                    grant.config.access_sentinel.as_bytes(),
+                                    grant.access.as_bytes(),
+                                )
+                            };
+                        }
+                        if token_grant == Some(index) {
+                            rewritten = replace_all(
+                                &rewritten,
+                                grant.config.refresh_sentinel.as_bytes(),
+                                grant.refresh.as_bytes(),
+                            );
+                        }
+                    }
+                    if let Some(index) = token_grant {
+                        validate_token_request_content_type(&headers)?;
+                        rewritten = update_content_length(&rewritten)?;
+                        self.exchanges.push_back(Some(index));
+                    }
+                    output.extend_from_slice(&rewritten);
+                    pending = self.request_buffer.split_off(request_len);
+                    self.request_buffer.clear();
+                    self.request_state = if is_token_request {
+                        RequestState::Headers
+                    } else {
+                        match framing {
+                            RequestBodyFraming::None | RequestBodyFraming::ContentLength(0) => {
+                                RequestState::Headers
+                            }
+                            RequestBodyFraming::ContentLength(length) => {
+                                RequestState::ContentLength(length)
+                            }
+                            RequestBodyFraming::Chunked => RequestState::ChunkSize,
+                        }
                     };
                 }
-                if token_grant == Some(index) {
-                    rewritten = replace_all(
-                        &rewritten,
-                        grant.config.refresh_sentinel.as_bytes(),
-                        grant.refresh.as_bytes(),
-                    );
+                RequestState::ContentLength(remaining) => {
+                    let consumed = remaining.min(pending.len());
+                    output.extend_from_slice(&pending[..consumed]);
+                    pending.drain(..consumed);
+                    self.request_state = if consumed == remaining {
+                        RequestState::Headers
+                    } else {
+                        RequestState::ContentLength(remaining - consumed)
+                    };
+                }
+                RequestState::ChunkSize => {
+                    self.request_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.request_buffer)?;
+                    let Some(end) = line_boundary(&self.request_buffer) else {
+                        break;
+                    };
+                    let line = self.request_buffer[..end].to_vec();
+                    pending = self.request_buffer.split_off(end);
+                    self.request_buffer.clear();
+                    let size = parse_chunk_size(&line)?;
+                    output.extend_from_slice(&line);
+                    self.request_state = if size == 0 {
+                        RequestState::ChunkTrailers
+                    } else {
+                        RequestState::ChunkData(size)
+                    };
+                }
+                RequestState::ChunkData(remaining) => {
+                    let consumed = remaining.min(pending.len());
+                    output.extend_from_slice(&pending[..consumed]);
+                    pending.drain(..consumed);
+                    self.request_state = if consumed == remaining {
+                        RequestState::ChunkDataEnd
+                    } else {
+                        RequestState::ChunkData(remaining - consumed)
+                    };
+                }
+                RequestState::ChunkDataEnd => {
+                    self.request_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    if self.request_buffer.len() < 2 {
+                        break;
+                    }
+                    if !self.request_buffer.starts_with(b"\r\n") {
+                        return Err(invalid_http());
+                    }
+                    output.extend_from_slice(b"\r\n");
+                    pending = self.request_buffer.split_off(2);
+                    self.request_buffer.clear();
+                    self.request_state = RequestState::ChunkSize;
+                }
+                RequestState::ChunkTrailers => {
+                    self.request_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.request_buffer)?;
+                    let boundary = if self.request_buffer.starts_with(b"\r\n") {
+                        Some(2)
+                    } else {
+                        header_boundary(&self.request_buffer)
+                    };
+                    let Some(boundary) = boundary else {
+                        break;
+                    };
+                    output.extend_from_slice(&self.request_buffer[..boundary]);
+                    pending = self.request_buffer.split_off(boundary);
+                    self.request_buffer.clear();
+                    self.request_state = RequestState::Headers;
                 }
             }
-            if let Some(index) = token_grant {
-                validate_token_request_content_type(message.headers)?;
-                rewritten = update_content_length(&rewritten)?;
-                self.exchanges.push_back(Some(index));
-            }
-            output.extend_from_slice(&rewritten);
-            self.request_buffer.drain(..message.total_len);
         }
         Ok(output)
     }
@@ -496,7 +655,7 @@ impl OAuthConnection {
         enforce_limit(&self.response_buffer)?;
         let mut output = Vec::new();
         loop {
-            let Some(message) = parse_http_message(&self.response_buffer)? else {
+            let Some(message) = parse_token_response(&self.response_buffer)? else {
                 break;
             };
             let total_len = message.total_len;
@@ -863,31 +1022,6 @@ fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> 
     output
 }
 
-fn reject_token_endpoint_expect(
-    data: &[u8],
-    grants: &[LoadedGrant],
-    sni: &str,
-    port: u16,
-) -> io::Result<()> {
-    let Some(boundary) = header_boundary(data) else {
-        return Ok(());
-    };
-    let headers = &data[..boundary];
-    let target = first_header_line(headers)?
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(invalid_http)?;
-    let is_token_endpoint = grants.iter().any(|grant| {
-        grant.endpoint_host.eq_ignore_ascii_case(sni)
-            && grant.endpoint_port == port
-            && grant.endpoint_target == target
-    });
-    if is_token_endpoint {
-        reject_expect_100_continue(headers)?;
-    }
-    Ok(())
-}
-
 fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<ResponseScrubState> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
     if !first_header_line(headers)?.starts_with("HTTP/1.1 ") {
@@ -896,6 +1030,7 @@ fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<Respon
     let status = response_status(headers)?;
     let mut content_length = None;
     let mut transfer_encoding = None;
+    let mut content_encoding = None;
     for (name, value) in text.lines().filter_map(|line| line.split_once(':')) {
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
@@ -907,7 +1042,18 @@ fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<Respon
                 return Err(invalid_http());
             }
             transfer_encoding = Some(value.trim());
+        } else if name.eq_ignore_ascii_case("content-encoding") {
+            if content_encoding.is_some() {
+                return Err(invalid_http());
+            }
+            content_encoding = Some(value.trim());
         }
+    }
+    if content_encoding.is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity")) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "encoded OAuth responses are unsupported",
+        ));
     }
     if transfer_encoding.is_some() && content_length.is_some() {
         return Err(invalid_http());
@@ -947,37 +1093,50 @@ fn line_boundary(data: &[u8]) -> Option<usize> {
         .map(|boundary| boundary + 2)
 }
 
-fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
+fn parse_token_response(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
     let Some(header_end) = header_boundary(data) else {
         return Ok(None);
     };
     let headers = &data[..header_end];
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
-    if text.lines().any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("transfer-encoding")
-                && !value.trim().eq_ignore_ascii_case("identity")
-        })
-    }) {
+    let mut content_encoding = None;
+    let mut transfer_encoding = None;
+    let mut content_length = None;
+    for (name, value) in text.lines().filter_map(|line| line.split_once(':')) {
+        if name.eq_ignore_ascii_case("content-encoding") {
+            if content_encoding.replace(value.trim()).is_some() {
+                return Err(invalid_http());
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if transfer_encoding.replace(value.trim()).is_some() {
+                return Err(invalid_http());
+            }
+        } else if name.eq_ignore_ascii_case("content-length")
+            && content_length
+                .replace(value.trim().parse::<usize>().map_err(|_| invalid_http())?)
+                .is_some()
+        {
+            return Err(invalid_http());
+        }
+    }
+    if content_encoding.is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity")) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "OAuth HTTP/1 chunked messages are unsupported",
+            "encoded OAuth responses are unsupported",
         ));
     }
-    let mut lengths = text.lines().filter_map(|line| {
-        line.split_once(':').and_then(|(name, value)| {
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>())
-        })
-    });
-    let content_length = match lengths.next() {
-        Some(Ok(length)) => length,
-        Some(Err(_)) => return Err(invalid_http()),
-        None => 0,
-    };
-    if lengths.next().is_some() {
-        return Err(invalid_http());
+    if transfer_encoding.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth token response transfer encoding is unsupported",
+        ));
     }
+    let content_length = content_length.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth token response requires Content-Length",
+        )
+    })?;
     let total_len = header_end
         .checked_add(content_length)
         .ok_or_else(invalid_http)?;
@@ -992,6 +1151,57 @@ fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
         body: &data[header_end..total_len],
         total_len,
     }))
+}
+
+fn request_body_framing(headers: &[u8]) -> io::Result<RequestBodyFraming> {
+    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    for (name, value) in text.lines().filter_map(|line| line.split_once(':')) {
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length
+                .replace(value.trim().parse::<usize>().map_err(|_| invalid_http())?)
+                .is_some()
+            {
+                return Err(invalid_http());
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            && transfer_encoding.replace(value.trim()).is_some()
+        {
+            return Err(invalid_http());
+        }
+    }
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err(invalid_http());
+    }
+    match (transfer_encoding, content_length) {
+        (Some(encoding), None) if encoding.eq_ignore_ascii_case("chunked") => {
+            Ok(RequestBodyFraming::Chunked)
+        }
+        (Some(_), None) => Err(invalid_http()),
+        (None, Some(length)) => Ok(RequestBodyFraming::ContentLength(length)),
+        (None, None) => Ok(RequestBodyFraming::None),
+        (Some(_), Some(_)) => Err(invalid_http()),
+    }
+}
+
+fn remove_header(headers: &[u8], removed_name: &str) -> io::Result<Vec<u8>> {
+    let boundary = header_boundary(headers).ok_or_else(invalid_http)?;
+    let text = std::str::from_utf8(&headers[..boundary]).map_err(|_| invalid_http())?;
+    let mut output = Vec::with_capacity(headers.len());
+    for line in text.trim_end_matches("\r\n\r\n").split("\r\n") {
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(removed_name))
+        {
+            continue;
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&headers[boundary..]);
+    Ok(output)
 }
 
 fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
@@ -1159,6 +1369,7 @@ mod tests {
                 Zeroizing::new("real-access".into()),
                 Zeroizing::new("real-refresh".into()),
             ],
+            request_state: RequestState::Headers,
         }
     }
 
@@ -1198,7 +1409,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
+        let request = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAccept-Encoding: gzip\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
         let mut allowed = connection();
         allowed.token_connection = None;
         allowed.grants[0].config.broker_endpoint = socket.to_string_lossy().into_owned();
@@ -1206,11 +1417,9 @@ mod tests {
             .transform_requests(request, "api.example.com")
             .await
             .unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("Bearer real-access")
-        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Bearer real-access"));
+        assert!(!output.to_ascii_lowercase().contains("accept-encoding"));
 
         let mut denied = connection();
         denied.token_connection = None;
@@ -1232,7 +1441,7 @@ mod tests {
     async fn token_json_request_replaces_both_sentinels_and_length() {
         let body = r#"{"access":"$MSB_OAUTH_ACCESS_123","refresh":"$MSB_OAUTH_REFRESH_123"}"#;
         let request = format!(
-            "POST /oauth/token HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /oauth/token HTTP/1.1\r\nHost: auth.example.com\r\nAccept-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         let mut connection = connection();
@@ -1245,6 +1454,7 @@ mod tests {
         assert!(output.contains("real-access"));
         assert!(output.contains("real-refresh"));
         assert!(!output.contains("$MSB_OAUTH_"));
+        assert!(!output.to_ascii_lowercase().contains("accept-encoding"));
     }
 
     #[tokio::test]
@@ -1300,6 +1510,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_length_api_request_streams_after_headers() {
+        let mut connection = connection();
+        let headers = b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\nAccept-Encoding: br\r\n\r\n";
+
+        let first = connection
+            .transform_requests(headers, "other.example.com")
+            .await
+            .unwrap();
+        let second = connection
+            .transform_requests(b"hello", "other.example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(first, b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(second, b"hello");
+    }
+
+    #[tokio::test]
+    async fn chunked_api_request_streams_and_preserves_keep_alive() {
+        let mut connection = connection();
+        let first = connection
+            .transform_requests(
+                b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\nte",
+                "other.example.com",
+            )
+            .await
+            .unwrap();
+        let second = connection
+            .transform_requests(
+                b"st\r\n0\r\nX-End: yes\r\n\r\nGET /next HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                "other.example.com",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            [first, second].concat(),
+            b"POST /v1 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\ntest\r\n0\r\nX-End: yes\r\n\r\nGET /next HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn expect_continue_api_request_forwards_headers_before_body() {
+        let mut connection = connection();
+        let headers = b"POST /v1 HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n";
+
+        let output = connection
+            .transform_requests(headers, "other.example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(output, headers);
+        assert_eq!(
+            connection
+                .transform_requests(b"body", "other.example.com")
+                .await
+                .unwrap(),
+            b"body"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_token_request_is_rejected_after_headers() {
+        let mut connection = connection();
+        let error = connection
+            .transform_requests(
+                b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "auth.example.com",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth token endpoint chunked requests are unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_rejects_head_requests() {
+        let mut connection = connection();
+        let error = connection
+            .transform_requests(
+                b"HEAD /oauth/token HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                "auth.example.com",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth token endpoint requests must use POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_then_token_request_fails_closed() {
+        let mut connection = connection();
+        connection
+            .transform_requests(
+                b"GET /v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                "auth.example.com",
+            )
+            .await
+            .unwrap();
+
+        let error = connection
+            .transform_requests(
+                b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                "auth.example.com",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "mixing OAuth API and token requests on one connection is unsupported"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_token_endpoint_does_not_match_other_path() {
         let request = b"POST /oauth/token/other HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let mut connection = connection();
@@ -1334,7 +1668,7 @@ mod tests {
         object.insert("access_token".into(), Value::String("ACCESS".into()));
         object.insert("refresh_token".into(), Value::String("REFRESH".into()));
         let rebuilt = rebuild_message(headers, &serde_json::to_vec(&json).unwrap()).unwrap();
-        let parsed = parse_http_message(&rebuilt).unwrap().unwrap();
+        let parsed = parse_token_response(&rebuilt).unwrap().unwrap();
         let output: Value = serde_json::from_slice(parsed.body).unwrap();
         assert_eq!(output["scope"], "read");
         assert_eq!(output["expires_in"], 3600);
@@ -1465,6 +1799,38 @@ mod tests {
         assert!(connection.transform_responses(response).await.is_err());
     }
 
+    #[tokio::test]
+    async fn token_responses_require_identity_content_length_framing() {
+        for response in [
+            b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 400 Bad Request\r\n\r\nsecret".as_slice(),
+            b"HTTP/1.1 400 Bad Request\r\nContent-Encoding: gzip\r\nContent-Length: 6\r\n\r\nsecret".as_slice(),
+        ] {
+            let mut connection = connection();
+            connection.token_connection = Some(true);
+            connection.exchanges.push_back(Some(0));
+            assert!(connection.transform_responses(response).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_with_buffered_token_response_fails_closed() {
+        let mut connection = connection();
+        connection.token_connection = Some(true);
+        connection.exchanges.push_back(Some(0));
+        assert!(
+            connection
+                .transform_responses(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nreal-access"
+                )
+                .await
+                .is_ok()
+        );
+
+        let error = connection.finish_response_scrubbing().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     #[test]
     fn error_response_token_fields_are_never_released() {
         let connection = connection();
@@ -1495,7 +1861,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(output.len(), input.len());
-        assert!(connection.finish_response_scrubbing().is_empty());
+        assert!(connection.finish_response_scrubbing().unwrap().is_empty());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("***********"));
         assert!(output.contains("************"));
@@ -1543,6 +1909,7 @@ mod tests {
                 Zeroizing::new("real-access".into()),
                 Zeroizing::new("real-refresh".into()),
             ],
+            request_state: RequestState::Headers,
         };
         connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
         let body = "refresh_token=$OTHER_REFRESH";
@@ -1578,6 +1945,7 @@ mod tests {
             response_scrub_state: ResponseScrubState::Headers,
             response_head_requests: VecDeque::new(),
             seen_tokens: vec![],
+            request_state: RequestState::Headers,
         };
         let request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
 
@@ -1651,6 +2019,33 @@ mod tests {
             output,
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n*****\r\n6\r\n******\r\n0\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn chunked_response_redacts_tokens_in_extensions() {
+        let mut connection = connection();
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;token=real-access\r\nbody\r\n0\r\n\r\n";
+
+        let output = connection.scrub_response_chunk(response).unwrap();
+
+        assert_eq!(output.len(), response.len());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("token=***********")
+        );
+    }
+
+    #[test]
+    fn encoded_api_response_is_rejected_before_headers_are_released() {
+        let mut connection = connection();
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\n\r\nreal-access";
+
+        let error = connection.scrub_response_chunk(response).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "encoded OAuth responses are unsupported");
     }
 
     #[test]

@@ -407,7 +407,7 @@ pub(crate) async fn intercept_relay(
             result = server_tls.read(&mut server_buf) => {
                 match result {
                     Ok(0) => {
-                        let tail = oauth.finish_response_scrubbing();
+                        let tail = oauth.finish_response_scrubbing()?;
                         if !tail.is_empty() {
                             guest_tls.writer().write_all(&tail).map_err(io::Error::other)?;
                             flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
