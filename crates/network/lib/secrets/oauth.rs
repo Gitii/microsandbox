@@ -21,6 +21,7 @@ use crate::shared::SharedState;
 
 const MAX_OAUTH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BROKER_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_OUTSTANDING_API_REQUESTS: usize = 1024;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 //--------------------------------------------------------------------------------------------------
@@ -230,6 +231,12 @@ impl OAuthConnection {
                     pending = self.response_scrub_buffer.split_off(boundary);
                     self.response_scrub_buffer.clear();
                     let status = response_status(&headers)?;
+                    if status == 101 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "OAuth API protocol upgrades are unsupported",
+                        ));
+                    }
                     self.response_scrub_state = response_body_state(
                         &headers,
                         self.response_head_requests
@@ -488,6 +495,13 @@ impl OAuthConnection {
                     }
                     self.token_connection = Some(is_token_request);
                     if !is_token_request {
+                        reject_protocol_upgrade(&headers)?;
+                        if self.response_head_requests.len() >= MAX_OUTSTANDING_API_REQUESTS {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "too many outstanding OAuth API requests",
+                            ));
+                        }
                         self.response_head_requests
                             .push_back(method.eq_ignore_ascii_case("HEAD"));
                     }
@@ -759,37 +773,31 @@ impl OAuthConnection {
         body: &[u8],
     ) -> io::Result<Vec<u8>> {
         let grant = &self.grants[index];
-        let mut response = if let Ok(mut json) = serde_json::from_slice::<Value>(body)
-            && let Some(object) = json.as_object_mut()
-        {
-            if object.contains_key(&grant.config.access_token_field) {
-                object.insert(
-                    grant.config.access_token_field.clone(),
-                    Value::String(grant.config.access_sentinel.clone()),
-                );
-            }
-            if object.contains_key(&grant.config.refresh_token_field) {
-                object.insert(
-                    grant.config.refresh_token_field.clone(),
-                    Value::String(grant.config.refresh_sentinel.clone()),
-                );
-            }
-            let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
-            rebuild_message(headers, &body)?
-        } else {
-            [headers, body].concat()
-        };
-        response = replace_all(
-            &response,
-            grant.access.as_bytes(),
-            grant.config.access_sentinel.as_bytes(),
-        );
-        response = replace_all(
-            &response,
-            grant.refresh.as_bytes(),
-            grant.config.refresh_sentinel.as_bytes(),
-        );
-        update_content_length(&response)
+        let mut json: Value = serde_json::from_slice(body).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed OAuth error response")
+        })?;
+        let object = json.as_object_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth error response must be an object",
+            )
+        })?;
+        if object.contains_key(&grant.config.access_token_field) {
+            object.insert(
+                grant.config.access_token_field.clone(),
+                Value::String(grant.config.access_sentinel.clone()),
+            );
+        }
+        if object.contains_key(&grant.config.refresh_token_field) {
+            object.insert(
+                grant.config.refresh_token_field.clone(),
+                Value::String(grant.config.refresh_sentinel.clone()),
+            );
+        }
+        let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
+        let mut response = rebuild_message(headers, &body)?;
+        scrub_seen_tokens(&mut response, &self.seen_tokens);
+        Ok(response)
     }
 
     fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
@@ -1239,6 +1247,26 @@ fn reject_expect_100_continue(headers: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn reject_protocol_upgrade(headers: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    let upgrade = text.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("upgrade")
+                || name.eq_ignore_ascii_case("connection")
+                    && value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+    });
+    if upgrade {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth API protocol upgrades are unsupported",
+        ));
+    }
+    Ok(())
+}
+
 fn response_status(headers: &[u8]) -> io::Result<u16> {
     let status = first_header_line(headers)?
         .split_whitespace()
@@ -1510,6 +1538,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_request_metadata_is_bounded_before_forwarding() {
+        let mut connection = connection();
+        connection
+            .response_head_requests
+            .resize(MAX_OUTSTANDING_API_REQUESTS, false);
+
+        let error = connection
+            .transform_requests(
+                b"GET /v1 HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                "api.example.com",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "too many outstanding OAuth API requests");
+        assert_eq!(
+            connection.response_head_requests.len(),
+            MAX_OUTSTANDING_API_REQUESTS
+        );
+    }
+
+    #[tokio::test]
     async fn content_length_api_request_streams_after_headers() {
         let mut connection = connection();
         let headers = b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\nAccept-Encoding: br\r\n\r\n";
@@ -1569,6 +1620,27 @@ mod tests {
                 .unwrap(),
             b"body"
         );
+    }
+
+    #[tokio::test]
+    async fn api_protocol_upgrade_requests_are_rejected_before_forwarding() {
+        for request in [
+            b"GET /v1 HTTP/1.1\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\n\r\n".as_slice(),
+        ] {
+            let mut connection = connection();
+            let error = connection
+                .transform_requests(request, "api.example.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth API protocol upgrades are unsupported"
+            );
+            assert!(connection.response_head_requests.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1800,6 +1872,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_object_token_errors_fail_closed_without_output() {
+        for body in ["not-json", r#""credential""#, r#"["credential"]"#] {
+            let mut connection = connection();
+            connection.exchanges.push_back(Some(0));
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            let error = connection
+                .transform_responses(response.as_bytes())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
     async fn token_responses_require_identity_content_length_framing() {
         for response in [
             b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
@@ -1835,16 +1926,20 @@ mod tests {
     fn error_response_token_fields_are_never_released() {
         let connection = connection();
         let headers = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n";
-        let body = br#"{"error":"invalid_grant","access_token":"novel-access","refresh_token":"novel-refresh","error_description":"real-access and real-refresh","nested":{"access":"real-access"}}"#;
+        let body = br#"{"error":"invalid_grant","access_token":"novel-access","refresh_token":"novel-refresh","error_description":"real-access and real-refresh","error_uri":"https://auth.example.com/errors/invalid-grant","retry_after":30,"nested":{"access":"real-access"}}"#;
         let output = connection.sanitize_token_error(0, headers, body).unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("invalid_grant"));
-        assert!(output.contains("$MSB_OAUTH_ACCESS_123"));
-        assert!(output.contains("$MSB_OAUTH_REFRESH_123"));
-        assert!(!output.contains("real-access"));
-        assert!(!output.contains("real-refresh"));
-        assert!(!output.contains("novel-access"));
-        assert!(!output.contains("novel-refresh"));
+        let message = parse_token_response(&output).unwrap().unwrap();
+        let json: Value = serde_json::from_slice(message.body).unwrap();
+        assert_eq!(json["error"], "invalid_grant");
+        assert_eq!(json["access_token"], "$MSB_OAUTH_ACCESS_123");
+        assert_eq!(json["refresh_token"], "$MSB_OAUTH_REFRESH_123");
+        assert_eq!(
+            json["error_uri"],
+            "https://auth.example.com/errors/invalid-grant"
+        );
+        assert_eq!(json["retry_after"], 30);
+        assert_eq!(json["error_description"], "*********** and ************");
+        assert_eq!(json["nested"]["access"], "***********");
     }
 
     #[test]
@@ -2046,6 +2141,21 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "encoded OAuth responses are unsupported");
+    }
+
+    #[test]
+    fn switching_protocols_response_is_rejected_before_release() {
+        let mut connection = connection();
+        connection.response_head_requests.push_back(false);
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+        let error = connection.scrub_response_chunk(response).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth API protocol upgrades are unsupported"
+        );
     }
 
     #[test]
