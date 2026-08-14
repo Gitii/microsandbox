@@ -15,8 +15,9 @@ use crate::{
     CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus, CloudSandboxStatusReason,
     CloudSecretEntry, CloudSecretSource, CloudSecretsConfig, CloudViolationAction,
     CloudVolumeMount, CpuPlacement, Destination, DestinationGroup, Direction, EnvVar, HandoffInit,
-    HostPermissions, MountOptions, NetworkPolicy, PortRange, Protocol, Rule, SandboxLogLevel,
-    SandboxPolicy, SecretInjection, SecurityProfile, StatVirtualization, TransparentHugePagePolicy,
+    HostPattern, HostPermissions, MountOptions, NetworkPolicy, OAuthSecret, PortRange, Protocol,
+    Rule, SandboxLogLevel, SandboxPolicy, SecretInjection, SecurityProfile, StatVirtualization,
+    TransparentHugePagePolicy,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -37,8 +38,10 @@ const DOMAIN_TYPE_NAMES: &[&str] = &[
     "EnvVar",
     "HandoffInit",
     "HostPermissions",
+    "HostPattern",
     "MountOptions",
     "NetworkPolicy",
+    "OAuthSecret",
     "PortRange",
     "Protocol",
     "Rule",
@@ -119,6 +122,8 @@ pub fn domain_declarations() -> Vec<String> {
         StatVirtualization::decl(&cfg),
         TransparentHugePagePolicy::decl(&cfg),
         HostPermissions::decl(&cfg),
+        HostPattern::decl(&cfg),
+        OAuthSecret::decl(&cfg),
         SecretInjection::decl(&cfg),
         NetworkPolicy::decl(&cfg),
         Rule::decl(&cfg),
@@ -236,7 +241,7 @@ mod tests {
 
     #[test]
     fn cloud_bindings_import_domain_and_stay_scoped() {
-        assert_eq!(domain_declarations().len(), 17);
+        assert_eq!(domain_declarations().len(), 21);
         assert_eq!(cloud_declarations().len(), 23);
 
         let cloud = render_cloud();

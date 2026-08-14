@@ -265,10 +265,21 @@ pub(crate) async fn intercept_relay(
     }
     .with_guest_dst(guest_dst);
     let mut oauth = if via_connect {
-        OAuthConnection::new_tls_intercepted_via_connect(&secrets.oauth, sni_name).await?
+        OAuthConnection::new_tls_intercepted_via_connect(
+            &secrets.oauth,
+            sni_name,
+            connect_dst.port(),
+        )
+        .await?
     } else {
-        OAuthConnection::new_tls_intercepted(&secrets.oauth, sni_name, guest_dst.ip(), &shared)
-            .await?
+        OAuthConnection::new_tls_intercepted(
+            &secrets.oauth,
+            sni_name,
+            connect_dst.port(),
+            guest_dst.ip(),
+            &shared,
+        )
+        .await?
     };
 
     // Get or generate per-domain certificate (includes cached ServerConfig).

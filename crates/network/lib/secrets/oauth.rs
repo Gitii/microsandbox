@@ -34,6 +34,7 @@ pub(crate) struct OAuthConnection {
     response_buffer: Vec<u8>,
     exchanges: VecDeque<Option<usize>>,
     token_connection: Option<bool>,
+    connection_port: u16,
     response_scrub_tail: Vec<u8>,
     seen_tokens: Vec<Zeroizing<String>>,
 }
@@ -41,6 +42,7 @@ pub(crate) struct OAuthConnection {
 struct LoadedGrant {
     config: OAuthSecret,
     endpoint_host: String,
+    endpoint_port: u16,
     endpoint_target: String,
     access: Zeroizing<String>,
     refresh: Zeroizing<String>,
@@ -97,28 +99,32 @@ impl OAuthConnection {
     pub(crate) async fn new_tls_intercepted(
         configs: &[OAuthSecret],
         sni: &str,
+        port: u16,
         guest_ip: IpAddr,
         shared: &SharedState,
     ) -> io::Result<Self> {
-        Self::new(configs, sni, Some((guest_ip, shared))).await
+        Self::new(configs, sni, port, Some((guest_ip, shared))).await
     }
 
     pub(crate) async fn new_tls_intercepted_via_connect(
         configs: &[OAuthSecret],
         sni: &str,
+        port: u16,
     ) -> io::Result<Self> {
-        Self::new(configs, sni, None).await
+        Self::new(configs, sni, port, None).await
     }
 
     async fn new(
         configs: &[OAuthSecret],
         sni: &str,
+        port: u16,
         identity: Option<(IpAddr, &SharedState)>,
     ) -> io::Result<Self> {
         let mut grants = Vec::new();
         let mut seen_tokens = Vec::new();
         for config in configs {
-            let (endpoint_host, endpoint_target) = parse_https_endpoint(&config.token_endpoint)?;
+            let (endpoint_host, endpoint_port, endpoint_target) =
+                parse_https_endpoint(&config.token_endpoint)?;
             let host_allowed = |matches: bool| {
                 matches
                     && identity.is_none_or(|(guest_ip, shared)| {
@@ -127,7 +133,8 @@ impl OAuthConnection {
                         })
                     })
             };
-            let endpoint_relevant = host_allowed(endpoint_host.eq_ignore_ascii_case(sni));
+            let endpoint_relevant =
+                port == endpoint_port && host_allowed(endpoint_host.eq_ignore_ascii_case(sni));
             let inject_relevant = config.inject_hosts.iter().any(|host| {
                 identity.map_or_else(
                     || host.matches(sni),
@@ -144,6 +151,7 @@ impl OAuthConnection {
             grants.push(LoadedGrant {
                 config: config.clone(),
                 endpoint_host,
+                endpoint_port,
                 endpoint_target,
                 access: Zeroizing::new(loaded.access),
                 refresh: Zeroizing::new(loaded.refresh),
@@ -153,6 +161,7 @@ impl OAuthConnection {
         }
         Ok(Self {
             token_connection: None,
+            connection_port: port,
             grants,
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
@@ -171,25 +180,25 @@ impl OAuthConnection {
     }
 
     pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        self.response_scrub_tail.extend_from_slice(data);
+        let context_len = self.response_scrub_tail.len();
+        let mut combined = std::mem::take(&mut self.response_scrub_tail);
+        combined.extend_from_slice(data);
         let keep = self
             .seen_tokens
             .iter()
             .map(|token| token.len().saturating_sub(1))
             .max()
             .unwrap_or(0)
-            .min(self.response_scrub_tail.len());
-        let emit = self.response_scrub_tail.len() - keep;
-        let mut buffered = std::mem::take(&mut self.response_scrub_tail);
-        scrub_seen_tokens(&mut buffered, &self.seen_tokens);
-        self.response_scrub_tail = buffered.split_off(emit);
-        buffered
+            .min(combined.len());
+        self.response_scrub_tail = combined[combined.len() - keep..].to_vec();
+        scrub_seen_tokens(&mut combined, &self.seen_tokens);
+        scrub_token_prefix_suffixes(&mut combined, &self.seen_tokens);
+        combined[context_len..].to_vec()
     }
 
     pub(crate) fn finish_response_scrubbing(&mut self) -> Vec<u8> {
-        let mut tail = std::mem::take(&mut self.response_scrub_tail);
-        scrub_seen_tokens(&mut tail, &self.seen_tokens);
-        tail
+        self.response_scrub_tail.clear();
+        Vec::new()
     }
 
     /// Transform complete HTTP/1.1 requests and record token exchanges.
@@ -216,7 +225,9 @@ impl OAuthConnection {
                 .iter()
                 .enumerate()
                 .filter(|(_, grant)| {
-                    grant.endpoint_host.eq_ignore_ascii_case(sni) && grant.endpoint_target == target
+                    grant.endpoint_host.eq_ignore_ascii_case(sni)
+                        && grant.endpoint_port == self.connection_port
+                        && grant.endpoint_target == target
                 })
                 .collect::<Vec<_>>();
             let matching_grants = endpoint_grants
@@ -421,7 +432,26 @@ impl OAuthConnection {
         body: &[u8],
     ) -> io::Result<Vec<u8>> {
         let grant = &self.grants[index];
-        let mut response = [headers, body].concat();
+        let mut response = if let Ok(mut json) = serde_json::from_slice::<Value>(body)
+            && let Some(object) = json.as_object_mut()
+        {
+            if object.contains_key(&grant.config.access_token_field) {
+                object.insert(
+                    grant.config.access_token_field.clone(),
+                    Value::String(grant.config.access_sentinel.clone()),
+                );
+            }
+            if object.contains_key(&grant.config.refresh_token_field) {
+                object.insert(
+                    grant.config.refresh_token_field.clone(),
+                    Value::String(grant.config.refresh_sentinel.clone()),
+                );
+            }
+            let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
+            rebuild_message(headers, &body)?
+        } else {
+            [headers, body].concat()
+        };
         response = replace_all(
             &response,
             grant.access.as_bytes(),
@@ -450,6 +480,18 @@ fn remember_token(tokens: &mut Vec<Zeroizing<String>>, token: &str) {
 fn scrub_seen_tokens(data: &mut Vec<u8>, tokens: &[Zeroizing<String>]) {
     for token in tokens {
         *data = replace_same_length(data, token.as_bytes());
+    }
+}
+
+fn scrub_token_prefix_suffixes(data: &mut [u8], tokens: &[Zeroizing<String>]) {
+    for token in tokens {
+        for prefix_len in (1..token.len()).rev() {
+            if data.ends_with(&token.as_bytes()[..prefix_len]) {
+                let start = data.len() - prefix_len;
+                data[start..].fill(b'*');
+                break;
+            }
+        }
     }
 }
 
@@ -591,21 +633,29 @@ fn parse_broker_response<T: for<'de> Deserialize<'de>>(response: &str) -> io::Re
     })
 }
 
-fn parse_https_endpoint(endpoint: &str) -> io::Result<(String, String)> {
+fn parse_https_endpoint(endpoint: &str) -> io::Result<(String, u16, String)> {
     let rest = endpoint.strip_prefix("https://").ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "OAuth endpoint is not HTTPS")
     })?;
     let (authority, target) = rest
         .split_once('/')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "OAuth endpoint has no path"))?;
-    let host = authority.split(':').next().unwrap_or_default();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse::<u16>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid OAuth endpoint port")
+            })?,
+        ),
+        None => (authority, 443),
+    };
     if host.is_empty() || authority.contains('@') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid OAuth endpoint authority",
         ));
     }
-    Ok((host.to_ascii_lowercase(), format!("/{target}")))
+    Ok((host.to_ascii_lowercase(), port, format!("/{target}")))
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -842,6 +892,7 @@ mod tests {
             response_buffer: vec![],
             exchanges: VecDeque::new(),
             token_connection: None,
+            connection_port: 443,
             response_scrub_tail: Vec::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
@@ -854,6 +905,7 @@ mod tests {
         LoadedGrant {
             config,
             endpoint_host: "auth.example.com".into(),
+            endpoint_port: 443,
             endpoint_target: "/oauth/token".into(),
             access: Zeroizing::new("real-access".into()),
             refresh: Zeroizing::new("real-refresh".into()),
@@ -998,6 +1050,19 @@ mod tests {
         assert_eq!(connection.token_connection, Some(false));
     }
 
+    #[tokio::test]
+    async fn exact_token_endpoint_does_not_match_other_port() {
+        let request = b"POST /oauth/token HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let mut connection = connection();
+        connection.connection_port = 8443;
+        let output = connection
+            .transform_requests(request, "auth.example.com")
+            .await
+            .unwrap();
+        assert_eq!(output, request);
+        assert_eq!(connection.token_connection, Some(false));
+    }
+
     #[test]
     fn response_rebuild_preserves_unrelated_json() {
         let headers =
@@ -1019,7 +1084,11 @@ mod tests {
     fn endpoint_parser_requires_https_and_preserves_exact_target() {
         assert_eq!(
             parse_https_endpoint("https://auth.example.com/oauth/token?aud=x").unwrap(),
-            ("auth.example.com".into(), "/oauth/token?aud=x".into())
+            ("auth.example.com".into(), 443, "/oauth/token?aud=x".into())
+        );
+        assert_eq!(
+            parse_https_endpoint("https://auth.example.com:8443/oauth/token").unwrap(),
+            ("auth.example.com".into(), 8443, "/oauth/token".into())
         );
         assert!(parse_https_endpoint("http://auth.example.com/token").is_err());
     }
@@ -1094,7 +1163,7 @@ mod tests {
 
         let mut oauth = config();
         oauth.broker_endpoint = socket.to_string_lossy().into_owned();
-        let mut connection = OAuthConnection::new(&[oauth], "auth.example.com", None)
+        let mut connection = OAuthConnection::new(&[oauth], "auth.example.com", 443, None)
             .await
             .unwrap();
         let request_body = "refresh_token=$MSB_OAUTH_REFRESH_123";
@@ -1139,7 +1208,7 @@ mod tests {
     fn error_response_token_fields_are_never_released() {
         let connection = connection();
         let headers = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n";
-        let body = br#"{"error":"invalid_grant","error_description":"real-access and real-refresh","nested":{"access":"real-access"}}"#;
+        let body = br#"{"error":"invalid_grant","access_token":"novel-access","refresh_token":"novel-refresh","error_description":"real-access and real-refresh","nested":{"access":"real-access"}}"#;
         let output = connection.sanitize_token_error(0, headers, body).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("invalid_grant"));
@@ -1147,14 +1216,18 @@ mod tests {
         assert!(output.contains("$MSB_OAUTH_REFRESH_123"));
         assert!(!output.contains("real-access"));
         assert!(!output.contains("real-refresh"));
+        assert!(!output.contains("novel-access"));
+        assert!(!output.contains("novel-refresh"));
     }
 
     #[test]
     fn api_response_echoes_are_scrubbed() {
         let mut connection = connection();
+        let input = b"echoed real-access and real-refresh";
         let mut output = connection.scrub_response_chunk(b"echoed real-ac");
         output.extend(connection.scrub_response_chunk(b"cess and real-refresh"));
-        output.extend(connection.finish_response_scrubbing());
+        assert_eq!(output.len(), input.len());
+        assert!(connection.finish_response_scrubbing().is_empty());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("***********"));
         assert!(output.contains("************"));
@@ -1192,6 +1265,7 @@ mod tests {
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
             token_connection: None,
+            connection_port: 443,
             response_scrub_tail: Vec::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),

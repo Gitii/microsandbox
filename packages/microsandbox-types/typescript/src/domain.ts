@@ -85,6 +85,51 @@ export type TransparentHugePagePolicy = "always" | "madvise" | "never";
 
 export type HostPermissions = "private" | "mirror";
 
+export type HostPattern = { "exact": string } | { "wildcard": string } | "any";
+
+export type OAuthSecret = {
+  /**
+   * Host broker Unix-domain socket path.
+   */
+  broker_endpoint: string;
+  /**
+   * Opaque grant identifier understood by the broker.
+   */
+  grant_id: string;
+  /**
+   * Exact HTTPS token endpoint, including path and optional query.
+   */
+  token_endpoint: string;
+  /**
+   * Hosts where the access sentinel may be substituted.
+   */
+  inject_hosts: Array<HostPattern>;
+  /**
+   * JSON field carrying the access token in successful token responses.
+   */
+  access_token_field: string;
+  /**
+   * JSON field carrying the refresh token in successful token responses.
+   */
+  refresh_token_field: string;
+  /**
+   * Environment variable exposing the access sentinel to the guest.
+   */
+  access_env_var: string;
+  /**
+   * Environment variable exposing the refresh sentinel to the guest.
+   */
+  refresh_env_var: string;
+  /**
+   * Per-sandbox access-token sentinel.
+   */
+  access_sentinel: string;
+  /**
+   * Per-sandbox refresh-token sentinel.
+   */
+  refresh_sentinel: string;
+};
+
 export type SecretInjection = {
   /**
    * Substitute in HTTP headers (default: true).
