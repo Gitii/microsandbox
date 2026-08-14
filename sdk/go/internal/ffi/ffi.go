@@ -1582,6 +1582,7 @@ type CreateOptions struct {
 	PortBindings    []PortBindingOptions `json:"port_bindings,omitempty"`
 	Network         *NetworkOptions      `json:"network,omitempty"`
 	Secrets         []SecretOptions      `json:"secrets,omitempty"`
+	OAuthSecrets    []OAuthSecretOptions `json:"oauth_secrets,omitempty"`
 	Patches         []PatchOptions       `json:"patches,omitempty"`
 	Volumes         map[string]MountSpec `json:"volumes,omitempty"`
 }
@@ -1717,6 +1718,20 @@ type SecretOptions struct {
 	Placeholder       string   `json:"placeholder,omitempty"`
 	RequireTLS        *bool    `json:"require_tls,omitempty"`
 	OnViolation       string   `json:"on_violation,omitempty"`
+}
+
+// OAuthSecretOptions is the durable JSON representation of an OAuth grant.
+type OAuthSecretOptions struct {
+	BrokerEndpoint    string   `json:"broker_endpoint"`
+	GrantID           string   `json:"grant_id"`
+	TokenEndpoint     string   `json:"token_endpoint"`
+	InjectHosts       []string `json:"inject_hosts"`
+	AccessTokenField  string   `json:"access_token_field"`
+	RefreshTokenField string   `json:"refresh_token_field"`
+	AccessEnvVar      string   `json:"access_env_var"`
+	RefreshEnvVar     string   `json:"refresh_env_var"`
+	AccessSentinel    string   `json:"access_sentinel"`
+	RefreshSentinel   string   `json:"refresh_sentinel"`
 }
 
 // PatchOptions is the JSON representation of a single rootfs patch.

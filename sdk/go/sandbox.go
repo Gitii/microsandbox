@@ -186,6 +186,20 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 			OnViolation:       string(s.OnViolation),
 		})
 	}
+	for _, grant := range o.OAuthSecrets {
+		ffiOpts.OAuthSecrets = append(ffiOpts.OAuthSecrets, ffi.OAuthSecretOptions{
+			BrokerEndpoint:    grant.BrokerEndpoint,
+			GrantID:           grant.GrantID,
+			TokenEndpoint:     grant.TokenEndpoint,
+			InjectHosts:       grant.InjectHosts,
+			AccessTokenField:  grant.AccessTokenField,
+			RefreshTokenField: grant.RefreshTokenField,
+			AccessEnvVar:      grant.AccessEnvVar,
+			RefreshEnvVar:     grant.RefreshEnvVar,
+			AccessSentinel:    grant.AccessSentinel,
+			RefreshSentinel:   grant.RefreshSentinel,
+		})
+	}
 
 	for _, p := range o.Patches {
 		ffiOpts.Patches = append(ffiOpts.Patches, ffi.PatchOptions{

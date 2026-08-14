@@ -7,6 +7,7 @@ import type {
   HostPermissions,
   MountOptions,
   NetworkPolicy,
+  OAuthSecret,
   SandboxLogLevel,
   SandboxPolicy,
   SecretInjection,
@@ -414,6 +415,10 @@ export type CloudSecretsConfig = {
    * Secrets to inject.
    */
   entries: Array<CloudSecretEntry>;
+  /**
+   * Broker-backed OAuth grants.
+   */
+  oauth: Array<OAuthSecret>;
   /**
    * Default action when a placeholder leaks to a disallowed host.
    */

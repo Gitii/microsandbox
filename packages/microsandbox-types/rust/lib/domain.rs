@@ -1825,9 +1825,44 @@ pub struct SecretsConfig {
     #[serde(default)]
     pub secrets: Vec<SecretEntry>,
 
+    /// OAuth grants whose token material is held by a host broker.
+    #[serde(default)]
+    pub oauth: Vec<OAuthSecret>,
+
     /// Default action when a placeholder leaks to a disallowed host.
     #[serde(default)]
     pub on_violation: ViolationAction,
+}
+
+/// Provider-neutral OAuth token handling configuration.
+///
+/// This durable value contains only routing metadata and an opaque grant ID.
+/// Access and refresh tokens are loaded from the broker at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct OAuthSecret {
+    /// Host broker Unix-domain socket path.
+    pub broker_endpoint: String,
+    /// Opaque grant identifier understood by the broker.
+    pub grant_id: String,
+    /// Exact HTTPS token endpoint, including path and optional query.
+    pub token_endpoint: String,
+    /// Hosts where the access sentinel may be substituted.
+    #[serde(default)]
+    pub inject_hosts: Vec<HostPattern>,
+    /// JSON field carrying the access token in successful token responses.
+    pub access_token_field: String,
+    /// JSON field carrying the refresh token in successful token responses.
+    pub refresh_token_field: String,
+    /// Environment variable exposing the access sentinel to the guest.
+    pub access_env_var: String,
+    /// Environment variable exposing the refresh sentinel to the guest.
+    pub refresh_env_var: String,
+    /// Per-sandbox access-token sentinel.
+    pub access_sentinel: String,
+    /// Per-sandbox refresh-token sentinel.
+    pub refresh_sentinel: String,
 }
 
 /// A single secret entry.
@@ -2020,6 +2055,15 @@ pub enum SecretConfigError {
         /// Index of the invalid secret entry.
         secret_index: usize,
     },
+
+    /// An OAuth configuration value is invalid.
+    #[error("oauth grant #{grant_index}: {reason}")]
+    InvalidOAuth {
+        /// Index of the invalid OAuth grant.
+        grant_index: usize,
+        /// Non-sensitive reason the configuration is invalid.
+        reason: &'static str,
+    },
 }
 
 impl SecretsConfig {
@@ -2027,6 +2071,49 @@ impl SecretsConfig {
     pub fn validate(&self) -> Result<(), SecretConfigError> {
         for (index, secret) in self.secrets.iter().enumerate() {
             secret.validate(index)?;
+        }
+        for (index, oauth) in self.oauth.iter().enumerate() {
+            oauth.validate(index)?;
+        }
+        Ok(())
+    }
+}
+
+impl OAuthSecret {
+    /// Validate durable OAuth metadata without contacting the broker.
+    pub fn validate(&self, grant_index: usize) -> Result<(), SecretConfigError> {
+        let invalid = |reason| SecretConfigError::InvalidOAuth {
+            grant_index,
+            reason,
+        };
+        if self.broker_endpoint.is_empty() {
+            return Err(invalid("broker_endpoint must not be empty"));
+        }
+        if self.grant_id.is_empty() {
+            return Err(invalid("grant_id must not be empty"));
+        }
+        if !self.token_endpoint.starts_with("https://") {
+            return Err(invalid("token_endpoint must be HTTPS"));
+        }
+        let authority_and_path = &self.token_endpoint[8..];
+        if !authority_and_path.contains('/') || authority_and_path.starts_with('/') {
+            return Err(invalid("token_endpoint must include a host and path"));
+        }
+        if self.inject_hosts.is_empty() {
+            return Err(invalid("at least one inject host is required"));
+        }
+        if self.access_token_field.is_empty() || self.refresh_token_field.is_empty() {
+            return Err(invalid("token response fields must not be empty"));
+        }
+        if self.access_token_field == self.refresh_token_field {
+            return Err(invalid("access and refresh token fields must differ"));
+        }
+        validate_env_var(&self.access_env_var, grant_index)?;
+        validate_env_var(&self.refresh_env_var, grant_index)?;
+        validate_placeholder(&self.access_sentinel, grant_index)?;
+        validate_placeholder(&self.refresh_sentinel, grant_index)?;
+        if self.access_sentinel == self.refresh_sentinel {
+            return Err(invalid("access and refresh sentinels must differ"));
         }
         Ok(())
     }
@@ -2705,6 +2792,30 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DeploymentProfile>(r#""single_tenant""#).unwrap(),
             DeploymentProfile::SingleTenant
+        );
+    }
+
+    #[test]
+    fn oauth_access_and_refresh_token_fields_must_differ() {
+        let oauth = OAuthSecret {
+            broker_endpoint: "/run/microsandbox/oauth.sock".into(),
+            grant_id: "grant".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            access_token_field: "token".into(),
+            refresh_token_field: "token".into(),
+            access_env_var: "ACCESS_TOKEN".into(),
+            refresh_env_var: "REFRESH_TOKEN".into(),
+            access_sentinel: "$ACCESS".into(),
+            refresh_sentinel: "$REFRESH".into(),
+        };
+
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "access and refresh token fields must differ",
+            })
         );
     }
 

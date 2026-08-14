@@ -22,6 +22,7 @@ use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::connect_upstream;
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
+use crate::secrets::oauth::OAuthConnection;
 use crate::shared::SharedState;
 
 //--------------------------------------------------------------------------------------------------
@@ -263,6 +264,23 @@ pub(crate) async fn intercept_relay(
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
+    let mut oauth = if via_connect {
+        OAuthConnection::new_tls_intercepted_via_connect(
+            &secrets.oauth,
+            sni_name,
+            connect_dst.port(),
+        )
+        .await?
+    } else {
+        OAuthConnection::new_tls_intercepted(
+            &secrets.oauth,
+            sni_name,
+            connect_dst.port(),
+            guest_dst.ip(),
+            &shared,
+        )
+        .await?
+    };
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -336,6 +354,8 @@ pub(crate) async fn intercept_relay(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
+        &mut oauth,
+        sni_name,
         &shared,
         &mut plaintext_buf,
     )
@@ -374,6 +394,8 @@ pub(crate) async fn intercept_relay(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
+                        &mut oauth,
+                        sni_name,
                         &shared,
                         &mut plaintext_buf,
                     )
@@ -384,12 +406,26 @@ pub(crate) async fn intercept_relay(
             // Server → guest: read plaintext, encrypt, send via channel.
             result = server_tls.read(&mut server_buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        let tail = oauth.finish_response_scrubbing()?;
+                        if !tail.is_empty() {
+                            guest_tls.writer().write_all(&tail).map_err(io::Error::other)?;
+                            flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+                        }
+                        break;
+                    },
                     Ok(n) => {
-                        guest_tls
-                            .writer()
-                            .write_all(&server_buf[..n])
-                            .map_err(io::Error::other)?;
+                        let data = if oauth.is_token_host() {
+                            oauth.transform_responses(&server_buf[..n]).await?
+                        } else if !oauth.is_empty() {
+                            oauth.scrub_response_chunk(&server_buf[..n])?
+                        } else {
+                            server_buf[..n].to_vec()
+                        };
+                        if data.is_empty() {
+                            continue;
+                        }
+                        guest_tls.writer().write_all(&data).map_err(io::Error::other)?;
                         flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
                     }
                     Err(e) => return Err(e),
@@ -447,6 +483,8 @@ async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
+    oauth: &mut OAuthConnection,
+    sni: &str,
     shared: &SharedState,
     buf: &mut [u8],
 ) -> io::Result<()> {
@@ -460,7 +498,7 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        if secrets_handler.is_empty() {
+        if secrets_handler.is_empty() && oauth.is_empty() {
             server_tls.write_all(&buf[..n]).await?;
             wrote_plaintext = true;
             continue;
@@ -468,6 +506,7 @@ async fn forward_plaintext(
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
+                let data = oauth.transform_requests(&data, sni).await?;
                 if !data.is_empty() {
                     server_tls.write_all(&data).await?;
                     wrote_plaintext = true;
