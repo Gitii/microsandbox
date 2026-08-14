@@ -2105,6 +2105,9 @@ impl OAuthSecret {
         if self.access_token_field.is_empty() || self.refresh_token_field.is_empty() {
             return Err(invalid("token response fields must not be empty"));
         }
+        if self.access_token_field == self.refresh_token_field {
+            return Err(invalid("access and refresh token fields must differ"));
+        }
         validate_env_var(&self.access_env_var, grant_index)?;
         validate_env_var(&self.refresh_env_var, grant_index)?;
         validate_placeholder(&self.access_sentinel, grant_index)?;
@@ -2789,6 +2792,30 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DeploymentProfile>(r#""single_tenant""#).unwrap(),
             DeploymentProfile::SingleTenant
+        );
+    }
+
+    #[test]
+    fn oauth_access_and_refresh_token_fields_must_differ() {
+        let oauth = OAuthSecret {
+            broker_endpoint: "/run/microsandbox/oauth.sock".into(),
+            grant_id: "grant".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            access_token_field: "token".into(),
+            refresh_token_field: "token".into(),
+            access_env_var: "ACCESS_TOKEN".into(),
+            refresh_env_var: "REFRESH_TOKEN".into(),
+            access_sentinel: "$ACCESS".into(),
+            refresh_sentinel: "$REFRESH".into(),
+        };
+
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "access and refresh token fields must differ",
+            })
         );
     }
 

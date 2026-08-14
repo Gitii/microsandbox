@@ -35,7 +35,11 @@ pub(crate) struct OAuthConnection {
     exchanges: VecDeque<Option<usize>>,
     token_connection: Option<bool>,
     connection_port: u16,
+    response_scrub_buffer: Vec<u8>,
+    response_scrub_framing: Vec<u8>,
     response_scrub_tail: Vec<u8>,
+    response_scrub_state: ResponseScrubState,
+    response_head_requests: VecDeque<bool>,
     seen_tokens: Vec<Zeroizing<String>>,
 }
 
@@ -88,6 +92,16 @@ struct HttpMessage<'a> {
     headers: &'a [u8],
     body: &'a [u8],
     total_len: usize,
+}
+
+enum ResponseScrubState {
+    Headers,
+    ContentLength(usize),
+    ChunkSize,
+    ChunkData(usize),
+    ChunkDataEnd,
+    ChunkTrailers,
+    CloseDelimited,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -166,7 +180,11 @@ impl OAuthConnection {
             request_buffer: Vec::new(),
             response_buffer: Vec::new(),
             exchanges: VecDeque::new(),
+            response_scrub_buffer: Vec::new(),
+            response_scrub_framing: Vec::new(),
             response_scrub_tail: Vec::new(),
+            response_scrub_state: ResponseScrubState::Headers,
+            response_head_requests: VecDeque::new(),
             seen_tokens,
         })
     }
@@ -179,26 +197,161 @@ impl OAuthConnection {
         self.token_connection == Some(true)
     }
 
-    pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        let context_len = self.response_scrub_tail.len();
-        let mut combined = std::mem::take(&mut self.response_scrub_tail);
-        combined.extend_from_slice(data);
-        let keep = self
-            .seen_tokens
-            .iter()
-            .map(|token| token.len().saturating_sub(1))
-            .max()
-            .unwrap_or(0)
-            .min(combined.len());
-        self.response_scrub_tail = combined[combined.len() - keep..].to_vec();
-        scrub_seen_tokens(&mut combined, &self.seen_tokens);
-        scrub_token_prefix_suffixes(&mut combined, &self.seen_tokens);
-        combined[context_len..].to_vec()
+    pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        let mut pending = data.to_vec();
+        while !pending.is_empty() {
+            match self.response_scrub_state {
+                ResponseScrubState::Headers => {
+                    self.response_scrub_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.response_scrub_buffer)?;
+                    let Some(boundary) = header_boundary(&self.response_scrub_buffer) else {
+                        break;
+                    };
+                    let headers = self.response_scrub_buffer[..boundary].to_vec();
+                    pending = self.response_scrub_buffer.split_off(boundary);
+                    self.response_scrub_buffer.clear();
+                    self.scrub_stream_bytes(&headers, &mut output);
+                    self.flush_scrub_tail(&mut output);
+                    let status = response_status(&headers)?;
+                    self.response_scrub_state = response_body_state(
+                        &headers,
+                        self.response_head_requests
+                            .front()
+                            .copied()
+                            .unwrap_or(false),
+                    )?;
+                    if !(100..200).contains(&status) {
+                        self.response_head_requests.pop_front();
+                    }
+                    if matches!(
+                        self.response_scrub_state,
+                        ResponseScrubState::ContentLength(0)
+                    ) {
+                        self.response_scrub_state = ResponseScrubState::Headers;
+                    }
+                }
+                ResponseScrubState::ContentLength(remaining) => {
+                    let consumed = remaining.min(pending.len());
+                    self.scrub_stream_bytes(&pending[..consumed], &mut output);
+                    pending.drain(..consumed);
+                    if consumed == remaining {
+                        self.flush_scrub_tail(&mut output);
+                        self.response_scrub_state = ResponseScrubState::Headers;
+                    } else {
+                        self.response_scrub_state =
+                            ResponseScrubState::ContentLength(remaining - consumed);
+                    }
+                }
+                ResponseScrubState::ChunkSize => {
+                    self.response_scrub_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.response_scrub_buffer)?;
+                    let Some(end) = line_boundary(&self.response_scrub_buffer) else {
+                        break;
+                    };
+                    let line = self.response_scrub_buffer[..end].to_vec();
+                    pending = self.response_scrub_buffer.split_off(end);
+                    self.response_scrub_buffer.clear();
+                    let size = parse_chunk_size(&line)?;
+                    if self.response_scrub_tail.is_empty() && self.response_scrub_framing.is_empty()
+                    {
+                        output.extend_from_slice(&line);
+                    } else {
+                        self.response_scrub_framing.extend_from_slice(&line);
+                    }
+                    self.response_scrub_state = if size == 0 {
+                        ResponseScrubState::ChunkTrailers
+                    } else {
+                        ResponseScrubState::ChunkData(size)
+                    };
+                }
+                ResponseScrubState::ChunkData(remaining) => {
+                    let consumed = remaining.min(pending.len());
+                    self.scrub_stream_bytes(&pending[..consumed], &mut output);
+                    pending.drain(..consumed);
+                    self.response_scrub_state = if consumed == remaining {
+                        ResponseScrubState::ChunkDataEnd
+                    } else {
+                        ResponseScrubState::ChunkData(remaining - consumed)
+                    };
+                }
+                ResponseScrubState::ChunkDataEnd => {
+                    self.response_scrub_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    if self.response_scrub_buffer.len() < 2 {
+                        break;
+                    }
+                    if !self.response_scrub_buffer.starts_with(b"\r\n") {
+                        return Err(invalid_http());
+                    }
+                    self.response_scrub_framing.extend_from_slice(b"\r\n");
+                    pending = self.response_scrub_buffer.split_off(2);
+                    self.response_scrub_buffer.clear();
+                    self.response_scrub_state = ResponseScrubState::ChunkSize;
+                }
+                ResponseScrubState::ChunkTrailers => {
+                    self.response_scrub_buffer.extend_from_slice(&pending);
+                    pending.clear();
+                    enforce_limit(&self.response_scrub_buffer)?;
+                    let boundary = if self.response_scrub_buffer.starts_with(b"\r\n") {
+                        Some(2)
+                    } else {
+                        header_boundary(&self.response_scrub_buffer)
+                    };
+                    let Some(boundary) = boundary else {
+                        break;
+                    };
+                    let trailers = self.response_scrub_buffer[..boundary].to_vec();
+                    pending = self.response_scrub_buffer.split_off(boundary);
+                    self.response_scrub_buffer.clear();
+                    self.flush_scrub_tail(&mut output);
+                    self.scrub_stream_bytes(&trailers, &mut output);
+                    self.flush_scrub_tail(&mut output);
+                    self.response_scrub_state = ResponseScrubState::Headers;
+                }
+                ResponseScrubState::CloseDelimited => {
+                    self.scrub_stream_bytes(&pending, &mut output);
+                    break;
+                }
+            }
+        }
+        Ok(output)
     }
 
     pub(crate) fn finish_response_scrubbing(&mut self) -> Vec<u8> {
-        self.response_scrub_tail.clear();
-        Vec::new()
+        let mut output = Vec::new();
+        let buffered = std::mem::take(&mut self.response_scrub_buffer);
+        self.scrub_stream_bytes(&buffered, &mut output);
+        self.flush_scrub_tail(&mut output);
+        output
+    }
+
+    fn scrub_stream_bytes(&mut self, data: &[u8], output: &mut Vec<u8>) {
+        let mut combined = std::mem::take(&mut self.response_scrub_tail);
+        let old_tail_len = combined.len();
+        combined.extend_from_slice(data);
+        scrub_seen_tokens(&mut combined, &self.seen_tokens);
+        let keep = longest_token_prefix_suffix(&combined, &self.seen_tokens);
+        let split = combined.len() - keep;
+        let tail = combined.split_off(split);
+        if self.response_scrub_framing.is_empty() {
+            output.extend(combined);
+        } else {
+            let before_framing = old_tail_len.min(combined.len());
+            output.extend_from_slice(&combined[..before_framing]);
+            if before_framing == old_tail_len {
+                output.extend(std::mem::take(&mut self.response_scrub_framing));
+                output.extend_from_slice(&combined[before_framing..]);
+            }
+        }
+        self.response_scrub_tail = tail;
+    }
+
+    fn flush_scrub_tail(&mut self, output: &mut Vec<u8>) {
+        output.extend(std::mem::take(&mut self.response_scrub_tail));
+        output.extend(std::mem::take(&mut self.response_scrub_framing));
     }
 
     /// Transform complete HTTP/1.1 requests and record token exchanges.
@@ -211,11 +364,21 @@ impl OAuthConnection {
         enforce_limit(&self.request_buffer)?;
         let mut output = Vec::new();
         loop {
+            reject_token_endpoint_expect(
+                &self.request_buffer,
+                &self.grants,
+                sni,
+                self.connection_port,
+            )?;
             let Some(message) = parse_http_message(&self.request_buffer)? else {
                 break;
             };
             let request = &self.request_buffer[..message.total_len];
             let request_line = first_header_line(message.headers)?;
+            let method = request_line
+                .split_whitespace()
+                .next()
+                .ok_or_else(invalid_http)?;
             let target = request_line
                 .split_whitespace()
                 .nth(1)
@@ -241,7 +404,8 @@ impl OAuthConnection {
             let token_grant = match matching_grants.as_slice() {
                 [index] => Some(*index),
                 [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
-                [] => None,
+                [] if endpoint_grants.is_empty() => None,
+                [] => return Err(invalid_http()),
                 _ => return Err(invalid_http()),
             };
             let is_token_request = token_grant.is_some();
@@ -255,6 +419,10 @@ impl OAuthConnection {
                 ));
             }
             self.token_connection = Some(is_token_request);
+            if !is_token_request {
+                self.response_head_requests
+                    .push_back(method.eq_ignore_ascii_case("HEAD"));
+            }
             if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -483,16 +651,16 @@ fn scrub_seen_tokens(data: &mut Vec<u8>, tokens: &[Zeroizing<String>]) {
     }
 }
 
-fn scrub_token_prefix_suffixes(data: &mut [u8], tokens: &[Zeroizing<String>]) {
+fn longest_token_prefix_suffix(data: &[u8], tokens: &[Zeroizing<String>]) -> usize {
+    let mut longest = 0;
     for token in tokens {
-        for prefix_len in (1..token.len()).rev() {
-            if data.ends_with(&token.as_bytes()[..prefix_len]) {
-                let start = data.len() - prefix_len;
-                data[start..].fill(b'*');
-                break;
+        for length in 1..token.len() {
+            if data.ends_with(&token.as_bytes()[..length]) {
+                longest = longest.max(length);
             }
         }
     }
+    longest
 }
 
 /// Fill omitted sentinels with independent random per-sandbox values.
@@ -695,11 +863,94 @@ fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> 
     output
 }
 
+fn reject_token_endpoint_expect(
+    data: &[u8],
+    grants: &[LoadedGrant],
+    sni: &str,
+    port: u16,
+) -> io::Result<()> {
+    let Some(boundary) = header_boundary(data) else {
+        return Ok(());
+    };
+    let headers = &data[..boundary];
+    let target = first_header_line(headers)?
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(invalid_http)?;
+    let is_token_endpoint = grants.iter().any(|grant| {
+        grant.endpoint_host.eq_ignore_ascii_case(sni)
+            && grant.endpoint_port == port
+            && grant.endpoint_target == target
+    });
+    if is_token_endpoint {
+        reject_expect_100_continue(headers)?;
+    }
+    Ok(())
+}
+
+fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<ResponseScrubState> {
+    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    if !first_header_line(headers)?.starts_with("HTTP/1.1 ") {
+        return Err(invalid_http());
+    }
+    let status = response_status(headers)?;
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    for (name, value) in text.lines().filter_map(|line| line.split_once(':')) {
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(invalid_http());
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|_| invalid_http())?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if transfer_encoding.is_some() {
+                return Err(invalid_http());
+            }
+            transfer_encoding = Some(value.trim());
+        }
+    }
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err(invalid_http());
+    }
+    if head_response || (100..200).contains(&status) || matches!(status, 204 | 304) {
+        return Ok(ResponseScrubState::ContentLength(0));
+    }
+    match (transfer_encoding, content_length) {
+        (Some(encoding), None) if encoding.eq_ignore_ascii_case("chunked") => {
+            Ok(ResponseScrubState::ChunkSize)
+        }
+        (Some(_), None) => Err(invalid_http()),
+        (None, Some(length)) => Ok(ResponseScrubState::ContentLength(length)),
+        (None, None) => Ok(ResponseScrubState::CloseDelimited),
+        (Some(_), Some(_)) => Err(invalid_http()),
+    }
+}
+
+fn parse_chunk_size(line: &[u8]) -> io::Result<usize> {
+    let text = std::str::from_utf8(line).map_err(|_| invalid_http())?;
+    let size = text
+        .strip_suffix("\r\n")
+        .and_then(|line| line.split(';').next())
+        .ok_or_else(invalid_http)?;
+    usize::from_str_radix(size.trim(), 16).map_err(|_| invalid_http())
+}
+
+fn header_boundary(data: &[u8]) -> Option<usize> {
+    data.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|boundary| boundary + 4)
+}
+
+fn line_boundary(data: &[u8]) -> Option<usize> {
+    data.windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|boundary| boundary + 2)
+}
+
 fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
-    let Some(boundary) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
+    let Some(header_end) = header_boundary(data) else {
         return Ok(None);
     };
-    let header_end = boundary + 4;
     let headers = &data[..header_end];
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
     if text.lines().any(|line| {
@@ -745,16 +996,7 @@ fn parse_http_message(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
 
 fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
-    if text.lines().any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue")
-        })
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OAuth Expect: 100-continue is unsupported",
-        ));
-    }
+    reject_expect_100_continue(headers)?;
     let supported = text.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.eq_ignore_ascii_case("content-type")
@@ -770,6 +1012,21 @@ fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
             "unsupported OAuth request content type",
         )
     })
+}
+
+fn reject_expect_100_continue(headers: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    if text.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue")
+        })
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth Expect: 100-continue is unsupported",
+        ));
+    }
+    Ok(())
 }
 
 fn response_status(headers: &[u8]) -> io::Result<u16> {
@@ -893,7 +1150,11 @@ mod tests {
             exchanges: VecDeque::new(),
             token_connection: None,
             connection_port: 443,
+            response_scrub_buffer: Vec::new(),
+            response_scrub_framing: Vec::new(),
             response_scrub_tail: Vec::new(),
+            response_scrub_state: ResponseScrubState::Headers,
+            response_head_requests: VecDeque::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
                 Zeroizing::new("real-refresh".into()),
@@ -1223,9 +1484,16 @@ mod tests {
     #[test]
     fn api_response_echoes_are_scrubbed() {
         let mut connection = connection();
-        let input = b"echoed real-access and real-refresh";
-        let mut output = connection.scrub_response_chunk(b"echoed real-ac");
-        output.extend(connection.scrub_response_chunk(b"cess and real-refresh"));
+        let input =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nechoed real-access and real-refresh";
+        let mut output = connection
+            .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nechoed real-ac")
+            .unwrap();
+        output.extend(
+            connection
+                .scrub_response_chunk(b"cess and real-refresh")
+                .unwrap(),
+        );
         assert_eq!(output.len(), input.len());
         assert!(connection.finish_response_scrubbing().is_empty());
         let output = String::from_utf8(output).unwrap();
@@ -1266,7 +1534,11 @@ mod tests {
             exchanges: VecDeque::new(),
             token_connection: None,
             connection_port: 443,
+            response_scrub_buffer: Vec::new(),
+            response_scrub_framing: Vec::new(),
             response_scrub_tail: Vec::new(),
+            response_scrub_state: ResponseScrubState::Headers,
+            response_head_requests: VecDeque::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
                 Zeroizing::new("real-refresh".into()),
@@ -1284,5 +1556,112 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("real-refresh"));
         assert_eq!(connection.exchanges.pop_front(), Some(Some(1)));
+    }
+
+    #[tokio::test]
+    async fn shared_endpoint_without_a_sentinel_is_rejected() {
+        let first = config();
+        let mut second = config();
+        second.grant_id = "other-grant".into();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        let mut connection = OAuthConnection {
+            grants: vec![loaded(first), loaded(second)],
+            request_buffer: Vec::new(),
+            response_buffer: Vec::new(),
+            exchanges: VecDeque::new(),
+            token_connection: None,
+            connection_port: 443,
+            response_scrub_buffer: Vec::new(),
+            response_scrub_framing: Vec::new(),
+            response_scrub_tail: Vec::new(),
+            response_scrub_state: ResponseScrubState::Headers,
+            response_head_requests: VecDeque::new(),
+            seen_tokens: vec![],
+        };
+        let request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+
+        let error = connection
+            .transform_requests(request, "auth.example.com")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(connection.exchanges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expect_continue_is_rejected_after_headers_without_waiting_for_body() {
+        let request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
+        let mut connection = connection();
+
+        let error = connection
+            .transform_requests(request, "auth.example.com")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth Expect: 100-continue is unsupported"
+        );
+    }
+
+    #[test]
+    fn response_scrubbing_preserves_innocent_token_prefix_at_response_end() {
+        let mut connection = connection();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\ninnocent real-ac";
+        let output = connection.scrub_response_chunk(response).unwrap();
+
+        assert_eq!(output, response);
+    }
+
+    #[test]
+    fn response_scrubbing_redacts_a_token_split_across_reads() {
+        let mut connection = connection();
+        let mut output = connection
+            .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\necho real-ac")
+            .unwrap();
+        output.extend(connection.scrub_response_chunk(b"cess done").unwrap());
+
+        assert_eq!(
+            output,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\necho *********** done"
+        );
+    }
+
+    #[test]
+    fn response_boundary_flushes_matcher_tail_on_keep_alive() {
+        let mut connection = connection();
+        let responses = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nreal-acHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ncess";
+        let output = connection.scrub_response_chunk(responses).unwrap();
+
+        assert_eq!(output, responses);
+    }
+
+    #[test]
+    fn chunked_response_redacts_token_split_across_chunks() {
+        let mut connection = connection();
+        let first = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nreal-\r\n";
+        let second = b"6\r\naccess\r\n0\r\n\r\n";
+        let mut output = connection.scrub_response_chunk(first).unwrap();
+        output.extend(connection.scrub_response_chunk(second).unwrap());
+
+        assert_eq!(
+            output,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n*****\r\n6\r\n******\r\n0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn head_response_completes_at_headers_on_keep_alive() {
+        let mut connection = connection();
+        connection.response_head_requests.push_back(true);
+        connection.response_head_requests.push_back(false);
+        let responses = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+
+        let output = connection.scrub_response_chunk(responses).unwrap();
+
+        assert_eq!(output, responses);
     }
 }
