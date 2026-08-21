@@ -129,7 +129,8 @@ pub trait PolicyObserver: Send + Sync {
 ///
 /// * [`DENIAL_LOG_EVENT`] — a denied packet, plus any swallowed before it.
 /// * [`DENIAL_FLUSH_EVENT`] — the trailing tally of a destination that
-///   stopped being denied. Emitted by a sweep, so it carries no `hostname`.
+///   stopped being denied. It carries the same destination evidence as the
+///   line that opened its suppression window.
 /// * [`DENIAL_SATURATED_EVENT`] — the limiter was tracking
 ///   [`MAX_TRACKED_PEERS`] destinations at once and dropped denials for
 ///   destinations it had no room to track. Its `peer` is empty, because it
@@ -171,7 +172,9 @@ struct LimiterState {
 }
 
 /// Identity a denial is rate limited by: one line per distinct destination
-/// per window, rather than one per packet.
+/// and hostname per window, rather than one per packet. The hostname matters
+/// even when two names resolve to the same address because consumers offer
+/// exact-host policy changes from this evidence.
 ///
 /// Keyed on the wire labels rather than the enums so that `Direction` and
 /// `Protocol` do not have to grow a public `Hash` derive for an internal
@@ -180,8 +183,10 @@ struct LimiterState {
 struct DenialKey {
     direction: &'static str,
     protocol: &'static str,
+    peer_kind: &'static str,
     peer: String,
     port: Option<u16>,
+    hostname: Option<String>,
 }
 
 /// Rate-limiter state for one destination.
@@ -226,17 +231,15 @@ impl PolicyObserver for LoggingPolicyObserver {
             DenialTarget::Domain(domain) => ("domain", domain.clone()),
         };
 
-        for line in self.admit(denial, &peer) {
-            // Only the line for this very denial knows the hostname; a
-            // swept tally is reported by a later packet's call and the
-            // hostname that went with it is long gone.
-            let hostname = match line.event {
-                DENIAL_LOG_EVENT => denial.hostname.as_deref().unwrap_or_default(),
-                _ => "",
-            };
-            let (peer_kind, peer, port) = match &line.key {
-                Some(key) => (peer_kind, key.peer.as_str(), key.port),
-                None => ("", "", None),
+        for line in self.admit(denial, peer_kind, &peer) {
+            let (peer_kind, peer, port, hostname) = match &line.key {
+                Some(key) => (
+                    key.peer_kind,
+                    key.peer.as_str(),
+                    key.port,
+                    key.hostname.as_deref().unwrap_or_default(),
+                ),
+                None => ("", "", None, ""),
             };
 
             tracing::warn!(
@@ -267,12 +270,14 @@ impl LoggingPolicyObserver {
     /// Decide which lines this denial produces: at most one for the denial
     /// itself, plus any trailing tallies a sweep shook loose, plus a
     /// saturation marker when the limiter has no room left.
-    fn admit(&self, denial: &PolicyDenial, peer: &str) -> Vec<Line> {
+    fn admit(&self, denial: &PolicyDenial, peer_kind: &'static str, peer: &str) -> Vec<Line> {
         let key = DenialKey {
             direction: direction_label(denial.direction),
             protocol: protocol_label(denial.protocol),
+            peer_kind,
             peer: peer.to_owned(),
             port: denial.port,
+            hostname: denial.hostname.clone(),
         };
 
         let now = Instant::now();
@@ -374,19 +379,24 @@ impl LoggingPolicyObserver {
         drop(state);
 
         for line in lines {
-            let (peer, port) = match &line.key {
-                Some(key) => (key.peer.as_str(), key.port),
-                None => ("", None),
+            let (peer_kind, peer, port, hostname) = match &line.key {
+                Some(key) => (
+                    key.peer_kind,
+                    key.peer.as_str(),
+                    key.port,
+                    key.hostname.as_deref().unwrap_or_default(),
+                ),
+                None => ("", "", None, ""),
             };
             tracing::warn!(
                 target: DENIAL_LOG_TARGET,
                 event = line.event,
                 direction = line.key.as_ref().map(|k| k.direction).unwrap_or_default(),
                 protocol = line.key.as_ref().map(|k| k.protocol).unwrap_or_default(),
-                peer_kind = "",
+                peer_kind = peer_kind,
                 peer = peer,
                 port = port.map(|p| p.to_string()).unwrap_or_default(),
-                hostname = "",
+                hostname = hostname,
                 verdict = "deny",
                 denials = line.denials,
                 "network policy denied traffic"
@@ -810,7 +820,7 @@ mod tests {
         peer: &str,
     ) -> Vec<(&'static str, u64)> {
         observer
-            .admit(denial, peer)
+            .admit(denial, "address", peer)
             .into_iter()
             .map(|line| (line.event, line.denials))
             .collect()
@@ -978,6 +988,24 @@ mod tests {
     }
 
     #[test]
+    fn hostnames_on_one_address_are_rate_limited_independently() {
+        let observer = LoggingPolicyObserver::default();
+        let api = tcp_denial(443).with_hostname(Some("api.example.com".into()));
+        let cdn = tcp_denial(443).with_hostname(Some("cdn.example.com".into()));
+
+        assert_eq!(
+            admitted(&observer, &api, "1.2.3.4"),
+            [(DENIAL_LOG_EVENT, 1)]
+        );
+        assert_eq!(
+            admitted(&observer, &cdn, "1.2.3.4"),
+            [(DENIAL_LOG_EVENT, 1)]
+        );
+        assert_eq!(admitted(&observer, &api, "1.2.3.4"), []);
+        assert_eq!(observer.state.lock().unwrap().recent.len(), 2);
+    }
+
+    #[test]
     fn a_saturated_limiter_says_so_rather_than_going_quiet() {
         // A spray across more destinations than the limiter can track is
         // exactly the scan a consumer most wants to see. Silence would be
@@ -1021,7 +1049,7 @@ mod tests {
         let denial = tcp_denial(443);
 
         for i in 0..(MAX_TRACKED_PEERS * 3) {
-            observer.admit(&denial, &format!("peer-{i}"));
+            observer.admit(&denial, "address", &format!("peer-{i}"));
         }
 
         assert!(observer.state.lock().unwrap().recent.len() <= MAX_TRACKED_PEERS);
