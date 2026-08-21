@@ -198,6 +198,20 @@ func installDir() (string, error) {
 	return filepath.Join(home, ".microsandbox"), nil
 }
 
+// SandboxLogRoot returns the directory containing each sandbox's runtime log.
+// It follows the runtime's home resolution: MSB_HOME when set, otherwise
+// ~/.microsandbox.
+func SandboxLogRoot() (string, error) {
+	if home, ok := os.LookupEnv("MSB_HOME"); ok {
+		return filepath.Join(home, "sandboxes"), nil
+	}
+	home, err := installDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "sandboxes"), nil
+}
+
 // materializeFFI extracts the embedded FFI library into a per-version
 // subdir under <dir>/lib/ and returns the on-disk path. The
 // per-version subdir lets multiple SDK versions coexist without

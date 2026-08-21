@@ -85,6 +85,43 @@ func TestOSStringFor(t *testing.T) {
 	}
 }
 
+func TestSandboxLogRoot(t *testing.T) {
+	t.Run("configured home", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("MSB_HOME", home)
+
+		got, err := SandboxLogRoot()
+		if err != nil {
+			t.Fatalf("SandboxLogRoot: %v", err)
+		}
+		if want := filepath.Join(home, "sandboxes"); got != want {
+			t.Errorf("SandboxLogRoot = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("operator home", func(t *testing.T) {
+		old, present := os.LookupEnv("MSB_HOME")
+		if err := os.Unsetenv("MSB_HOME"); err != nil {
+			t.Fatalf("unset MSB_HOME: %v", err)
+		}
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv("MSB_HOME", old)
+			}
+		})
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+
+		got, err := SandboxLogRoot()
+		if err != nil {
+			t.Fatalf("SandboxLogRoot: %v", err)
+		}
+		if want := filepath.Join(home, ".microsandbox", "sandboxes"); got != want {
+			t.Errorf("SandboxLogRoot = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestExtractMsbAndKrunfwWindowsBundle(t *testing.T) {
 	t.Parallel()
 
