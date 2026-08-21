@@ -738,6 +738,39 @@ impl SandboxBuilder {
         self
     }
 
+    /// Add an OAuth grant whose tokens remain in a host broker.
+    #[cfg(feature = "net")]
+    pub fn oauth_secret(
+        mut self,
+        oauth: microsandbox_network::secrets::config::OAuthSecret,
+    ) -> Self {
+        match self.config.local_network_config() {
+            Ok(network) => {
+                let network = microsandbox_network::builder::NetworkBuilder::from_config(network)
+                    .oauth_secret(oauth)
+                    .build();
+                let mut network = match network {
+                    Ok(network) => network,
+                    Err(err) => {
+                        if self.build_error.is_none() {
+                            self.build_error = Some(err.into());
+                        }
+                        return self;
+                    }
+                };
+                network.tls.enabled = true;
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) if self.build_error.is_none() => self.build_error = Some(err),
+            Err(_) => {}
+        }
+        self
+    }
+
     /// Shorthand: add a secret with env var, value, and allowed host.
     ///
     /// Placeholder is auto-generated as `$MSB_<env_var>`.

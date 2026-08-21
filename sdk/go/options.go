@@ -73,6 +73,7 @@ type SandboxConfig struct {
 	PortBindings        []PortBinding     // explicit bind address host→guest ports
 	Network             *NetworkConfig
 	Secrets             []SecretEntry
+	OAuthSecrets        []OAuthSecretConfig
 	Patches             []PatchConfig
 	Volumes             map[string]MountConfig // guest path → mount config
 }
@@ -945,6 +946,11 @@ func WithSecrets(secrets ...SecretEntry) SandboxOption {
 	return func(o *SandboxConfig) { o.Secrets = append(o.Secrets, secrets...) }
 }
 
+// WithOAuthSecrets appends broker-backed OAuth grants to the sandbox.
+func WithOAuthSecrets(grants ...OAuthSecretConfig) SandboxOption {
+	return func(o *SandboxConfig) { o.OAuthSecrets = append(o.OAuthSecrets, grants...) }
+}
+
 // WithPatches appends rootfs patches applied before the VM boots.
 // Patches are only compatible with OverlayFS rootfs (not disk images).
 func WithPatches(patches ...PatchConfig) SandboxOption {
@@ -1276,6 +1282,21 @@ type SecretEnvOptions struct {
 	Placeholder       string
 	RequireTLS        *bool
 	OnViolation       ViolationAction
+}
+
+// OAuthSecretConfig configures provider-neutral OAuth token protection.
+// Token values are never part of this durable configuration.
+type OAuthSecretConfig struct {
+	BrokerEndpoint    string
+	GrantID           string
+	TokenEndpoint     string
+	InjectHosts       []string
+	AccessTokenField  string
+	RefreshTokenField string
+	AccessEnvVar      string
+	RefreshEnvVar     string
+	AccessSentinel    string
+	RefreshSentinel   string
 }
 
 // secretFactory is the factory namespace matching Node's `Secret.env(...)` and

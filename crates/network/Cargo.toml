@@ -35,11 +35,13 @@ parking_lot = { workspace = true }
 pem = "3"
 percent-encoding = "2"
 rcgen = { workspace = true }
+rand = { workspace = true }
 resolv-conf = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types.workspace = true
 serde = { workspace = true }
+serde_json = { workspace = true }
 # Used for the `SO_LINGER(0)` (RST-on-drop) trick on rejected inbound
 # connections in `publisher.rs`. tokio's `TcpStream::set_linger` is
 # deprecated; `socket2::SockRef::from(&stream)` is the supported path.
@@ -75,5 +77,4 @@ system-configuration = "0.7"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }

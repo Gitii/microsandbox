@@ -16,7 +16,7 @@ use crate::policy::{BuildError, NetworkPolicy};
 use zeroize::Zeroizing;
 
 use crate::secrets::config::{
-    HostPattern, SecretEntry, SecretInjection, SecretSource, ViolationAction,
+    HostPattern, OAuthSecret, SecretEntry, SecretInjection, SecretSource, ViolationAction,
 };
 use microsandbox_types::{ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig};
 
@@ -179,6 +179,14 @@ impl NetworkBuilder {
     /// Add a materialized secret entry.
     pub fn secret_entry(mut self, entry: SecretEntry) -> Self {
         self.config.secrets.secrets.push(entry);
+        self
+    }
+
+    /// Add a provider-neutral OAuth grant backed by a host token broker.
+    pub fn oauth_secret(mut self, oauth: OAuthSecret) -> Self {
+        let mut oauth = oauth;
+        crate::secrets::oauth::ensure_sentinels(&mut oauth);
+        self.config.secrets.oauth.push(oauth);
         self
     }
 

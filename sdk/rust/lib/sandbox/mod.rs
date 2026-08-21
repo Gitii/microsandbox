@@ -114,6 +114,8 @@ pub use microsandbox_network::builder::SecretBuilder;
 pub use microsandbox_network::config::NetworkConfig;
 #[cfg(feature = "net")]
 pub use microsandbox_network::policy::{NetworkPolicy, NetworkProfile};
+#[cfg(feature = "net")]
+pub use microsandbox_network::secrets::config::OAuthSecret;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_types::{CpuPlacement, PullPolicy};
 pub use microsandbox_types::{

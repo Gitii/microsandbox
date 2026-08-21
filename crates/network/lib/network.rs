@@ -370,6 +370,13 @@ impl SmoltcpNetwork {
         for secret in &self.config.secrets.secrets {
             vars.push((secret.env_var.clone(), secret.placeholder.clone()));
         }
+        for oauth in &self.config.secrets.oauth {
+            vars.push((oauth.access_env_var.clone(), oauth.access_sentinel.clone()));
+            vars.push((
+                oauth.refresh_env_var.clone(),
+                oauth.refresh_sentinel.clone(),
+            ));
+        }
 
         vars
     }
@@ -475,6 +482,7 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
     let had_custom_nameservers = !config.dns.nameservers.is_empty();
     let disabled_rebind_protection = !config.dns.rebind_protection;
     let trusted_host_cas = config.trust_host_cas;
+    let had_oauth_configuration = !config.secrets.oauth.is_empty();
     let connection_limit_clamped = config
         .max_connections
         .is_some_and(|limit| limit > MULTI_TENANT_MAX_CONNECTIONS);
@@ -484,6 +492,7 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
     config.dns.nameservers.clear();
     config.dns.rebind_protection = true;
     config.trust_host_cas = false;
+    config.secrets.oauth.clear();
     config.max_connections = Some(
         config
             .max_connections
@@ -496,6 +505,7 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
         || had_custom_nameservers
         || disabled_rebind_protection
         || trusted_host_cas
+        || had_oauth_configuration
         || connection_limit_clamped
     {
         tracing::warn!(
@@ -504,6 +514,7 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
             had_custom_nameservers,
             disabled_rebind_protection,
             trusted_host_cas,
+            had_oauth_configuration,
             connection_limit_clamped,
             "multi-tenant deployment profile overrode unsafe network configuration"
         );
@@ -655,6 +666,18 @@ mod tests {
         config.dns.nameservers = vec!["10.0.0.53".parse::<Nameserver>().unwrap()];
         config.dns.rebind_protection = false;
         config.trust_host_cas = true;
+        config.secrets.oauth.push(microsandbox_types::OAuthSecret {
+            broker_endpoint: "/tenant-controlled/broker.sock".into(),
+            grant_id: "tenant-controlled-grant".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            inject_hosts: vec![microsandbox_types::HostPattern::Any],
+            access_token_field: "access_token".into(),
+            refresh_token_field: "refresh_token".into(),
+            access_env_var: "ACCESS_TOKEN".into(),
+            refresh_env_var: "REFRESH_TOKEN".into(),
+            access_sentinel: "$ACCESS".into(),
+            refresh_sentinel: "$REFRESH".into(),
+        });
         config.max_connections = Some(MULTI_TENANT_MAX_CONNECTIONS + 1);
         config.policy = NetworkPolicy::allow_all();
 
@@ -666,6 +689,7 @@ mod tests {
         assert!(config.dns.nameservers.is_empty());
         assert!(config.dns.rebind_protection);
         assert!(!config.trust_host_cas);
+        assert!(config.secrets.oauth.is_empty());
         assert_eq!(config.max_connections, Some(MULTI_TENANT_MAX_CONNECTIONS));
         // Tenant policy stays intact and is intersected with the platform
         // policy at evaluation time instead of being reordered or flattened.
@@ -678,12 +702,25 @@ mod tests {
         config.interface.mtu = Some(9000);
         config.dns.rebind_protection = false;
         config.trust_host_cas = true;
+        config.secrets.oauth.push(microsandbox_types::OAuthSecret {
+            broker_endpoint: "/platform/broker.sock".into(),
+            grant_id: "platform-grant".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            inject_hosts: vec![microsandbox_types::HostPattern::Any],
+            access_token_field: "access_token".into(),
+            refresh_token_field: "refresh_token".into(),
+            access_env_var: "ACCESS_TOKEN".into(),
+            refresh_env_var: "REFRESH_TOKEN".into(),
+            access_sentinel: "$ACCESS".into(),
+            refresh_sentinel: "$REFRESH".into(),
+        });
 
         enforce_deployment_profile(&mut config, DeploymentProfile::SingleTenant);
 
         assert_eq!(config.interface.mtu, Some(9000));
         assert!(!config.dns.rebind_protection);
         assert!(config.trust_host_cas);
+        assert_eq!(config.secrets.oauth.len(), 1);
     }
 
     #[test]
