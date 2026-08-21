@@ -969,6 +969,34 @@ mod tests {
     }
 
     #[test]
+    fn a_flush_keeps_the_opening_denial_identity() {
+        let observer = LoggingPolicyObserver::default();
+        let denial = tcp_denial(443).with_hostname(Some("api.example.com".into()));
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            observer.on_denied(&denial);
+            observer.on_denied(&denial);
+            observer.flush();
+        });
+
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let flush = logged
+            .lines()
+            .find(|line| line.contains(DENIAL_FLUSH_EVENT))
+            .expect("the suppressed denial must be flushed");
+        assert!(flush.contains(r#""peer_kind":"address""#), "{flush}");
+        assert!(flush.contains(r#""peer":"1.2.3.4""#), "{flush}");
+        assert!(flush.contains(r#""port":"443""#), "{flush}");
+        assert!(flush.contains(r#""hostname":"api.example.com""#), "{flush}");
+    }
+
+    #[test]
     fn distinct_destinations_are_rate_limited_independently() {
         let observer = LoggingPolicyObserver::default();
 
