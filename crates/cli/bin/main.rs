@@ -290,20 +290,17 @@ fn main() {
 
     let exit_code = match cli.command {
         // Sandbox process entry — never returns (VMM takes over).
-        // Always install tracing for sandbox processes: default to info when
-        // no explicit level is set so lifecycle events and VMM diagnostics
-        // are captured in runtime.log for post-mortem debugging.
+        // Always install tracing for sandbox processes. With no explicit
+        // diagnostic level, the subscriber keeps policy denials at WARN and
+        // suppresses everything else.
         Commands::Sandbox(args) => {
             let mut args = *args;
-            let sandbox_level = args
-                .log_level
-                .or(log_level)
-                .or(Some(microsandbox_runtime::logging::LogLevel::Info));
+            let sandbox_level = args.log_level.or(log_level);
             args.log_level = sandbox_level;
             // The sandbox subprocess's stderr is redirected into
             // runtime.log via setup_log_capture(), so disable ANSI —
             // color escapes have nowhere useful to render.
-            log_args::init_tracing(sandbox_level, false);
+            log_args::init_sandbox_tracing(sandbox_level);
             sandbox_cmd::run(args); // returns `!`
         }
         command => {
