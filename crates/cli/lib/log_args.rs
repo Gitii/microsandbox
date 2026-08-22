@@ -28,7 +28,9 @@ pub struct LogArgs {
     #[arg(long, global = true, conflicts_with_all = ["error", "warn", "info", "trace"])]
     pub debug: bool,
 
-    /// Show all diagnostic logs (most verbose).
+    /// Show all diagnostics, including complete intercepted HTTP headers and bodies.
+    ///
+    /// Traffic is not sanitized or redacted and may contain credentials.
     #[arg(long, global = true, conflicts_with_all = ["error", "warn", "info", "debug"])]
     pub trace: bool,
 }
