@@ -467,8 +467,8 @@ pub(crate) async fn intercept_relay(
                     Ok(0) => {
                         let tail = oauth.finish_response_scrubbing()?;
                         if !tail.is_empty() {
-                            traffic.record("guest-response", &tail);
                             guest_tls.writer().write_all(&tail).map_err(io::Error::other)?;
+                            traffic.record("guest-response", &tail);
                             flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
                         }
                         break;
@@ -485,8 +485,8 @@ pub(crate) async fn intercept_relay(
                         if data.is_empty() {
                             continue;
                         }
-                        traffic.record("guest-response", &data);
                         guest_tls.writer().write_all(&data).map_err(io::Error::other)?;
+                        traffic.record("guest-response", &data);
                         flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
                     }
                     Err(e) => return Err(e),
@@ -562,8 +562,8 @@ async fn forward_plaintext(
         traffic.record("guest-request", &buf[..n]);
 
         if secrets_handler.is_empty() && oauth.is_empty() {
-            traffic.record("upstream-request", &buf[..n]);
             server_tls.write_all(&buf[..n]).await?;
+            traffic.record("upstream-request", &buf[..n]);
             wrote_plaintext = true;
             continue;
         }
@@ -572,8 +572,8 @@ async fn forward_plaintext(
             Ok(data) => {
                 let data = oauth.transform_requests(&data, traffic.sni).await?;
                 if !data.is_empty() {
-                    traffic.record("upstream-request", &data);
                     server_tls.write_all(&data).await?;
+                    traffic.record("upstream-request", &data);
                     wrote_plaintext = true;
                 }
             }
@@ -706,10 +706,17 @@ mod tests {
         assert!(logged.contains("sequence=2 direction=\"upstream-request\""));
         assert!(logged.contains("sequence=3 direction=\"upstream-response\""));
         assert!(logged.contains("sequence=4 direction=\"guest-response\""));
-        assert!(logged.contains("direction=\"upstream-request\""));
         assert!(logged.contains("sni=\"api.example.com\""));
+        assert!(logged.contains("Authorization: Bearer sentinel"));
         assert!(logged.contains(
             "payload=POST /token HTTP/1.1\\r\\nAuthorization: Bearer secret\\r\\n\\r\\nbody\\x00"
         ));
+        assert!(
+            logged
+                .contains("payload=HTTP/1.1 200 OK\\r\\nContent-Length: 10\\r\\n\\r\\nnew-secret")
+        );
+        assert!(
+            logged.contains("payload=HTTP/1.1 200 OK\\r\\nContent-Length: 8\\r\\n\\r\\nsentinel")
+        );
     }
 }
