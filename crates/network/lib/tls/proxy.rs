@@ -702,6 +702,14 @@ mod tests {
         let (enabled, logged) = record_at(tracing::Level::TRACE);
         assert!(enabled.enabled);
         assert_eq!(enabled.sequence, 4);
+        assert_eq!(
+            logged
+                .matches(&format!("connection={}", enabled.connection))
+                .count(),
+            4
+        );
+        assert_eq!(logged.matches("guest_dst=192.0.2.1:443").count(), 4);
+        assert_eq!(logged.matches("connect_dst=192.0.2.2:443").count(), 4);
         assert!(logged.contains("sequence=1 direction=\"guest-request\""));
         assert!(logged.contains("sequence=2 direction=\"upstream-request\""));
         assert!(logged.contains("sequence=3 direction=\"upstream-response\""));
