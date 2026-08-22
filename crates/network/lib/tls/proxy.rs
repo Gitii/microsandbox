@@ -9,7 +9,6 @@ use std::fmt::{self, Write as _};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
@@ -39,8 +38,6 @@ const RELAY_BUF_SIZE: usize = 16384;
 
 /// Trace target for complete intercepted traffic, including credentials.
 const TRAFFIC_LOG_TARGET: &str = "microsandbox::network::traffic";
-
-static NEXT_TRAFFIC_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -77,11 +74,7 @@ impl<'a> TrafficTrace<'a> {
         let enabled = tracing::enabled!(target: TRAFFIC_LOG_TARGET, tracing::Level::TRACE);
         Self {
             enabled,
-            connection: if enabled {
-                NEXT_TRAFFIC_CONNECTION.fetch_add(1, Ordering::Relaxed)
-            } else {
-                0
-            },
+            connection: if enabled { rand::random() } else { 0 },
             sequence: 0,
             sni,
             guest_dst,
@@ -577,7 +570,7 @@ async fn forward_plaintext(
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
-                let data = oauth.transform_requests(&data, &traffic.sni).await?;
+                let data = oauth.transform_requests(&data, traffic.sni).await?;
                 if !data.is_empty() {
                     traffic.record("upstream-request", &data);
                     server_tls.write_all(&data).await?;
@@ -677,8 +670,20 @@ mod tests {
                 "192.0.2.2:443".parse().unwrap(),
             );
             trace.record(
+                "guest-request",
+                b"POST /token HTTP/1.1\r\nAuthorization: Bearer sentinel\r\n\r\nbody\0",
+            );
+            trace.record(
                 "upstream-request",
                 b"POST /token HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\nbody\0",
+            );
+            trace.record(
+                "upstream-response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nnew-secret",
+            );
+            trace.record(
+                "guest-response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nsentinel",
             );
             trace
         });
@@ -696,7 +701,11 @@ mod tests {
 
         let (enabled, logged) = record_at(tracing::Level::TRACE);
         assert!(enabled.enabled);
-        assert_eq!(enabled.sequence, 1);
+        assert_eq!(enabled.sequence, 4);
+        assert!(logged.contains("sequence=1 direction=\"guest-request\""));
+        assert!(logged.contains("sequence=2 direction=\"upstream-request\""));
+        assert!(logged.contains("sequence=3 direction=\"upstream-response\""));
+        assert!(logged.contains("sequence=4 direction=\"guest-response\""));
         assert!(logged.contains("direction=\"upstream-request\""));
         assert!(logged.contains("sni=\"api.example.com\""));
         assert!(logged.contains(
