@@ -5,6 +5,7 @@
 //! connection to the real server. Bypass mode replays buffered bytes and
 //! splices the connection without termination.
 
+use std::fmt::{self, Write as _};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,6 +36,9 @@ const CLIENT_HELLO_BUF_SIZE: usize = 16384;
 /// Buffer size for bidirectional relay.
 const RELAY_BUF_SIZE: usize = 16384;
 
+/// Trace target for complete intercepted traffic, including credentials.
+const TRAFFIC_LOG_TARGET: &str = "microsandbox::network::traffic";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -52,6 +56,59 @@ pub(crate) struct TlsProxyContext {
     pub(crate) expected_sni: Option<String>,
     /// `true` when the connection arrived via HTTP CONNECT; skips the DNS-cache pin check.
     pub(crate) via_connect: bool,
+}
+
+struct TrafficTrace<'a> {
+    enabled: bool,
+    connection: u64,
+    sequence: u64,
+    sni: &'a str,
+    guest_dst: SocketAddr,
+    connect_dst: SocketAddr,
+}
+
+struct EscapedPayload<'a>(&'a [u8]);
+
+impl<'a> TrafficTrace<'a> {
+    fn new(sni: &'a str, guest_dst: SocketAddr, connect_dst: SocketAddr) -> Self {
+        let enabled = tracing::enabled!(target: TRAFFIC_LOG_TARGET, tracing::Level::TRACE);
+        Self {
+            enabled,
+            connection: if enabled { rand::random() } else { 0 },
+            sequence: 0,
+            sni,
+            guest_dst,
+            connect_dst,
+        }
+    }
+
+    fn record(&mut self, direction: &'static str, payload: &[u8]) {
+        if !self.enabled {
+            return;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        tracing::trace!(
+            target: TRAFFIC_LOG_TARGET,
+            connection = self.connection,
+            sequence = self.sequence,
+            direction,
+            sni = self.sni,
+            guest_dst = %self.guest_dst,
+            connect_dst = %self.connect_dst,
+            bytes = payload.len(),
+            payload = %EscapedPayload(payload),
+            "intercepted traffic; payload is not sanitized or redacted",
+        );
+    }
+}
+
+impl fmt::Display for EscapedPayload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0.escape_ascii() {
+            f.write_char(char::from(byte))?;
+        }
+        Ok(())
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -345,6 +402,7 @@ pub(crate) async fn intercept_relay(
     // Phase 2: Bidirectional plaintext relay.
     let mut server_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut plaintext_buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut traffic = TrafficTrace::new(sni_name, guest_dst, connect_dst);
 
     // Drain any application data already buffered during the TLS handshake.
     // In TLS 1.3, the client sends Finished + application data in the same
@@ -355,7 +413,7 @@ pub(crate) async fn intercept_relay(
         &mut server_tls,
         &mut secrets_handler,
         &mut oauth,
-        sni_name,
+        &mut traffic,
         &shared,
         &mut plaintext_buf,
     )
@@ -395,7 +453,7 @@ pub(crate) async fn intercept_relay(
                         &mut server_tls,
                         &mut secrets_handler,
                         &mut oauth,
-                        sni_name,
+                        &mut traffic,
                         &shared,
                         &mut plaintext_buf,
                     )
@@ -410,11 +468,13 @@ pub(crate) async fn intercept_relay(
                         let tail = oauth.finish_response_scrubbing()?;
                         if !tail.is_empty() {
                             guest_tls.writer().write_all(&tail).map_err(io::Error::other)?;
+                            traffic.record("guest-response", &tail);
                             flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
                         }
                         break;
                     },
                     Ok(n) => {
+                        traffic.record("upstream-response", &server_buf[..n]);
                         let data = if oauth.is_token_host() {
                             oauth.transform_responses(&server_buf[..n]).await?
                         } else if !oauth.is_empty() {
@@ -426,6 +486,7 @@ pub(crate) async fn intercept_relay(
                             continue;
                         }
                         guest_tls.writer().write_all(&data).map_err(io::Error::other)?;
+                        traffic.record("guest-response", &data);
                         flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
                     }
                     Err(e) => return Err(e),
@@ -484,7 +545,7 @@ async fn forward_plaintext(
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
     oauth: &mut OAuthConnection,
-    sni: &str,
+    traffic: &mut TrafficTrace<'_>,
     shared: &SharedState,
     buf: &mut [u8],
 ) -> io::Result<()> {
@@ -498,17 +559,21 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
+        traffic.record("guest-request", &buf[..n]);
+
         if secrets_handler.is_empty() && oauth.is_empty() {
             server_tls.write_all(&buf[..n]).await?;
+            traffic.record("upstream-request", &buf[..n]);
             wrote_plaintext = true;
             continue;
         }
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
-                let data = oauth.transform_requests(&data, sni).await?;
+                let data = oauth.transform_requests(&data, traffic.sni).await?;
                 if !data.is_empty() {
                     server_tls.write_all(&data).await?;
+                    traffic.record("upstream-request", &data);
                     wrote_plaintext = true;
                 }
             }
@@ -557,4 +622,109 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn record_at(level: tracing::Level) -> (TrafficTrace<'static>, String) {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .with_max_level(level)
+            .finish();
+        let trace = tracing::subscriber::with_default(subscriber, || {
+            let mut trace = TrafficTrace::new(
+                "api.example.com",
+                "192.0.2.1:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+            );
+            trace.record(
+                "guest-request",
+                b"POST /token HTTP/1.1\r\nAuthorization: Bearer sentinel\r\n\r\nbody\0",
+            );
+            trace.record(
+                "upstream-request",
+                b"POST /token HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\nbody\0",
+            );
+            trace.record(
+                "upstream-response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nnew-secret",
+            );
+            trace.record(
+                "guest-response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nsentinel",
+            );
+            trace
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        (trace, logged)
+    }
+
+    #[test]
+    fn complete_intercepted_payload_is_logged_only_at_trace() {
+        let (disabled, logged) = record_at(tracing::Level::DEBUG);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.connection, 0);
+        assert_eq!(disabled.sequence, 0);
+        assert!(logged.is_empty());
+
+        let (enabled, logged) = record_at(tracing::Level::TRACE);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.sequence, 4);
+        assert_eq!(
+            logged
+                .matches(&format!("connection={}", enabled.connection))
+                .count(),
+            4
+        );
+        assert_eq!(logged.matches("guest_dst=192.0.2.1:443").count(), 4);
+        assert_eq!(logged.matches("connect_dst=192.0.2.2:443").count(), 4);
+        assert!(logged.contains("sequence=1 direction=\"guest-request\""));
+        assert!(logged.contains("sequence=2 direction=\"upstream-request\""));
+        assert!(logged.contains("sequence=3 direction=\"upstream-response\""));
+        assert!(logged.contains("sequence=4 direction=\"guest-response\""));
+        assert!(logged.contains("sni=\"api.example.com\""));
+        assert!(logged.contains("Authorization: Bearer sentinel"));
+        assert!(logged.contains(
+            "payload=POST /token HTTP/1.1\\r\\nAuthorization: Bearer secret\\r\\n\\r\\nbody\\x00"
+        ));
+        assert!(
+            logged
+                .contains("payload=HTTP/1.1 200 OK\\r\\nContent-Length: 10\\r\\n\\r\\nnew-secret")
+        );
+        assert!(
+            logged.contains("payload=HTTP/1.1 200 OK\\r\\nContent-Length: 8\\r\\n\\r\\nsentinel")
+        );
+    }
 }
