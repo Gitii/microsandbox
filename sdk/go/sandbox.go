@@ -188,16 +188,19 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	}
 	for _, grant := range o.OAuthSecrets {
 		ffiOpts.OAuthSecrets = append(ffiOpts.OAuthSecrets, ffi.OAuthSecretOptions{
-			BrokerEndpoint:    grant.BrokerEndpoint,
-			GrantID:           grant.GrantID,
-			TokenEndpoint:     grant.TokenEndpoint,
-			InjectHosts:       grant.InjectHosts,
-			AccessTokenField:  grant.AccessTokenField,
-			RefreshTokenField: grant.RefreshTokenField,
-			AccessEnvVar:      grant.AccessEnvVar,
-			RefreshEnvVar:     grant.RefreshEnvVar,
-			AccessSentinel:    grant.AccessSentinel,
-			RefreshSentinel:   grant.RefreshSentinel,
+			BrokerEndpoint:     grant.BrokerEndpoint,
+			GrantID:            grant.GrantID,
+			TokenEndpoint:      grant.TokenEndpoint,
+			DeviceCodeEndpoint: grant.DeviceCodeEndpoint,
+			PollEndpoint:       grant.PollEndpoint,
+			PollSecretFields:   grant.PollSecretFields,
+			InjectHosts:        grant.InjectHosts,
+			AccessTokenField:   grant.AccessTokenField,
+			RefreshTokenField:  grant.RefreshTokenField,
+			AccessEnvVar:       grant.AccessEnvVar,
+			RefreshEnvVar:      grant.RefreshEnvVar,
+			AccessSentinel:     grant.AccessSentinel,
+			RefreshSentinel:    grant.RefreshSentinel,
 		})
 	}
 

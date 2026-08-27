@@ -101,6 +101,37 @@ export type OAuthSecret = {
    */
   token_endpoint: string;
   /**
+   * Exact HTTPS device-code endpoint (RFC 8628), when the grant is obtained
+   * by a device flow.
+   *
+   * Requests to it carry no grant material and are forwarded unmodified;
+   * the endpoint only has to be known so the grant is loaded for the
+   * connection that carries the rest of the device flow.
+   */
+  device_code_endpoint?: string | null;
+  /**
+   * Exact HTTPS device-code polling endpoint (RFC 8628).
+   *
+   * A `POST` here is a token request: a response carrying
+   * [`access_token_field`](Self::access_token_field) is committed to the
+   * broker and sanitized like a token-endpoint response, while the
+   * `authorization_pending`, `slow_down`, `expired_token` and
+   * `access_denied` errors are forwarded untouched. May be the same URL as
+   * [`token_endpoint`](Self::token_endpoint).
+   */
+  poll_endpoint?: string | null;
+  /**
+   * Extra secret JSON fields in a poll response, such as the proprietary
+   * `authorization_code` and `code_verifier` some providers return before
+   * the real token exchange.
+   *
+   * Each is replaced with a sentinel before the guest sees it, and
+   * substituted back on a later token request. The real values are held in
+   * memory for the life of the connection that received them, so the
+   * exchange has to happen on that connection.
+   */
+  poll_secret_fields: Array<string>;
+  /**
    * Hosts where the access sentinel may be substituted.
    */
   inject_hosts: Array<HostPattern>;
@@ -110,6 +141,10 @@ export type OAuthSecret = {
   access_token_field: string;
   /**
    * JSON field carrying the refresh token in successful token responses.
+   *
+   * May be the same field as
+   * [`access_token_field`](Self::access_token_field): a device flow without
+   * a refresh grant hands the same value back for both.
    */
   refresh_token_field: string;
   /**

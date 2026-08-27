@@ -1848,12 +1848,44 @@ pub struct OAuthSecret {
     pub grant_id: String,
     /// Exact HTTPS token endpoint, including path and optional query.
     pub token_endpoint: String,
+    /// Exact HTTPS device-code endpoint (RFC 8628), when the grant is obtained
+    /// by a device flow.
+    ///
+    /// Requests to it carry no grant material and are forwarded unmodified;
+    /// the endpoint only has to be known so the grant is loaded for the
+    /// connection that carries the rest of the device flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_code_endpoint: Option<String>,
+    /// Exact HTTPS device-code polling endpoint (RFC 8628).
+    ///
+    /// A `POST` here is a token request: a response carrying
+    /// [`access_token_field`](Self::access_token_field) is committed to the
+    /// broker and sanitized like a token-endpoint response, while the
+    /// `authorization_pending`, `slow_down`, `expired_token` and
+    /// `access_denied` errors are forwarded untouched. May be the same URL as
+    /// [`token_endpoint`](Self::token_endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_endpoint: Option<String>,
+    /// Extra secret JSON fields in a poll response, such as the proprietary
+    /// `authorization_code` and `code_verifier` some providers return before
+    /// the real token exchange.
+    ///
+    /// Each is replaced with a sentinel before the guest sees it, and
+    /// substituted back on a later token request. The real values are held in
+    /// memory for the life of the connection that received them, so the
+    /// exchange has to happen on that connection.
+    #[serde(default)]
+    pub poll_secret_fields: Vec<String>,
     /// Hosts where the access sentinel may be substituted.
     #[serde(default)]
     pub inject_hosts: Vec<HostPattern>,
     /// JSON field carrying the access token in successful token responses.
     pub access_token_field: String,
     /// JSON field carrying the refresh token in successful token responses.
+    ///
+    /// May be the same field as
+    /// [`access_token_field`](Self::access_token_field): a device flow without
+    /// a refresh grant hands the same value back for both.
     pub refresh_token_field: String,
     /// Environment variable exposing the access sentinel to the guest.
     pub access_env_var: String,
@@ -2092,12 +2124,27 @@ impl OAuthSecret {
         if self.grant_id.is_empty() {
             return Err(invalid("grant_id must not be empty"));
         }
-        if !self.token_endpoint.starts_with("https://") {
-            return Err(invalid("token_endpoint must be HTTPS"));
+        validate_oauth_endpoint(
+            &self.token_endpoint,
+            "token_endpoint must be HTTPS",
+            "token_endpoint must include a host and path",
+            grant_index,
+        )?;
+        if let Some(endpoint) = &self.device_code_endpoint {
+            validate_oauth_endpoint(
+                endpoint,
+                "device_code_endpoint must be HTTPS",
+                "device_code_endpoint must include a host and path",
+                grant_index,
+            )?;
         }
-        let authority_and_path = &self.token_endpoint[8..];
-        if !authority_and_path.contains('/') || authority_and_path.starts_with('/') {
-            return Err(invalid("token_endpoint must include a host and path"));
+        if let Some(endpoint) = &self.poll_endpoint {
+            validate_oauth_endpoint(
+                endpoint,
+                "poll_endpoint must be HTTPS",
+                "poll_endpoint must include a host and path",
+                grant_index,
+            )?;
         }
         if self.inject_hosts.is_empty() {
             return Err(invalid("at least one inject host is required"));
@@ -2105,8 +2152,16 @@ impl OAuthSecret {
         if self.access_token_field.is_empty() || self.refresh_token_field.is_empty() {
             return Err(invalid("token response fields must not be empty"));
         }
-        if self.access_token_field == self.refresh_token_field {
-            return Err(invalid("access and refresh token fields must differ"));
+        if !self.poll_secret_fields.is_empty() && self.poll_endpoint.is_none() {
+            return Err(invalid("poll_secret_fields requires a poll_endpoint"));
+        }
+        for field in &self.poll_secret_fields {
+            if field.is_empty() {
+                return Err(invalid("poll secret fields must not be empty"));
+            }
+            if *field == self.access_token_field || *field == self.refresh_token_field {
+                return Err(invalid("poll secret fields must not be token fields"));
+            }
         }
         validate_env_var(&self.access_env_var, grant_index)?;
         validate_env_var(&self.refresh_env_var, grant_index)?;
@@ -2208,6 +2263,25 @@ fn validate_env_var(env_var: &str, secret_index: usize) -> Result<(), SecretConf
     }
     if env_var.contains('\0') {
         return Err(SecretConfigError::EnvVarContainsNul { secret_index });
+    }
+    Ok(())
+}
+
+fn validate_oauth_endpoint(
+    endpoint: &str,
+    not_https: &'static str,
+    missing_path: &'static str,
+    grant_index: usize,
+) -> Result<(), SecretConfigError> {
+    let invalid = |reason| SecretConfigError::InvalidOAuth {
+        grant_index,
+        reason,
+    };
+    let authority_and_path = endpoint
+        .strip_prefix("https://")
+        .ok_or_else(|| invalid(not_https))?;
+    if !authority_and_path.contains('/') || authority_and_path.starts_with('/') {
+        return Err(invalid(missing_path));
     }
     Ok(())
 }
@@ -2795,26 +2869,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oauth_access_and_refresh_token_fields_must_differ() {
-        let oauth = OAuthSecret {
+    fn device_flow_oauth() -> OAuthSecret {
+        OAuthSecret {
             broker_endpoint: "/run/microsandbox/oauth.sock".into(),
             grant_id: "grant".into(),
-            token_endpoint: "https://auth.example.com/token".into(),
-            inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
-            access_token_field: "token".into(),
-            refresh_token_field: "token".into(),
+            token_endpoint: "https://github.com/login/oauth/access_token".into(),
+            device_code_endpoint: Some("https://github.com/login/device/code".into()),
+            poll_endpoint: Some("https://github.com/login/oauth/access_token".into()),
+            poll_secret_fields: vec![],
+            inject_hosts: vec![HostPattern::Exact("api.github.com".into())],
+            access_token_field: "access_token".into(),
+            refresh_token_field: "access_token".into(),
             access_env_var: "ACCESS_TOKEN".into(),
             refresh_env_var: "REFRESH_TOKEN".into(),
             access_sentinel: "$ACCESS".into(),
             refresh_sentinel: "$REFRESH".into(),
-        };
+        }
+    }
 
+    #[test]
+    fn oauth_access_and_refresh_token_fields_may_be_the_same() {
+        assert_eq!(device_flow_oauth().validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_device_endpoints_must_be_https_with_a_path() {
+        let mut oauth = device_flow_oauth();
+        oauth.device_code_endpoint = Some("http://github.com/login/device/code".into());
         assert_eq!(
             oauth.validate(0),
             Err(SecretConfigError::InvalidOAuth {
                 grant_index: 0,
-                reason: "access and refresh token fields must differ",
+                reason: "device_code_endpoint must be HTTPS",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.poll_endpoint = Some("https://github.com".into());
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "poll_endpoint must include a host and path",
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_poll_secret_fields_need_a_poll_endpoint_and_may_not_be_token_fields() {
+        let mut oauth = device_flow_oauth();
+        oauth.poll_endpoint = None;
+        oauth.poll_secret_fields = vec!["authorization_code".into()];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "poll_secret_fields requires a poll_endpoint",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.poll_secret_fields = vec!["access_token".into()];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "poll secret fields must not be token fields",
             })
         );
     }

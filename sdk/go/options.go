@@ -1287,9 +1287,19 @@ type SecretEnvOptions struct {
 // OAuthSecretConfig configures provider-neutral OAuth token protection.
 // Token values are never part of this durable configuration.
 type OAuthSecretConfig struct {
-	BrokerEndpoint    string
-	GrantID           string
-	TokenEndpoint     string
+	BrokerEndpoint string
+	GrantID        string
+	TokenEndpoint  string
+	// DeviceCodeEndpoint is the exact HTTPS RFC 8628 device-code URL, when
+	// the grant is obtained by a device flow. Requests to it are forwarded
+	// unmodified.
+	DeviceCodeEndpoint string
+	// PollEndpoint is the exact HTTPS device-code polling URL. It may be the
+	// same URL as TokenEndpoint.
+	PollEndpoint string
+	// PollSecretFields names extra secret JSON fields in a poll response that
+	// are replaced with sentinels before the sandbox sees them.
+	PollSecretFields  []string
 	InjectHosts       []string
 	AccessTokenField  string
 	RefreshTokenField string

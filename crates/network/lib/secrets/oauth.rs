@@ -26,6 +26,16 @@ const MAX_RESPONSE_SCRUB_FRAMING_BYTES: usize = MAX_OAUTH_MESSAGE_BYTES;
 const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// RFC 8628 poll errors that say the device flow has not produced a token.
+/// None of them is a failure of the grant the broker holds, so the response is
+/// forwarded to the guest untouched and nothing is committed.
+const POLL_WAITING_ERRORS: [&str; 4] = [
+    "authorization_pending",
+    "slow_down",
+    "expired_token",
+    "access_denied",
+];
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -35,7 +45,7 @@ pub(crate) struct OAuthConnection {
     grants: Vec<LoadedGrant>,
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
-    exchanges: VecDeque<Option<usize>>,
+    exchanges: VecDeque<Exchange>,
     token_connection: Option<bool>,
     connection_port: u16,
     response_scrub_buffer: Vec<u8>,
@@ -49,13 +59,49 @@ pub(crate) struct OAuthConnection {
 
 struct LoadedGrant {
     config: OAuthSecret,
-    endpoint_host: String,
-    endpoint_port: u16,
-    endpoint_target: String,
+    token: Endpoint,
+    device_code: Option<Endpoint>,
+    poll: Option<Endpoint>,
     access: Zeroizing<String>,
     refresh: Zeroizing<String>,
     generation: u64,
     lease: Option<UnixStream>,
+    poll_secrets: Vec<PollSecret>,
+}
+
+/// One exact HTTPS endpoint a request line is matched against.
+struct Endpoint {
+    host: String,
+    port: u16,
+    target: String,
+}
+
+/// An extra secret a poll response carried, held for the connection's life so
+/// the token request that follows can carry it back upstream.
+struct PollSecret {
+    field: String,
+    sentinel: String,
+    value: Zeroizing<String>,
+}
+
+/// A request whose response is still outstanding on a token connection.
+enum Exchange {
+    /// Forwarded unchanged; the response carries no grant material.
+    PassThrough,
+    /// A token or poll request for the grant at this index.
+    Token { grant: usize, poll: bool },
+}
+
+/// How a poll (RFC 8628) response body ends the polling loop.
+enum PollOutcome {
+    /// The device flow has not produced a token yet, or has ended without one.
+    Waiting,
+    /// The response carries the access token field.
+    Granted,
+    /// The response carries only configured poll secret fields.
+    Secrets,
+    /// Anything else, including a malformed body: a failed exchange.
+    Failed,
 }
 
 #[derive(Serialize)]
@@ -156,8 +202,17 @@ impl OAuthConnection {
         let mut grants = Vec::new();
         let mut seen_tokens = Vec::new();
         for config in configs {
-            let (endpoint_host, endpoint_port, endpoint_target) =
-                parse_https_endpoint(&config.token_endpoint)?;
+            let token = parse_https_endpoint(&config.token_endpoint)?;
+            let device_code = config
+                .device_code_endpoint
+                .as_deref()
+                .map(parse_https_endpoint)
+                .transpose()?;
+            let poll = config
+                .poll_endpoint
+                .as_deref()
+                .map(parse_https_endpoint)
+                .transpose()?;
             let host_allowed = |matches: bool| {
                 matches
                     && identity.is_none_or(|(guest_ip, shared)| {
@@ -166,8 +221,15 @@ impl OAuthConnection {
                         })
                     })
             };
-            let endpoint_relevant =
-                port == endpoint_port && host_allowed(endpoint_host.eq_ignore_ascii_case(sni));
+            // Every endpoint of the flow makes the grant relevant: the device
+            // code endpoint carries no secret, but the connection that reaches
+            // it also carries the poll and token requests that do.
+            let is_relevant = |endpoint: &Endpoint| {
+                port == endpoint.port && host_allowed(endpoint.host.eq_ignore_ascii_case(sni))
+            };
+            let endpoint_relevant = is_relevant(&token)
+                || device_code.as_ref().is_some_and(&is_relevant)
+                || poll.as_ref().is_some_and(&is_relevant);
             let inject_relevant = config.inject_hosts.iter().any(|host| {
                 identity.map_or_else(
                     || host.matches(sni),
@@ -183,13 +245,14 @@ impl OAuthConnection {
             remember_token(&mut seen_tokens, &loaded.refresh)?;
             grants.push(LoadedGrant {
                 config: config.clone(),
-                endpoint_host,
-                endpoint_port,
-                endpoint_target,
+                token,
+                device_code,
+                poll,
                 access: Zeroizing::new(loaded.access),
                 refresh: Zeroizing::new(loaded.refresh),
                 generation: loaded.generation,
                 lease: None,
+                poll_secrets: Vec::new(),
             });
         }
         Ok(Self {
@@ -430,35 +493,55 @@ impl OAuthConnection {
                         .split_whitespace()
                         .nth(1)
                         .ok_or_else(invalid_http)?;
+                    let port = self.connection_port;
+                    // A grant matches at most once even when its poll endpoint
+                    // is its token endpoint, which is what a device flow with a
+                    // refresh grant looks like.
                     let endpoint_grants = self
                         .grants
                         .iter()
                         .enumerate()
                         .filter(|(_, grant)| {
-                            grant.endpoint_host.eq_ignore_ascii_case(sni)
-                                && grant.endpoint_port == self.connection_port
-                                && grant.endpoint_target == target
+                            grant.token.matches(sni, port, target)
+                                || grant
+                                    .poll
+                                    .as_ref()
+                                    .is_some_and(|poll| poll.matches(sni, port, target))
                         })
                         .collect::<Vec<_>>();
+                    let endpoint_request = !endpoint_grants.is_empty();
+                    let device_code_request = !endpoint_request
+                        && self.grants.iter().any(|grant| {
+                            grant
+                                .device_code
+                                .as_ref()
+                                .is_some_and(|device_code| device_code.matches(sni, port, target))
+                        });
                     let framing = request_body_framing(&headers)?;
                     let body_len = match framing {
                         RequestBodyFraming::None | RequestBodyFraming::Chunked => 0,
                         RequestBodyFraming::ContentLength(length) => length,
                     };
                     let total_len = header_end.checked_add(body_len).ok_or_else(invalid_http)?;
-                    let endpoint_request = !endpoint_grants.is_empty();
-                    if endpoint_request {
+                    if endpoint_request || device_code_request {
+                        let endpoint = if endpoint_request {
+                            "token"
+                        } else {
+                            "device code"
+                        };
                         if !method.eq_ignore_ascii_case("POST") {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "OAuth token endpoint requests must use POST",
+                                format!("OAuth {endpoint} endpoint requests must use POST"),
                             ));
                         }
                         reject_expect_100_continue(&headers)?;
                         if matches!(framing, RequestBodyFraming::Chunked) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "OAuth token endpoint chunked requests are unsupported",
+                                format!(
+                                    "OAuth {endpoint} endpoint chunked requests are unsupported"
+                                ),
                             ));
                         }
                         if self.request_buffer.len() < total_len {
@@ -490,7 +573,16 @@ impl OAuthConnection {
                         [] => return Err(invalid_http()),
                         _ => return Err(invalid_http()),
                     };
-                    let is_token_request = token_grant.is_some();
+                    let poll_request = token_grant.is_some_and(|index| {
+                        self.grants[index]
+                            .poll
+                            .as_ref()
+                            .is_some_and(|poll| poll.matches(sni, port, target))
+                    });
+                    // A device code request holds no secret, but it belongs to
+                    // the same conversation: buffered whole, forwarded
+                    // unchanged, and its response released only once parsed.
+                    let is_token_request = token_grant.is_some() || device_code_request;
                     if self
                         .token_connection
                         .is_some_and(|token_connection| token_connection != is_token_request)
@@ -512,7 +604,12 @@ impl OAuthConnection {
                         self.response_head_requests
                             .push_back(method.eq_ignore_ascii_case("HEAD"));
                     }
-                    if token_grant.is_some() && self.exchanges.iter().any(Option::is_some) {
+                    if token_grant.is_some()
+                        && self
+                            .exchanges
+                            .iter()
+                            .any(|exchange| matches!(exchange, Exchange::Token { .. }))
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "OAuth token request pipelining is unsupported",
@@ -572,12 +669,24 @@ impl OAuthConnection {
                                 grant.config.refresh_sentinel.as_bytes(),
                                 grant.refresh.as_bytes(),
                             );
+                            for secret in &grant.poll_secrets {
+                                rewritten = replace_all(
+                                    &rewritten,
+                                    secret.sentinel.as_bytes(),
+                                    secret.value.as_bytes(),
+                                );
+                            }
                         }
                     }
                     if let Some(index) = token_grant {
                         validate_token_request_content_type(&headers)?;
                         rewritten = update_content_length(&rewritten)?;
-                        self.exchanges.push_back(Some(index));
+                        self.exchanges.push_back(Exchange::Token {
+                            grant: index,
+                            poll: poll_request,
+                        });
+                    } else if device_code_request {
+                        self.exchanges.push_back(Exchange::PassThrough);
                     }
                     output.extend_from_slice(&rewritten);
                     pending = self.request_buffer.split_off(request_len);
@@ -675,10 +784,7 @@ impl OAuthConnection {
         self.response_buffer.extend_from_slice(data);
         enforce_limit(&self.response_buffer)?;
         let mut output = Vec::new();
-        loop {
-            let Some(message) = parse_token_response(&self.response_buffer)? else {
-                break;
-            };
+        while let Some(message) = parse_token_response(&self.response_buffer)? {
             let total_len = message.total_len;
             let headers = message.headers.to_vec();
             let body = message.body.to_vec();
@@ -694,20 +800,118 @@ impl OAuthConnection {
                 ));
             }
             let rewritten = match exchange {
-                Some(index) if (200..300).contains(&status) => {
-                    self.sanitize_token_response(index, &headers, &body).await?
+                Exchange::Token { grant, poll } => {
+                    self.finish_exchange(grant, poll, status, &headers, &body, response)
+                        .await?
                 }
-                Some(index) => {
-                    let rewritten = self.sanitize_token_error(index, &headers, &body)?;
-                    self.grants[index].lease = None;
-                    rewritten
-                }
-                _ => response,
+                Exchange::PassThrough => response,
             };
             output.extend_from_slice(&self.scrub_tokens(rewritten));
             self.response_buffer.drain(..total_len);
         }
         Ok(output)
+    }
+
+    /// Complete a token or poll exchange for the grant at `index`.
+    async fn finish_exchange(
+        &mut self,
+        index: usize,
+        poll: bool,
+        status: u16,
+        headers: &[u8],
+        body: &[u8],
+        response: Vec<u8>,
+    ) -> io::Result<Vec<u8>> {
+        if poll {
+            match poll_outcome(status, body, &self.grants[index].config) {
+                PollOutcome::Waiting => {
+                    // Nothing was committed, so the broker lease is released
+                    // rather than held across the guest's polling interval.
+                    self.grants[index].lease = None;
+                    return Ok(response);
+                }
+                PollOutcome::Secrets => return self.sanitize_poll_secrets(index, headers, body),
+                PollOutcome::Granted | PollOutcome::Failed => {}
+            }
+        }
+        if (200..300).contains(&status) {
+            return self.sanitize_token_response(index, headers, body).await;
+        }
+        let rewritten = self.sanitize_token_error(index, headers, body)?;
+        self.grants[index].lease = None;
+        Ok(rewritten)
+    }
+
+    /// Replace a poll response's extra secret fields with sentinels, holding
+    /// the real values for the token request that follows on this connection.
+    fn sanitize_poll_secrets(
+        &mut self,
+        index: usize,
+        headers: &[u8],
+        body: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let mut json: Value = serde_json::from_slice(body).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed OAuth poll response")
+        })?;
+        let object = json.as_object_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth poll response must be an object",
+            )
+        })?;
+        self.replace_poll_secrets(index, object)?;
+        // No token was committed, so the grant keeps its material and the
+        // lease goes back to the broker.
+        self.grants[index].lease = None;
+        let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
+        let mut response = rebuild_message(headers, &body)?;
+        scrub_seen_tokens(&mut response, &self.seen_tokens);
+        Ok(response)
+    }
+
+    fn replace_poll_secrets(
+        &mut self,
+        index: usize,
+        object: &mut serde_json::Map<String, Value>,
+    ) -> io::Result<()> {
+        let fields = self.grants[index].config.poll_secret_fields.clone();
+        for field in fields {
+            let Some(Value::String(value)) = object.get(&field) else {
+                continue;
+            };
+            let value = value.clone();
+            let sentinel = self.remember_poll_secret(index, &field, &value)?;
+            object.insert(field, Value::String(sentinel));
+        }
+        Ok(())
+    }
+
+    /// Mint or refresh the sentinel standing in for one poll secret field. The
+    /// sentinel is stable for the life of the connection so a request that
+    /// echoes an earlier one still substitutes.
+    fn remember_poll_secret(
+        &mut self,
+        index: usize,
+        field: &str,
+        value: &str,
+    ) -> io::Result<String> {
+        remember_token(&mut self.seen_tokens, value)?;
+        let grant = &mut self.grants[index];
+        if let Some(secret) = grant
+            .poll_secrets
+            .iter_mut()
+            .find(|secret| secret.field == field)
+        {
+            secret.value = Zeroizing::new(value.to_string());
+            return Ok(secret.sentinel.clone());
+        }
+        let sentinel = random_sentinel("POLL");
+        grant.poll_secrets.push(PollSecret {
+            field: field.to_string(),
+            sentinel: sentinel.clone(),
+            value: Zeroizing::new(value.to_string()),
+        });
+        Ok(sentinel)
     }
 
     async fn sanitize_token_response(
@@ -716,7 +920,6 @@ impl OAuthConnection {
         headers: &[u8],
         body: &[u8],
     ) -> io::Result<Vec<u8>> {
-        let grant = &mut self.grants[index];
         let mut json: Value = serde_json::from_slice(body)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed OAuth response"))?;
         let object = json.as_object_mut().ok_or_else(|| {
@@ -725,6 +928,7 @@ impl OAuthConnection {
                 "OAuth response must be an object",
             )
         })?;
+        let grant = &mut self.grants[index];
         let access = object
             .get(&grant.config.access_token_field)
             .and_then(Value::as_str)
@@ -759,22 +963,27 @@ impl OAuthConnection {
         grant.refresh = Zeroizing::new(refresh);
         grant.generation = generation;
         grant.lease = None;
-        object.insert(
-            grant.config.access_token_field.clone(),
-            Value::String(grant.config.access_sentinel.clone()),
-        );
-        if object.contains_key(&grant.config.refresh_token_field) {
+        // A device flow without a refresh grant names one field for both
+        // tokens; the access sentinel is the one the guest gets back.
+        if object.contains_key(&grant.config.refresh_token_field)
+            && grant.config.refresh_token_field != grant.config.access_token_field
+        {
             object.insert(
                 grant.config.refresh_token_field.clone(),
                 Value::String(grant.config.refresh_sentinel.clone()),
             );
         }
+        object.insert(
+            grant.config.access_token_field.clone(),
+            Value::String(grant.config.access_sentinel.clone()),
+        );
+        self.replace_poll_secrets(index, object)?;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
         rebuild_message(headers, &body)
     }
 
     fn sanitize_token_error(
-        &self,
+        &mut self,
         index: usize,
         headers: &[u8],
         body: &[u8],
@@ -789,18 +998,21 @@ impl OAuthConnection {
                 "OAuth error response must be an object",
             )
         })?;
+        if object.contains_key(&grant.config.refresh_token_field)
+            && grant.config.refresh_token_field != grant.config.access_token_field
+        {
+            object.insert(
+                grant.config.refresh_token_field.clone(),
+                Value::String(grant.config.refresh_sentinel.clone()),
+            );
+        }
         if object.contains_key(&grant.config.access_token_field) {
             object.insert(
                 grant.config.access_token_field.clone(),
                 Value::String(grant.config.access_sentinel.clone()),
             );
         }
-        if object.contains_key(&grant.config.refresh_token_field) {
-            object.insert(
-                grant.config.refresh_token_field.clone(),
-                Value::String(grant.config.refresh_sentinel.clone()),
-            );
-        }
+        self.replace_poll_secrets(index, object)?;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
         let mut response = rebuild_message(headers, &body)?;
         scrub_seen_tokens(&mut response, &self.seen_tokens);
@@ -810,6 +1022,13 @@ impl OAuthConnection {
     fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
         scrub_seen_tokens(&mut response, &self.seen_tokens);
         response
+    }
+}
+
+impl Endpoint {
+    /// Whether a request line on this connection reached exactly this endpoint.
+    fn matches(&self, sni: &str, port: u16, target: &str) -> bool {
+        self.port == port && self.target == target && self.host.eq_ignore_ascii_case(sni)
     }
 }
 
@@ -983,7 +1202,39 @@ fn parse_broker_response<T: for<'de> Deserialize<'de>>(response: &str) -> io::Re
     })
 }
 
-fn parse_https_endpoint(endpoint: &str) -> io::Result<(String, u16, String)> {
+/// Classify a poll (RFC 8628) response body.
+fn poll_outcome(status: u16, body: &[u8], config: &OAuthSecret) -> PollOutcome {
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
+        return PollOutcome::Failed;
+    };
+    // GitHub answers a pending poll with HTTP 200 and RFC 8628 answers it with
+    // 400, so the body decides, not the status.
+    if let Some(error) = object.get("error").and_then(Value::as_str)
+        && POLL_WAITING_ERRORS.contains(&error)
+    {
+        return PollOutcome::Waiting;
+    }
+    if !(200..300).contains(&status) {
+        return PollOutcome::Failed;
+    }
+    if object
+        .get(&config.access_token_field)
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return PollOutcome::Granted;
+    }
+    if config
+        .poll_secret_fields
+        .iter()
+        .any(|field| object.get(field).and_then(Value::as_str).is_some())
+    {
+        return PollOutcome::Secrets;
+    }
+    PollOutcome::Failed
+}
+
+fn parse_https_endpoint(endpoint: &str) -> io::Result<Endpoint> {
     let rest = endpoint.strip_prefix("https://").ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "OAuth endpoint is not HTTPS")
     })?;
@@ -1005,7 +1256,11 @@ fn parse_https_endpoint(endpoint: &str) -> io::Result<(String, u16, String)> {
             "invalid OAuth endpoint authority",
         ));
     }
-    Ok((host.to_ascii_lowercase(), port, format!("/{target}")))
+    Ok(Endpoint {
+        host: host.to_ascii_lowercase(),
+        port,
+        target: format!("/{target}"),
+    })
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1391,15 +1646,22 @@ fn random_sentinel(kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use tokio::net::UnixListener;
+
     use super::*;
     use crate::secrets::config::HostPattern;
-    use tokio::net::UnixListener;
 
     fn config() -> OAuthSecret {
         OAuthSecret {
             broker_endpoint: "/tmp/broker.sock".into(),
             grant_id: "opaque-grant".into(),
             token_endpoint: "https://auth.example.com/oauth/token".into(),
+            device_code_endpoint: None,
+            poll_endpoint: None,
+            poll_secret_fields: vec![],
             inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
             access_token_field: "access_token".into(),
             refresh_token_field: "refresh_token".into(),
@@ -1411,8 +1673,157 @@ mod tests {
     }
 
     fn connection() -> OAuthConnection {
+        connection_for(vec![config()])
+    }
+
+    struct BrokerState {
+        access: String,
+        refresh: String,
+        generation: u64,
+        commits: Vec<Value>,
+    }
+
+    /// A stand-in host broker: it answers `load` and `acquire` with the grant
+    /// it currently holds, and records every `commit`.
+    struct FakeBroker {
+        socket: PathBuf,
+        state: Arc<std::sync::Mutex<BrokerState>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeBroker {
+        fn commits(&self) -> Vec<Value> {
+            self.state.lock().unwrap().commits.clone()
+        }
+    }
+
+    impl Drop for FakeBroker {
+        fn drop(&mut self) {
+            self.task.abort();
+            std::fs::remove_file(&self.socket).ok();
+        }
+    }
+
+    fn start_broker(access: &str, refresh: &str) -> FakeBroker {
+        let socket = std::env::temp_dir().join(format!(
+            "msb-oauth-device-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(BrokerState {
+            access: access.into(),
+            refresh: refresh.into(),
+            generation: 7,
+            commits: Vec::new(),
+        }));
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        while stream.read_line(&mut line).await.unwrap() > 0 {
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            line.clear();
+                            let reply = {
+                                let mut state = state.lock().unwrap();
+                                match request["action"].as_str().unwrap() {
+                                    "load" | "acquire" => serde_json::json!({
+                                        "access": state.access,
+                                        "refresh": state.refresh,
+                                        "generation": state.generation,
+                                    }),
+                                    "commit" => {
+                                        assert_eq!(request["generation"], state.generation);
+                                        state.access =
+                                            request["access"].as_str().unwrap().to_string();
+                                        state.refresh =
+                                            request["refresh"].as_str().unwrap().to_string();
+                                        state.generation += 1;
+                                        let generation = state.generation;
+                                        state.commits.push(request);
+                                        serde_json::json!({"ok": true, "generation": generation})
+                                    }
+                                    other => panic!("unexpected broker action {other}"),
+                                }
+                            };
+                            let mut bytes = serde_json::to_vec(&reply).unwrap();
+                            bytes.push(b'\n');
+                            stream.get_mut().write_all(&bytes).await.unwrap();
+                        }
+                    });
+                }
+            }
+        });
+        FakeBroker {
+            socket,
+            state,
+            task,
+        }
+    }
+
+    fn broker_config(broker: &FakeBroker) -> OAuthSecret {
+        let mut config = config();
+        config.broker_endpoint = broker.socket.to_string_lossy().into_owned();
+        config
+    }
+
+    fn json_request(target: &str, body: &str) -> String {
+        format!(
+            "POST {target} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn form_request(target: &str, body: &str) -> String {
+        format!(
+            "POST {target} HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn json_response(status: u16, body: &str) -> String {
+        let reason = if (200..300).contains(&status) {
+            "OK"
+        } else {
+            "Bad Request"
+        };
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn loaded(config: OAuthSecret) -> LoadedGrant {
+        let token = parse_https_endpoint(&config.token_endpoint).unwrap();
+        let device_code = config
+            .device_code_endpoint
+            .as_deref()
+            .map(|endpoint| parse_https_endpoint(endpoint).unwrap());
+        let poll = config
+            .poll_endpoint
+            .as_deref()
+            .map(|endpoint| parse_https_endpoint(endpoint).unwrap());
+        LoadedGrant {
+            config,
+            token,
+            device_code,
+            poll,
+            access: Zeroizing::new("real-access".into()),
+            refresh: Zeroizing::new("real-refresh".into()),
+            generation: 4,
+            lease: None,
+            poll_secrets: Vec::new(),
+        }
+    }
+
+    fn connection_for(configs: Vec<OAuthSecret>) -> OAuthConnection {
         OAuthConnection {
-            grants: vec![loaded(config())],
+            grants: configs.into_iter().map(loaded).collect(),
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
@@ -1428,19 +1839,6 @@ mod tests {
                 Zeroizing::new("real-refresh".into()),
             ],
             request_state: RequestState::Headers,
-        }
-    }
-
-    fn loaded(config: OAuthSecret) -> LoadedGrant {
-        LoadedGrant {
-            config,
-            endpoint_host: "auth.example.com".into(),
-            endpoint_port: 443,
-            endpoint_target: "/oauth/token".into(),
-            access: Zeroizing::new("real-access".into()),
-            refresh: Zeroizing::new("real-refresh".into()),
-            generation: 4,
-            lease: None,
         }
     }
 
@@ -1779,14 +2177,12 @@ mod tests {
 
     #[test]
     fn endpoint_parser_requires_https_and_preserves_exact_target() {
-        assert_eq!(
-            parse_https_endpoint("https://auth.example.com/oauth/token?aud=x").unwrap(),
-            ("auth.example.com".into(), 443, "/oauth/token?aud=x".into())
-        );
-        assert_eq!(
-            parse_https_endpoint("https://auth.example.com:8443/oauth/token").unwrap(),
-            ("auth.example.com".into(), 8443, "/oauth/token".into())
-        );
+        let endpoint = parse_https_endpoint("https://auth.example.com/oauth/token?aud=x").unwrap();
+        assert!(endpoint.matches("auth.example.com", 443, "/oauth/token?aud=x"));
+        assert!(!endpoint.matches("auth.example.com", 443, "/oauth/token"));
+        let endpoint = parse_https_endpoint("https://auth.example.com:8443/oauth/token").unwrap();
+        assert!(endpoint.matches("AUTH.example.com", 8443, "/oauth/token"));
+        assert!(!endpoint.matches("auth.example.com", 443, "/oauth/token"));
         assert!(parse_https_endpoint("http://auth.example.com/token").is_err());
     }
 
@@ -1896,7 +2292,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_success_fails_closed_without_output() {
         let mut connection = connection();
-        connection.exchanges.push_back(Some(0));
+        connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json";
         assert!(connection.transform_responses(response).await.is_err());
     }
@@ -1905,7 +2304,10 @@ mod tests {
     async fn non_object_token_errors_fail_closed_without_output() {
         for body in ["not-json", r#""credential""#, r#"["credential"]"#] {
             let mut connection = connection();
-            connection.exchanges.push_back(Some(0));
+            connection.exchanges.push_back(Exchange::Token {
+                grant: 0,
+                poll: false,
+            });
             let response = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -1929,7 +2331,10 @@ mod tests {
         ] {
             let mut connection = connection();
             connection.token_connection = Some(true);
-            connection.exchanges.push_back(Some(0));
+            connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
             assert!(connection.transform_responses(response).await.is_err());
         }
     }
@@ -1938,7 +2343,10 @@ mod tests {
     async fn eof_with_buffered_token_response_fails_closed() {
         let mut connection = connection();
         connection.token_connection = Some(true);
-        connection.exchanges.push_back(Some(0));
+        connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
         assert!(
             connection
                 .transform_responses(
@@ -1954,7 +2362,7 @@ mod tests {
 
     #[test]
     fn error_response_token_fields_are_never_released() {
-        let connection = connection();
+        let mut connection = connection();
         let headers = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n";
         let body = br#"{"error":"invalid_grant","access_token":"novel-access","refresh_token":"novel-refresh","error_description":"real-access and real-refresh","error_uri":"https://auth.example.com/errors/invalid-grant","retry_after":30,"nested":{"access":"real-access"}}"#;
         let output = connection.sanitize_token_error(0, headers, body).unwrap();
@@ -1998,7 +2406,10 @@ mod tests {
     async fn failed_refresh_releases_lease() {
         let mut connection = connection();
         connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
-        connection.exchanges.push_back(Some(0));
+        connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
         let body = r#"{"error":"invalid_grant"}"#;
         let response = format!(
             "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
@@ -2018,24 +2429,7 @@ mod tests {
         second.grant_id = "other-grant".into();
         second.access_sentinel = "$OTHER_ACCESS".into();
         second.refresh_sentinel = "$OTHER_REFRESH".into();
-        let mut connection = OAuthConnection {
-            grants: vec![loaded(first), loaded(second)],
-            request_buffer: Vec::new(),
-            response_buffer: Vec::new(),
-            exchanges: VecDeque::new(),
-            token_connection: None,
-            connection_port: 443,
-            response_scrub_buffer: Vec::new(),
-            response_scrub_framing: Vec::new(),
-            response_scrub_tail: Vec::new(),
-            response_scrub_state: ResponseScrubState::Headers,
-            response_head_requests: VecDeque::new(),
-            seen_tokens: vec![
-                Zeroizing::new("real-access".into()),
-                Zeroizing::new("real-refresh".into()),
-            ],
-            request_state: RequestState::Headers,
-        };
+        let mut connection = connection_for(vec![first, second]);
         connection.grants[1].lease = Some(UnixStream::pair().unwrap().0);
         let body = "refresh_token=$OTHER_REFRESH";
         let request = format!(
@@ -2047,7 +2441,13 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("real-refresh"));
-        assert_eq!(connection.exchanges.pop_front(), Some(Some(1)));
+        assert!(matches!(
+            connection.exchanges.pop_front(),
+            Some(Exchange::Token {
+                grant: 1,
+                poll: false
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2057,21 +2457,8 @@ mod tests {
         second.grant_id = "other-grant".into();
         second.access_sentinel = "$OTHER_ACCESS".into();
         second.refresh_sentinel = "$OTHER_REFRESH".into();
-        let mut connection = OAuthConnection {
-            grants: vec![loaded(first), loaded(second)],
-            request_buffer: Vec::new(),
-            response_buffer: Vec::new(),
-            exchanges: VecDeque::new(),
-            token_connection: None,
-            connection_port: 443,
-            response_scrub_buffer: Vec::new(),
-            response_scrub_framing: Vec::new(),
-            response_scrub_tail: Vec::new(),
-            response_scrub_state: ResponseScrubState::Headers,
-            response_head_requests: VecDeque::new(),
-            seen_tokens: vec![],
-            request_state: RequestState::Headers,
-        };
+        let mut connection = connection_for(vec![first, second]);
+        connection.seen_tokens.clear();
         let request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
 
         let error = connection
@@ -2090,21 +2477,8 @@ mod tests {
         second.grant_id = "other-grant".into();
         second.access_sentinel = "$OTHER_ACCESS".into();
         second.refresh_sentinel = "$OTHER_REFRESH".into();
-        let mut connection = OAuthConnection {
-            grants: vec![loaded(first), loaded(second)],
-            request_buffer: Vec::new(),
-            response_buffer: Vec::new(),
-            exchanges: VecDeque::new(),
-            token_connection: None,
-            connection_port: 443,
-            response_scrub_buffer: Vec::new(),
-            response_scrub_framing: Vec::new(),
-            response_scrub_tail: Vec::new(),
-            response_scrub_state: ResponseScrubState::Headers,
-            response_head_requests: VecDeque::new(),
-            seen_tokens: Vec::new(),
-            request_state: RequestState::Headers,
-        };
+        let mut connection = connection_for(vec![first, second]);
+        connection.seen_tokens.clear();
         let first_request = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
         let partial_second = b"POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 64\r\n\r\nrefresh_token=$OTHER_REFRESH";
 
@@ -2282,5 +2656,270 @@ mod tests {
         let output = connection.scrub_response_chunk(responses).unwrap();
 
         assert_eq!(output, responses);
+    }
+
+    #[tokio::test]
+    async fn copilot_device_flow_commits_only_once_the_poll_grants_a_token() {
+        let broker = start_broker("old-access", "old-access");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://github.com/login/oauth/access_token".into();
+        config.device_code_endpoint = Some("https://github.com/login/device/code".into());
+        config.poll_endpoint = Some("https://github.com/login/oauth/access_token".into());
+        // Copilot has no refresh grant: the same field carries both tokens.
+        config.access_token_field = "access_token".into();
+        config.refresh_token_field = "access_token".into();
+        config.inject_hosts = vec![HostPattern::Exact("api.github.com".into())];
+        let mut connection = OAuthConnection::new(&[config], "github.com", 443, None)
+            .await
+            .unwrap();
+
+        let device = json_request(
+            "/login/device/code",
+            r#"{"client_id":"Iv1.b507","scope":"repo"}"#,
+        );
+        let upstream = connection
+            .transform_requests(device.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        assert_eq!(upstream, device.as_bytes());
+        let device_response = json_response(
+            200,
+            r#"{"device_code":"dc","user_code":"WDJB-MJHT","verification_uri":"https://github.com/login/device","interval":5}"#,
+        );
+        let guest = connection
+            .transform_responses(device_response.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(guest, device_response.as_bytes());
+
+        let poll = json_request(
+            "/login/oauth/access_token",
+            r#"{"client_id":"Iv1.b507","device_code":"dc","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}"#,
+        );
+        let upstream = connection
+            .transform_requests(poll.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        assert_eq!(upstream, poll.as_bytes());
+        assert!(connection.grants[0].lease.is_some());
+        // GitHub answers a pending poll with HTTP 200 and an error body.
+        let pending = json_response(200, r#"{"error":"authorization_pending"}"#);
+        let guest = connection
+            .transform_responses(pending.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(guest, pending.as_bytes());
+        assert!(connection.grants[0].lease.is_none());
+        assert!(broker.commits().is_empty());
+
+        connection
+            .transform_requests(poll.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        let granted = json_response(
+            200,
+            r#"{"access_token":"gho_new","token_type":"bearer","scope":"repo"}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(!guest.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(!guest.contains("gho_new"));
+        assert!(guest.contains(r#""token_type":"bearer""#));
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["access"], "gho_new");
+        assert_eq!(commits[0]["refresh"], "gho_new");
+    }
+
+    #[tokio::test]
+    async fn xai_device_flow_shares_one_endpoint_for_polling_and_refresh() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://auth.x.ai/oauth2/token".into();
+        config.device_code_endpoint = Some("https://auth.x.ai/oauth2/device/code".into());
+        config.poll_endpoint = Some("https://auth.x.ai/oauth2/token".into());
+        let mut connection = OAuthConnection::new(&[config], "auth.x.ai", 443, None)
+            .await
+            .unwrap();
+
+        let poll = form_request(
+            "/oauth2/token",
+            "client_id=xai&device_code=dc&grant_type=urn:ietf:params:oauth:grant-type:device_code",
+        );
+        let upstream = connection
+            .transform_requests(poll.as_bytes(), "auth.x.ai")
+            .await
+            .unwrap();
+        assert_eq!(upstream, poll.as_bytes());
+        // RFC 8628 answers a pending poll with HTTP 400: the body decides.
+        let pending = json_response(400, r#"{"error":"slow_down","interval":10}"#);
+        let guest = connection
+            .transform_responses(pending.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(guest, pending.as_bytes());
+        assert!(broker.commits().is_empty());
+
+        connection
+            .transform_requests(poll.as_bytes(), "auth.x.ai")
+            .await
+            .unwrap();
+        let granted = json_response(
+            200,
+            r#"{"access_token":"xai-access","refresh_token":"xai-refresh","expires_in":3600}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(guest.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(!guest.contains("xai-access"));
+        assert!(!guest.contains("xai-refresh"));
+        assert_eq!(broker.commits().len(), 1);
+
+        // The refresh grant lives at the poll URL: the sentinel is replaced
+        // with the token the poll just committed.
+        let refresh = form_request(
+            "/oauth2/token",
+            "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(refresh.as_bytes(), "auth.x.ai")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("refresh_token=xai-refresh"));
+    }
+
+    #[tokio::test]
+    async fn openai_poll_secrets_are_sentineled_and_substituted_back() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://auth.openai.com/oauth/token".into();
+        config.device_code_endpoint = Some("https://auth.openai.com/oauth/device/code".into());
+        config.poll_endpoint = Some("https://auth.openai.com/oauth/device/token".into());
+        config.poll_secret_fields = vec!["authorization_code".into(), "code_verifier".into()];
+        let mut connection = OAuthConnection::new(&[config], "auth.openai.com", 443, None)
+            .await
+            .unwrap();
+
+        let poll = json_request("/oauth/device/token", r#"{"device_code":"dc"}"#);
+        connection
+            .transform_requests(poll.as_bytes(), "auth.openai.com")
+            .await
+            .unwrap();
+        let secrets = json_response(
+            200,
+            r#"{"authorization_code":"ac-real","code_verifier":"cv-real","expires_in":600}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(secrets.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!guest.contains("ac-real"));
+        assert!(!guest.contains("cv-real"));
+        assert!(broker.commits().is_empty());
+        assert!(connection.grants[0].lease.is_none());
+        let message = parse_token_response(guest.as_bytes()).unwrap().unwrap();
+        let json: Value = serde_json::from_slice(message.body).unwrap();
+        let code = json["authorization_code"].as_str().unwrap().to_string();
+        let verifier = json["code_verifier"].as_str().unwrap().to_string();
+        assert!(code.starts_with("$MSB_OAUTH_POLL_"));
+        assert!(verifier.starts_with("$MSB_OAUTH_POLL_"));
+        assert_ne!(code, verifier);
+        assert_eq!(json["expires_in"], 600);
+
+        let exchange = json_request(
+            "/oauth/token",
+            &format!(r#"{{"authorization_code":"{code}","code_verifier":"{verifier}"}}"#),
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(exchange.as_bytes(), "auth.openai.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains(r#""authorization_code":"ac-real""#));
+        assert!(upstream.contains(r#""code_verifier":"cv-real""#));
+
+        let granted = json_response(
+            200,
+            r#"{"access_token":"oa-access","refresh_token":"oa-refresh"}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(!guest.contains("oa-access"));
+        assert_eq!(broker.commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn poll_error_outside_the_waiting_set_fails_closed() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://auth.example.com/oauth/token".into();
+        config.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        let poll = json_request("/oauth/device/token", r#"{"device_code":"dc"}"#);
+
+        let mut connection = OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let denied = json_response(
+            400,
+            r#"{"error":"unauthorized_client","access_token":"leaked"}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(denied.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains("unauthorized_client"));
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(!guest.contains("leaked"));
+        assert!(connection.grants[0].lease.is_none());
+        assert!(broker.commits().is_empty());
+
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let error = connection
+            .transform_responses(json_response(200, r#"{"interval":5}"#).as_bytes())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "OAuth access token is missing");
+        assert!(broker.commits().is_empty());
     }
 }
