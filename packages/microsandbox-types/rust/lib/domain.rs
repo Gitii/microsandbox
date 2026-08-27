@@ -1811,6 +1811,15 @@ pub(crate) fn default_private() -> HostPermissions {
 /// Maximum supported secret placeholder length in bytes.
 pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
 
+/// Maximum supported OAuth sentinel length in bytes.
+///
+/// Sentinels may be JWT-shaped: the real token's header and payload copied
+/// verbatim with only the signature replaced, so that a client which decodes
+/// the token to read its claims keeps working. Such a sentinel is as long as
+/// the token whose claims it mirrors, which is far longer than the opaque
+/// sentinels this bound was first written for.
+pub const MAX_OAUTH_SENTINEL_BYTES: usize = 8 * 1024;
+
 /// Placeholder-based secret injection for a sandbox's TLS-intercepted egress.
 ///
 /// The sandbox only ever sees each secret's `placeholder`; the local network
@@ -1895,9 +1904,20 @@ pub struct OAuthSecret {
     pub access_env_var: String,
     /// Environment variable exposing the refresh sentinel to the guest.
     pub refresh_env_var: String,
-    /// Per-sandbox access-token sentinel.
+    /// Per-sandbox access-token sentinel, the value the guest starts with.
+    ///
+    /// It may be opaque, or JWT-shaped for a client that decodes the token to
+    /// read its claims: the real token's header and payload copied verbatim
+    /// with only the signature replaced. A JWT-shaped sentinel mirrors claims
+    /// that change on every login and refresh, so the broker may hand back a
+    /// replacement with the tokens it loads or commits, and that replacement
+    /// supersedes this value for the connection that received it.
+    ///
+    /// Must be non-empty, at most 8192 bytes (`MAX_OAUTH_SENTINEL_BYTES`),
+    /// and must not contain NUL, CR, or LF. No two grants may share one.
     pub access_sentinel: String,
-    /// Per-sandbox refresh-token sentinel.
+    /// Per-sandbox refresh-token sentinel, under the same rules as
+    /// [`access_sentinel`](Self::access_sentinel).
     pub refresh_sentinel: String,
 }
 
@@ -2110,6 +2130,21 @@ impl SecretsConfig {
         }
         for (index, oauth) in self.oauth.iter().enumerate() {
             oauth.validate(index)?;
+            // A sentinel shared by two grants would be substituted with
+            // whichever grant the proxy reached first, so one grant's token
+            // would leave under the other's name.
+            let shared = self.oauth[..index].iter().any(|earlier| {
+                [&earlier.access_sentinel, &earlier.refresh_sentinel]
+                    .contains(&&oauth.access_sentinel)
+                    || [&earlier.access_sentinel, &earlier.refresh_sentinel]
+                        .contains(&&oauth.refresh_sentinel)
+            });
+            if shared {
+                return Err(SecretConfigError::InvalidOAuth {
+                    grant_index: index,
+                    reason: "sentinels must not be shared with another grant",
+                });
+            }
         }
         Ok(())
     }
@@ -2177,8 +2212,8 @@ impl OAuthSecret {
         }
         validate_env_var(&self.access_env_var, grant_index)?;
         validate_env_var(&self.refresh_env_var, grant_index)?;
-        validate_placeholder(&self.access_sentinel, grant_index)?;
-        validate_placeholder(&self.refresh_sentinel, grant_index)?;
+        validate_sentinel(&self.access_sentinel, grant_index)?;
+        validate_sentinel(&self.refresh_sentinel, grant_index)?;
         if self.access_sentinel == self.refresh_sentinel {
             return Err(invalid("access and refresh sentinels must differ"));
         }
@@ -2299,16 +2334,30 @@ fn validate_oauth_endpoint(
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
+    validate_placeholder_bytes(placeholder, secret_index, MAX_SECRET_PLACEHOLDER_BYTES)
+}
+
+/// Validate one OAuth sentinel, which may be JWT-shaped and so far longer than
+/// a plain secret placeholder.
+fn validate_sentinel(sentinel: &str, grant_index: usize) -> Result<(), SecretConfigError> {
+    validate_placeholder_bytes(sentinel, grant_index, MAX_OAUTH_SENTINEL_BYTES)
+}
+
+fn validate_placeholder_bytes(
+    placeholder: &str,
+    secret_index: usize,
+    max_bytes: usize,
+) -> Result<(), SecretConfigError> {
     if placeholder.is_empty() {
         return Err(SecretConfigError::EmptyPlaceholder { secret_index });
     }
 
     let actual_bytes = placeholder.len();
-    if actual_bytes > MAX_SECRET_PLACEHOLDER_BYTES {
+    if actual_bytes > max_bytes {
         return Err(SecretConfigError::PlaceholderTooLong {
             secret_index,
             actual_bytes,
-            max_bytes: MAX_SECRET_PLACEHOLDER_BYTES,
+            max_bytes,
         });
     }
 
@@ -2902,6 +2951,53 @@ mod tests {
     #[test]
     fn oauth_access_and_refresh_token_fields_may_be_the_same() {
         assert_eq!(device_flow_oauth().validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_sentinels_may_not_be_shared_between_grants() {
+        let first = device_flow_oauth();
+        let mut second = device_flow_oauth();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        let mut config = SecretsConfig {
+            oauth: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+
+        // The second grant's refresh sentinel is the first grant's access
+        // sentinel.
+        second.refresh_sentinel = first.access_sentinel.clone();
+        config.oauth = vec![first, second];
+        assert_eq!(
+            config.validate(),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 1,
+                reason: "sentinels must not be shared with another grant",
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_sentinels_may_be_jwt_sized() {
+        // A JWT-shaped sentinel carries the real token's claims, so it is far
+        // longer than a plain secret placeholder is allowed to be.
+        let mut oauth = device_flow_oauth();
+        oauth.access_sentinel = "e".repeat(MAX_SECRET_PLACEHOLDER_BYTES + 1);
+        assert_eq!(oauth.validate(0), Ok(()));
+
+        oauth.access_sentinel = "e".repeat(MAX_OAUTH_SENTINEL_BYTES);
+        assert_eq!(oauth.validate(0), Ok(()));
+
+        oauth.access_sentinel = "e".repeat(MAX_OAUTH_SENTINEL_BYTES + 1);
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::PlaceholderTooLong {
+                secret_index: 0,
+                actual_bytes: MAX_OAUTH_SENTINEL_BYTES + 1,
+                max_bytes: MAX_OAUTH_SENTINEL_BYTES,
+            })
+        );
     }
 
     #[test]
