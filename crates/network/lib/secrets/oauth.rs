@@ -28,6 +28,13 @@ const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 /// more pass over every request body, and a connection that mints this many
 /// new sentinels is not a session any client runs.
 const MAX_GRANT_SENTINEL_ALIASES: usize = 64;
+/// Refusal for a response the proxy has to read whole and cannot frame. Both
+/// name the endpoint they are about, so a connection that fails says which
+/// half of the conversation it was reading.
+const UNFRAMED_TOKEN_RESPONSE: &str =
+    "OAuth token responses require Content-Length or chunked framing";
+const UNFRAMED_MINT_RESPONSE: &str =
+    "OAuth mint endpoint responses require Content-Length or chunked framing";
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Port a configured endpoint is on when it does not say otherwise.
 const DEFAULT_HTTPS_PORT: u16 = 443;
@@ -292,21 +299,16 @@ struct Committed {
     refresh_sentinel: Option<String>,
 }
 
-struct HttpMessage<'a> {
-    headers: &'a [u8],
-    body: &'a [u8],
-    total_len: usize,
-}
-
-/// One complete response to a mint request, with any chunked framing undone.
+/// One complete response the proxy has to read whole -- a token exchange or a
+/// mint -- with any chunked framing undone.
 ///
-/// Both framings are read: a minted key is small enough to arrive in a single
-/// chunk, and an endpoint that streams JSON is not obliged to say how long it
-/// is up front. The body comes back de-chunked and the response handed to the
-/// guest is rebuilt with a `Content-Length`, since rewriting the field changes
-/// its length anyway and re-chunking to preserve a framing no client depends
-/// on would only add a way to get it wrong.
-struct MintMessage {
+/// Both framings are read: a token or a minted key is small enough to arrive
+/// in a single chunk, and an endpoint behind a CDN is not obliged to say how
+/// long its answer is up front. The body comes back de-chunked and the
+/// response handed to the guest is rebuilt with a `Content-Length`, since
+/// rewriting the fields changes its length anyway and re-chunking to preserve
+/// a framing no client depends on would only add a way to get it wrong.
+struct FramedResponse {
     headers: Vec<u8>,
     body: Vec<u8>,
     total_len: usize,
@@ -520,7 +522,9 @@ impl OAuthConnection {
                     "OAuth informational responses are unsupported",
                 ));
             }
-            let Some(message) = parse_mint_response(&self.response_buffer)? else {
+            let Some(message) =
+                parse_framed_response(&self.response_buffer, UNFRAMED_MINT_RESPONSE)?
+            else {
                 break;
             };
             let total_len = message.total_len;
@@ -1220,12 +1224,14 @@ impl OAuthConnection {
                 self.exchanges.pop_front();
                 continue;
             }
-            let Some(message) = parse_token_response(&self.response_buffer)? else {
+            let Some(message) =
+                parse_framed_response(&self.response_buffer, UNFRAMED_TOKEN_RESPONSE)?
+            else {
                 break;
             };
             let total_len = message.total_len;
-            let headers = message.headers.to_vec();
-            let body = message.body.to_vec();
+            let headers = message.headers;
+            let body = message.body;
             let exchange = self.exchanges.pop_front().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "OAuth response without request")
             })?;
@@ -1302,7 +1308,7 @@ impl OAuthConnection {
         // lease goes back to the broker.
         self.grants[index].lease = None;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
-        let mut response = rebuild_message(headers, &body)?;
+        let mut response = rebuild_identity_message(headers, &body)?;
         scrub_seen_tokens(&mut response, &self.seen_tokens);
         Ok(response)
     }
@@ -1489,7 +1495,7 @@ impl OAuthConnection {
         );
         self.replace_poll_secrets(index, object)?;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
-        rebuild_message(headers, &body)
+        rebuild_identity_message(headers, &body)
     }
 
     fn sanitize_token_error(
@@ -1524,7 +1530,7 @@ impl OAuthConnection {
         }
         self.replace_poll_secrets(index, object)?;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
-        let mut response = rebuild_message(headers, &body)?;
+        let mut response = rebuild_identity_message(headers, &body)?;
         scrub_seen_tokens(&mut response, &self.seen_tokens);
         Ok(response)
     }
@@ -2305,67 +2311,15 @@ fn line_boundary(data: &[u8]) -> Option<usize> {
         .map(|boundary| boundary + 2)
 }
 
-fn parse_token_response(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
-    let Some(header_end) = header_boundary(data) else {
-        return Ok(None);
-    };
-    let headers = &data[..header_end];
-    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
-    let mut content_encoding = None;
-    let mut transfer_encoding = None;
-    let mut content_length = None;
-    for (name, value) in text.lines().filter_map(|line| line.split_once(':')) {
-        if name.eq_ignore_ascii_case("content-encoding") {
-            if content_encoding.replace(value.trim()).is_some() {
-                return Err(invalid_http());
-            }
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            if transfer_encoding.replace(value.trim()).is_some() {
-                return Err(invalid_http());
-            }
-        } else if name.eq_ignore_ascii_case("content-length")
-            && content_length
-                .replace(value.trim().parse::<usize>().map_err(|_| invalid_http())?)
-                .is_some()
-        {
-            return Err(invalid_http());
-        }
-    }
-    if content_encoding.is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity")) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "encoded OAuth responses are unsupported",
-        ));
-    }
-    if transfer_encoding.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OAuth token response transfer encoding is unsupported",
-        ));
-    }
-    let content_length = content_length.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OAuth token response requires Content-Length",
-        )
-    })?;
-    let total_len = header_end
-        .checked_add(content_length)
-        .ok_or_else(invalid_http)?;
-    if total_len > MAX_OAUTH_MESSAGE_BYTES {
-        return Err(invalid_http());
-    }
-    if data.len() < total_len {
-        return Ok(None);
-    }
-    Ok(Some(HttpMessage {
-        headers,
-        body: &data[header_end..total_len],
-        total_len,
-    }))
-}
-
-fn parse_mint_response(data: &[u8]) -> io::Result<Option<MintMessage>> {
+/// Read one complete response, undoing chunked framing.
+///
+/// `unframed` names the endpoint in the refusal a close-delimited response
+/// earns: a body whose end is the connection's end cannot be read whole
+/// without waiting for a close that a keep-alive origin will not send.
+fn parse_framed_response(
+    data: &[u8],
+    unframed: &'static str,
+) -> io::Result<Option<FramedResponse>> {
     let Some(header_end) = header_boundary(data) else {
         return Ok(None);
     };
@@ -2379,7 +2333,7 @@ fn parse_mint_response(data: &[u8]) -> io::Result<Option<MintMessage>> {
             if data.len() < total_len {
                 return Ok(None);
             }
-            Ok(Some(MintMessage {
+            Ok(Some(FramedResponse {
                 headers,
                 body: data[header_end..total_len].to_vec(),
                 total_len,
@@ -2389,16 +2343,13 @@ fn parse_mint_response(data: &[u8]) -> io::Result<Option<MintMessage>> {
             let Some((body, consumed)) = collect_chunked_body(&data[header_end..])? else {
                 return Ok(None);
             };
-            Ok(Some(MintMessage {
+            Ok(Some(FramedResponse {
                 headers,
                 body,
                 total_len: header_end + consumed,
             }))
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OAuth mint endpoint responses require Content-Length or chunked framing",
-        )),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, unframed)),
     }
 }
 
@@ -3008,6 +2959,13 @@ mod tests {
         config
     }
 
+    /// Read one complete token endpoint response, the way the connection does.
+    fn parse_token_response(data: &[u8]) -> FramedResponse {
+        parse_framed_response(data, UNFRAMED_TOKEN_RESPONSE)
+            .unwrap()
+            .unwrap()
+    }
+
     fn json_request(target: &str, body: &str) -> String {
         format!(
             "POST {target} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -3032,6 +2990,26 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    /// One complete chunked response: a single chunk, the terminator, and
+    /// whatever trailers the caller asks for.
+    fn chunked_response(status: u16, body: &str, trailers: &[&str]) -> String {
+        let reason = if (200..300).contains(&status) {
+            "OK"
+        } else {
+            "Bad Request"
+        };
+        let mut response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n",
+            body.len()
+        );
+        for trailer in trailers {
+            response.push_str(trailer);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response
     }
 
     fn loaded(config: OAuthSecret) -> LoadedGrant {
@@ -3417,8 +3395,8 @@ mod tests {
         object.insert("access_token".into(), Value::String("ACCESS".into()));
         object.insert("refresh_token".into(), Value::String("REFRESH".into()));
         let rebuilt = rebuild_message(headers, &serde_json::to_vec(&json).unwrap()).unwrap();
-        let parsed = parse_token_response(&rebuilt).unwrap().unwrap();
-        let output: Value = serde_json::from_slice(parsed.body).unwrap();
+        let parsed = parse_token_response(&rebuilt);
+        let output: Value = serde_json::from_slice(&parsed.body).unwrap();
         assert_eq!(output["scope"], "read");
         assert_eq!(output["expires_in"], 3600);
         assert_eq!(output["access_token"], "ACCESS");
@@ -3572,15 +3550,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_responses_require_identity_content_length_framing() {
-        let chunked = "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    async fn token_responses_require_identity_encoding_and_a_framing() {
         let unframed = "HTTP/1.1 400 Bad Request\r\n\r\nsecret";
         let encoded = concat!(
             "HTTP/1.1 400 Bad Request\r\n",
             "Content-Encoding: gzip\r\n",
             "Content-Length: 6\r\n\r\nsecret"
         );
-        for response in [chunked, unframed, encoded] {
+        let encoded_chunked = concat!(
+            "HTTP/1.1 400 Bad Request\r\n",
+            "Content-Encoding: gzip\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n6\r\nsecret\r\n0\r\n\r\n"
+        );
+        for response in [unframed, encoded, encoded_chunked] {
             let mut connection = connection();
             connection.token_connection = Some(true);
             connection.exchanges.push_back(Exchange::Token {
@@ -3594,6 +3576,299 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_chunked_token_response_is_held_until_its_terminator() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut connection =
+            OAuthConnection::new(&[broker_config(&broker)], "auth.example.com", 443, None)
+                .await
+                .unwrap();
+        let request = form_request("/oauth/token", "refresh_token=$MSB_OAUTH_REFRESH_123");
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("refresh_token=old-refresh"), "{upstream}");
+
+        let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600}"#;
+        let response = chunked_response(200, body, &[]);
+        // Split inside the chunk's own terminator, so the first read carries
+        // every byte of the token but none of the framing that ends it.
+        let split = response.len() - "\r\n0\r\n\r\n".len();
+        let held = connection
+            .transform_responses(&response.as_bytes()[..split])
+            .await
+            .unwrap();
+        assert!(held.is_empty(), "nothing is released before the terminator");
+        assert!(broker.commits().is_empty(), "nothing is committed either");
+
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(&response.as_bytes()[split..])
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"), "{guest}");
+        assert!(guest.contains("$MSB_OAUTH_REFRESH_123"), "{guest}");
+        assert!(!guest.contains("new-access"), "{guest}");
+        assert!(!guest.contains("new-refresh"), "{guest}");
+        assert!(
+            !guest.to_ascii_lowercase().contains("transfer-encoding"),
+            "{guest}"
+        );
+        let message = parse_token_response(guest.as_bytes());
+        assert_eq!(message.total_len, guest.len());
+        assert!(
+            guest.contains(&format!("Content-Length: {}", message.body.len())),
+            "{guest}"
+        );
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(json["token_type"], "Bearer");
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["access"], "new-access");
+        assert_eq!(commits[0]["refresh"], "new-refresh");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_token_response_drops_its_trailers() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut connection =
+            OAuthConnection::new(&[broker_config(&broker)], "auth.example.com", 443, None)
+                .await
+                .unwrap();
+        connection
+            .transform_requests(
+                form_request("/oauth/token", "refresh_token=$MSB_OAUTH_REFRESH_123").as_bytes(),
+                "auth.example.com",
+            )
+            .await
+            .unwrap();
+
+        let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","scope":"read"}"#;
+        let response = chunked_response(200, body, &["X-Body-Checksum: 5f2e", "X-Origin: edge"]);
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(response.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !guest.to_ascii_lowercase().contains("x-body-checksum"),
+            "{guest}"
+        );
+        assert!(!guest.to_ascii_lowercase().contains("x-origin"), "{guest}");
+        let message = parse_token_response(guest.as_bytes());
+        assert_eq!(message.total_len, guest.len());
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(json["scope"], "read");
+        assert_eq!(json["access_token"], "$MSB_OAUTH_ACCESS_123");
+        assert_eq!(broker.commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_chunked_token_response_fails_closed() {
+        let mut connection = connection();
+        connection.token_connection = Some(true);
+        connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
+        // The chunk announces more than a whole message is allowed to be, so
+        // it is refused on its size line rather than buffered towards it.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            MAX_OAUTH_MESSAGE_BYTES + 1
+        );
+
+        let error = connection
+            .transform_responses(response.as_bytes())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_chunked_token_error_response_is_forwarded_with_a_length() {
+        let mut connection = connection();
+        connection.token_connection = Some(true);
+        connection.exchanges.push_back(Exchange::Token {
+            grant: 0,
+            poll: false,
+        });
+        let body = r#"{"error":"invalid_grant","error_description":"expired"}"#;
+        let response = chunked_response(400, body, &[]);
+
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(response.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(guest.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{guest}");
+        assert!(
+            !guest.to_ascii_lowercase().contains("transfer-encoding"),
+            "{guest}"
+        );
+        let message = parse_token_response(guest.as_bytes());
+        assert_eq!(message.total_len, guest.len());
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(json["error"], "invalid_grant");
+        assert_eq!(json["error_description"], "expired");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_device_code_poll_grant_is_committed_and_sentineled() {
+        let broker = start_broker("old-access", "old-access");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://github.com/login/oauth/access_token".into();
+        config.device_code_endpoint = Some("https://github.com/login/device/code".into());
+        config.poll_endpoint = Some("https://github.com/login/oauth/access_token".into());
+        config.refresh_token_field = "access_token".into();
+        config.inject_hosts = vec![HostPattern::Exact("api.github.com".into())];
+        let mut connection = OAuthConnection::new(&[config], "github.com", 443, None)
+            .await
+            .unwrap();
+
+        let poll = json_request(
+            "/login/oauth/access_token",
+            r#"{"client_id":"Iv1.b507","device_code":"dc","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}"#,
+        );
+        connection
+            .transform_requests(poll.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        let granted = chunked_response(
+            200,
+            r#"{"access_token":"gho_new","token_type":"bearer","scope":"repo"}"#,
+            &[],
+        );
+        let split = granted.len() - "\r\n0\r\n\r\n".len();
+        assert!(
+            connection
+                .transform_responses(&granted.as_bytes()[..split])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a granted poll is released only once its terminator lands"
+        );
+
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(&granted.as_bytes()[split..])
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"), "{guest}");
+        assert!(!guest.contains("gho_new"), "{guest}");
+        assert!(
+            !guest.to_ascii_lowercase().contains("transfer-encoding"),
+            "{guest}"
+        );
+        let message = parse_token_response(guest.as_bytes());
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(json["token_type"], "bearer");
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["access"], "gho_new");
+    }
+
+    /// The body Cloudflare handed back on the login this was written for:
+    /// 0x2f2 bytes, padded here to the byte so the fixture is the recorded
+    /// shape rather than an approximation of it.
+    fn anthropic_token_body() -> String {
+        let body = |padding: &str| {
+            format!(
+                concat!(
+                    r#"{{"token_type":"Bearer","access_token":"sk-ant-oat01-new-access","#,
+                    r#""refresh_token":"sk-ant-ort01-new-refresh","expires_in":28800,"#,
+                    r#""scope":"user:inference user:profile","#,
+                    r#""organization":{{"uuid":"11111111-2222-3333-4444-555555555555","#,
+                    r#""name":"Example Org"}},"account":{{"#,
+                    r#""uuid":"66666666-7777-8888-9999-000000000000","#,
+                    r#""email_address":"user@example.com"}},"padding":"{}"}}"#
+                ),
+                padding
+            )
+        };
+        body(&"x".repeat(0x2f2 - body("").len()))
+    }
+
+    #[tokio::test]
+    async fn the_captured_anthropic_login_response_is_read_and_sanitized() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://platform.claude.com/v1/oauth/token".into();
+        let mut connection = OAuthConnection::new(&[config], "platform.claude.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request(
+                    "/v1/oauth/token",
+                    r#"{"grant_type":"authorization_code","code":"ac"}"#,
+                )
+                .as_bytes(),
+                "platform.claude.com",
+            )
+            .await
+            .unwrap();
+
+        let body = anthropic_token_body();
+        assert_eq!(body.len(), 0x2f2);
+        let response = format!(
+            concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Date: Thu, 27 Aug 2026 09:00:00 GMT\r\n",
+                "Content-Type: application/json\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: keep-alive\r\n",
+                "Server: cloudflare\r\n\r\n",
+                "2f2\r\n{}\r\n0\r\n\r\n"
+            ),
+            body
+        );
+
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(response.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!guest.contains("sk-ant-oat01-new-access"), "{guest}");
+        assert!(!guest.contains("sk-ant-ort01-new-refresh"), "{guest}");
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"), "{guest}");
+        assert!(guest.contains("$MSB_OAUTH_REFRESH_123"), "{guest}");
+        assert!(guest.contains("Server: cloudflare"), "{guest}");
+        assert!(
+            !guest.to_ascii_lowercase().contains("transfer-encoding"),
+            "{guest}"
+        );
+        let message = parse_token_response(guest.as_bytes());
+        assert_eq!(message.total_len, guest.len());
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(json["expires_in"], 28800);
+        assert_eq!(json["account"]["email_address"], "user@example.com");
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["access"], "sk-ant-oat01-new-access");
+        assert_eq!(commits[0]["refresh"], "sk-ant-ort01-new-refresh");
     }
 
     #[tokio::test]
@@ -3623,8 +3898,8 @@ mod tests {
         let headers = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n";
         let body = br#"{"error":"invalid_grant","access_token":"novel-access","refresh_token":"novel-refresh","error_description":"real-access and real-refresh","error_uri":"https://auth.example.com/errors/invalid-grant","retry_after":30,"nested":{"access":"real-access"}}"#;
         let output = connection.sanitize_token_error(0, headers, body).unwrap();
-        let message = parse_token_response(&output).unwrap().unwrap();
-        let json: Value = serde_json::from_slice(message.body).unwrap();
+        let message = parse_token_response(&output);
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
         assert_eq!(json["error"], "invalid_grant");
         assert_eq!(json["access_token"], "$MSB_OAUTH_ACCESS_123");
         assert_eq!(json["refresh_token"], "$MSB_OAUTH_REFRESH_123");
@@ -4109,8 +4384,8 @@ mod tests {
         assert!(!guest.contains("cv-real"));
         assert!(broker.commits().is_empty());
         assert!(connection.grants[0].lease.is_none());
-        let message = parse_token_response(guest.as_bytes()).unwrap().unwrap();
-        let json: Value = serde_json::from_slice(message.body).unwrap();
+        let message = parse_token_response(guest.as_bytes());
+        let json: Value = serde_json::from_slice(&message.body).unwrap();
         let code = json["authorization_code"].as_str().unwrap().to_string();
         let verifier = json["code_verifier"].as_str().unwrap().to_string();
         assert!(code.starts_with(POLL_SENTINEL_PREFIX));
