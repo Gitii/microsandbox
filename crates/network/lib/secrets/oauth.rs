@@ -26,15 +26,15 @@ const MAX_RESPONSE_SCRUB_FRAMING_BYTES: usize = MAX_OAUTH_MESSAGE_BYTES;
 const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// RFC 8628 poll errors that say the device flow has not produced a token.
-/// None of them is a failure of the grant the broker holds, so the response is
-/// forwarded to the guest untouched and nothing is committed.
 /// Kind, and so the prefix, of every minted poll secret sentinel. Sentinels
 /// are per-connection, so one that survives substitution belongs to a
 /// connection that is gone and must not leave the sandbox.
 const POLL_SENTINEL_KIND: &str = "POLL";
 const POLL_SENTINEL_PREFIX: &str = "$MSB_OAUTH_POLL_";
 
+/// RFC 8628 poll errors that say the device flow has not produced a token.
+/// None of them is a failure of the grant the broker holds, so the response is
+/// forwarded to the guest untouched and nothing is committed.
 const POLL_WAITING_ERRORS: [&str; 4] = [
     "authorization_pending",
     "slow_down",
