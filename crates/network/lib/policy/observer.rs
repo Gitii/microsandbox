@@ -580,7 +580,11 @@ fn protocol_label(protocol: Protocol) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
+
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata};
 
     use super::*;
     use crate::policy::{Action, NetworkPolicy};
@@ -702,8 +706,67 @@ mod tests {
         }
     }
 
+    /// A global default subscriber that records nothing.
+    ///
+    /// `tracing` caches one interest value per callsite for the whole
+    /// process, and computes it — when a single dispatcher is registered —
+    /// from the default subscriber of whichever thread happens to reach the
+    /// callsite first. The capture tests below install their subscriber with
+    /// `with_default`, which is thread-local, so a *parallel* test that drops
+    /// a `LoggingPolicyObserver` holding a tally reaches the `warn!` inside
+    /// `flush_pending` with no subscriber at all, and that callsite is cached
+    /// as `Interest::never()` for every thread, permanently. The capture test
+    /// then sees its opening denial and no flush line, however it sets its own
+    /// subscriber up.
+    ///
+    /// Registering a global default that is `sometimes` interested in
+    /// everything keeps the decision dynamic: no callsite is ever cached off,
+    /// and each event is routed to whatever subscriber the emitting thread
+    /// actually has — the capture buffer here, and nothing anywhere else.
+    struct DynamicInterest;
+
+    impl tracing::Subscriber for DynamicInterest {
+        fn register_callsite(&self, _: &Metadata<'_>) -> Interest {
+            Interest::sometimes()
+        }
+
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {}
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// Install [`DynamicInterest`], once, before capturing log output.
+    ///
+    /// Installing it also re-evaluates the interest cache, so a callsite a
+    /// parallel test already cached off is repaired here, and cannot be cached
+    /// off again while this dispatcher is registered.
+    fn keep_callsites_dynamic() {
+        static INSTALLED: Once = Once::new();
+
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(DynamicInterest)
+                .expect("no other global default subscriber may be installed in this binary");
+        });
+    }
+
     /// Capture the JSON the logging observer writes for one denial.
     fn logged_denial(denial: &PolicyDenial) -> serde_json::Value {
+        keep_callsites_dynamic();
+
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -721,6 +784,8 @@ mod tests {
 
     /// Capture the default text layer's rendering of one denial.
     fn logged_denial_text(denial: &PolicyDenial) -> String {
+        keep_callsites_dynamic();
+
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -952,6 +1017,8 @@ mod tests {
             );
         }
 
+        keep_callsites_dynamic();
+
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -970,6 +1037,8 @@ mod tests {
 
     #[test]
     fn a_flush_keeps_the_opening_denial_identity() {
+        keep_callsites_dynamic();
+
         let observer = LoggingPolicyObserver::default();
         let denial = tcp_denial(443).with_hostname(Some("api.example.com".into()));
         let buffer = Buffer::default();
