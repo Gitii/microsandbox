@@ -115,6 +115,13 @@ struct Scrubbed {
     complete: bool,
 }
 
+/// Which of a grant's two tokens a sentinel stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SentinelKind {
+    Access,
+    Refresh,
+}
+
 /// A request whose response is still outstanding on a token connection.
 enum Exchange {
     /// Forwarded unchanged; the response carries no grant material.
@@ -252,6 +259,7 @@ impl OAuthConnection {
         identity: Option<(IpAddr, &SharedState)>,
     ) -> io::Result<Self> {
         let mut grants = Vec::new();
+        let mut reported = Vec::new();
         let mut seen_tokens = Vec::new();
         for config in configs {
             let token = parse_https_endpoint(&config.token_endpoint)?;
@@ -310,17 +318,15 @@ impl OAuthConnection {
                 lease: None,
                 poll_secrets: Vec::new(),
             };
-            // The guest may already hold a sentinel minted after this sandbox
-            // was configured, so the broker's answer wins over the config.
             grants.push(grant);
-            let index = grants.len() - 1;
-            adopt_sentinels(
-                &mut grants,
-                index,
-                loaded.access_sentinel,
-                loaded.refresh_sentinel,
-                &seen_tokens,
-            )?;
+            reported.push((loaded.access_sentinel, loaded.refresh_sentinel));
+        }
+        // The guest may already hold a sentinel minted after this sandbox was
+        // configured, so the broker's answer wins over the config. Adoption
+        // waits for every grant to be loaded: a sentinel is checked against
+        // the whole connection, and half a connection is not the whole of it.
+        for (index, (access, refresh)) in reported.into_iter().enumerate() {
+            adopt_sentinels(&mut grants, index, access, refresh, &seen_tokens)?;
         }
         Ok(Self {
             token_connection: None,
@@ -1203,14 +1209,12 @@ impl OAuthConnection {
 impl LoadedGrant {
     /// Every access-token sentinel live for this grant, current one first.
     fn access_sentinels(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.access_sentinel.as_str())
-            .chain(self.access_aliases.iter().map(String::as_str))
+        self.sentinels_of(SentinelKind::Access)
     }
 
     /// Every refresh-token sentinel live for this grant, current one first.
     fn refresh_sentinels(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.refresh_sentinel.as_str())
-            .chain(self.refresh_aliases.iter().map(String::as_str))
+        self.sentinels_of(SentinelKind::Refresh)
     }
 
     /// Every sentinel live for this grant, of either kind.
@@ -1218,25 +1222,40 @@ impl LoadedGrant {
         self.access_sentinels().chain(self.refresh_sentinels())
     }
 
+    /// Every sentinel live for one of this grant's tokens, current one first.
+    fn sentinels_of(&self, kind: SentinelKind) -> impl Iterator<Item = &str> {
+        let (current, aliases) = match kind {
+            SentinelKind::Access => (&self.access_sentinel, &self.access_aliases),
+            SentinelKind::Refresh => (&self.refresh_sentinel, &self.refresh_aliases),
+        };
+        std::iter::once(current.as_str()).chain(aliases.iter().map(String::as_str))
+    }
+
+    /// Whether adopting `sentinel` would grow this kind's alias set past its
+    /// bound. Checked for both kinds before either is adopted, so a rejected
+    /// pair leaves the grant as it was.
+    fn exceeds_alias_limit(&self, kind: SentinelKind, sentinel: &str) -> bool {
+        let (current, aliases) = match kind {
+            SentinelKind::Access => (&self.access_sentinel, &self.access_aliases),
+            SentinelKind::Refresh => (&self.refresh_sentinel, &self.refresh_aliases),
+        };
+        current != sentinel
+            && !aliases.iter().any(|alias| alias == sentinel)
+            && aliases.len() >= MAX_GRANT_SENTINEL_ALIASES
+    }
+
     /// Make `sentinel` the current one of a kind, keeping the one it replaces
-    /// live as an alias.
-    fn supersede(
-        current: &mut String,
-        aliases: &mut Vec<String>,
-        sentinel: String,
-    ) -> io::Result<()> {
+    /// live as an alias. The caller has already checked the alias bound.
+    fn supersede(&mut self, kind: SentinelKind, sentinel: String) {
+        let (current, aliases) = match kind {
+            SentinelKind::Access => (&mut self.access_sentinel, &mut self.access_aliases),
+            SentinelKind::Refresh => (&mut self.refresh_sentinel, &mut self.refresh_aliases),
+        };
         if *current == sentinel {
-            return Ok(());
+            return;
         }
         aliases.retain(|alias| *alias != sentinel);
-        if aliases.len() >= MAX_GRANT_SENTINEL_ALIASES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "too many OAuth sentinels for one grant",
-            ));
-        }
         aliases.push(std::mem::replace(current, sentinel));
-        Ok(())
     }
 }
 
@@ -1285,6 +1304,9 @@ fn longest_token_prefix_suffix(data: &[u8], tokens: &[Zeroizing<String>]) -> usi
 /// that mints opaque sentinels once, at configuration time, always sends. What
 /// is replaced is not discarded: the previous sentinel stays live as an alias,
 /// so a guest holding it substitutes rather than leaking it upstream.
+///
+/// Either both sentinels are adopted or neither is: everything that can
+/// refuse the pair runs before anything is written.
 fn adopt_sentinels(
     grants: &mut [LoadedGrant],
     index: usize,
@@ -1293,44 +1315,40 @@ fn adopt_sentinels(
     seen: &[Zeroizing<String>],
 ) -> io::Result<()> {
     let access = access
-        .map(|access| validate_sentinel(access, grants, index, seen))
+        .map(|access| validate_sentinel(access, grants, index, SentinelKind::Access, seen))
         .transpose()?;
     let refresh = refresh
-        .map(|refresh| validate_sentinel(refresh, grants, index, seen))
+        .map(|refresh| validate_sentinel(refresh, grants, index, SentinelKind::Refresh, seen))
         .transpose()?;
-    let grant = &grants[index];
-    let next_access = access.as_deref().unwrap_or(&grant.access_sentinel);
-    let next_refresh = refresh.as_deref().unwrap_or(&grant.refresh_sentinel);
-    // One sentinel standing for both tokens would substitute as whichever the
-    // proxy tried first, so the pair has to stay distinguishable, aliases
-    // included.
-    let ambiguous = next_access == next_refresh
-        || access
-            .as_deref()
-            .is_some_and(|access| grant.refresh_sentinels().any(|held| held == access))
-        || refresh
-            .as_deref()
-            .is_some_and(|refresh| grant.access_sentinels().any(|held| held == refresh));
-    if ambiguous {
+    // Neither is live yet, so this pair is the one case the scan in
+    // `validate_sentinel` cannot see.
+    if let (Some(access), Some(refresh)) = (&access, &refresh)
+        && overlaps(access, refresh)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "OAuth broker sentinels must differ",
         ));
     }
+    let grant = &grants[index];
+    let exceeded = access
+        .as_deref()
+        .is_some_and(|access| grant.exceeds_alias_limit(SentinelKind::Access, access))
+        || refresh
+            .as_deref()
+            .is_some_and(|refresh| grant.exceeds_alias_limit(SentinelKind::Refresh, refresh));
+    if exceeded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "too many OAuth sentinels for one grant",
+        ));
+    }
     let grant = &mut grants[index];
     if let Some(access) = access {
-        LoadedGrant::supersede(
-            &mut grant.access_sentinel,
-            &mut grant.access_aliases,
-            access,
-        )?;
+        grant.supersede(SentinelKind::Access, access);
     }
     if let Some(refresh) = refresh {
-        LoadedGrant::supersede(
-            &mut grant.refresh_sentinel,
-            &mut grant.refresh_aliases,
-            refresh,
-        )?;
+        grant.supersede(SentinelKind::Refresh, refresh);
     }
     Ok(())
 }
@@ -1339,15 +1357,23 @@ fn adopt_sentinels(
 ///
 /// A sentinel may be JWT-shaped — the real token's header and payload copied
 /// verbatim with only the signature replaced — so it carries base64url bytes
-/// (`.`, `-`, `_` included) and runs to at most
-/// [`MAX_OAUTH_SENTINEL_BYTES`] bytes. It is matched and replaced byte for
-/// byte, so only bytes that could not survive an HTTP message are rejected,
-/// along with any value this connection has seen as a real token or holds for
-/// another grant.
+/// (`.`, `-`, `_` included) and runs to at most [`MAX_OAUTH_SENTINEL_BYTES`]
+/// bytes. It is matched and replaced byte for byte, so the bytes themselves
+/// are only rejected when they could not survive an HTTP message.
+///
+/// What it may not do is overlap something else the connection substitutes.
+/// Sharing bytes with a real token would write that token into the one body
+/// that is never scrubbed, and sharing them with another live sentinel — of
+/// this grant or any other — makes substitution depend on which the proxy
+/// reaches first, which can leave the other half-replaced or send it upstream
+/// under the wrong grant. Only the identical value already held for this same
+/// token is allowed through, which is what re-naming a current sentinel or
+/// promoting one of its aliases looks like.
 fn validate_sentinel(
     sentinel: String,
     grants: &[LoadedGrant],
     index: usize,
+    kind: SentinelKind,
     seen: &[Zeroizing<String>],
 ) -> io::Result<String> {
     if sentinel.is_empty() {
@@ -1368,28 +1394,43 @@ fn validate_sentinel(
             "OAuth broker sentinel contains a control character",
         ));
     }
-    // A sentinel that is one of the real tokens would be written into the
-    // guest's response body as itself, and the body the token response takes
-    // is the one path that is not scrubbed afterwards.
-    if seen.iter().any(|token| token.as_str() == sentinel) {
+    if seen.iter().any(|token| overlaps(&sentinel, token)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "OAuth broker sentinel is a live token",
+            "OAuth broker sentinel overlaps a live token",
         ));
     }
-    // Two grants sharing a sentinel would each substitute it with their own
-    // token, so the first grant in the list would decide whose secret leaves.
-    let taken = grants
-        .iter()
-        .enumerate()
-        .any(|(other, grant)| other != index && grant.sentinels().any(|held| held == sentinel));
-    if taken {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OAuth broker sentinel belongs to another grant",
-        ));
+    for (other, grant) in grants.iter().enumerate() {
+        let same_grant = other == index;
+        // The same value already held for this same token is the one repeat
+        // that means nothing new, rather than an overlap.
+        let repeat = same_grant && grant.sentinels_of(kind).any(|held| held == sentinel);
+        let clash = grant
+            .sentinels()
+            .any(|held| !(repeat && held == sentinel) && overlaps(&sentinel, held));
+        if clash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                if same_grant {
+                    "OAuth broker sentinels must differ"
+                } else {
+                    "OAuth broker sentinel belongs to another grant"
+                },
+            ));
+        }
     }
     Ok(sentinel)
+}
+
+/// Whether either of two values occurs inside the other.
+///
+/// Substitution walks one sentinel at a time, so an overlapping pair is not
+/// merely ambiguous: replacing the longer one first leaves nothing of the
+/// shorter, and replacing the shorter one first leaves the rest of the longer
+/// wrapped around a real token.
+fn overlaps(left: &str, right: &str) -> bool {
+    contains_bytes(left.as_bytes(), right.as_bytes())
+        || contains_bytes(right.as_bytes(), left.as_bytes())
 }
 
 /// Fill omitted sentinels with independent random per-sandbox values.
@@ -1622,31 +1663,35 @@ fn replace_same_length(data: &[u8], token: &[u8]) -> Vec<u8> {
 ///
 /// The header name and scheme are matched case-insensitively, as HTTP defines
 /// them, but the sentinel itself is matched byte for byte: a JWT-shaped
-/// sentinel is base64url, where case is significant.
+/// sentinel is base64url, where case is significant. Every `Authorization`
+/// header carrying the sentinel is replaced, not just the first.
 fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> {
     const MARKER: &[u8] = b"authorization: bearer ";
     if sentinel.is_empty() || data.len() < MARKER.len() {
         return data.to_vec();
     }
     let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    let mut searched = 0;
-    while let Some(offset) = lower[searched..]
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)
-    {
-        let value_start = searched + offset + MARKER.len();
-        let value_end = value_start + sentinel.len();
-        if data.len() >= value_end && &data[value_start..value_end] == sentinel {
-            let mut output = data.to_vec();
-            output.splice(value_start..value_end, token.iter().copied());
-            return output;
-        }
-        searched = value_start;
-        if searched + MARKER.len() > lower.len() {
+    let mut output = Vec::with_capacity(data.len());
+    let mut cursor = 0;
+    while cursor + MARKER.len() <= data.len() {
+        let Some(offset) = lower[cursor..]
+            .windows(MARKER.len())
+            .position(|window| window == MARKER)
+        else {
             break;
+        };
+        let value_start = cursor + offset + MARKER.len();
+        let value_end = value_start + sentinel.len();
+        output.extend_from_slice(&data[cursor..value_start]);
+        if data.len() >= value_end && &data[value_start..value_end] == sentinel {
+            output.extend_from_slice(token);
+            cursor = value_end;
+        } else {
+            cursor = value_start;
         }
     }
-    data.to_vec()
+    output.extend_from_slice(&data[cursor..]);
+    output
 }
 
 fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<ResponseScrubState> {
@@ -3845,10 +3890,17 @@ mod tests {
         let response = response.as_bytes();
         let mut connection = connection();
 
-        // Split inside the real token and again inside the sentinel, so the
-        // scrubber has to carry a partial match across both writes.
-        let first = response.iter().position(|byte| *byte == b'a').unwrap() + 40;
+        // Split inside the real token, and again inside the sentinel, so the
+        // scrubber has to carry a partial match of the token across a write
+        // and leave a partial match of the sentinel alone across another.
+        let token_at = response
+            .windows(b"real-access".len())
+            .position(|window| window == b"real-access")
+            .unwrap();
+        let first = token_at + 5;
         let second = response.len() - 12;
+        assert!(first > token_at && first < token_at + b"real-access".len());
+        assert!(second > response.len() - JWT_ACCESS_SENTINEL.len());
         let mut output = connection.scrub_response_chunk(&response[..first]).unwrap();
         output.extend(
             connection
@@ -3905,13 +3957,39 @@ mod tests {
         }
 
         // A sentinel that is one of the real tokens would hand that token to
-        // the guest as its own stand-in.
+        // the guest as its own stand-in — and so would one that merely
+        // carries a token inside it, since the body it goes into is the one
+        // that is never scrubbed.
         let error = adopt(&mut grants, Some("real-access"), None).unwrap_err();
-        assert_eq!(error.to_string(), "OAuth broker sentinel is a live token");
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel overlaps a live token"
+        );
+
+        let error = adopt(&mut grants, Some("Bearer real-access."), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel overlaps a live token"
+        );
+
+        // The other direction too: a sentinel a token contains would be
+        // half-substituted wherever that token appears.
+        let error = adopt(&mut grants, Some("real-acc"), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel overlaps a live token"
+        );
 
         // A sentinel another grant on this connection holds would substitute
-        // that grant's token instead.
+        // that grant's token instead, and one that contains another grant's
+        // sentinel would swallow it.
         let error = adopt(&mut grants, Some("$OTHER_REFRESH"), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel belongs to another grant"
+        );
+
+        let error = adopt(&mut grants, Some("$OTHER_ACCESS_AND_MORE"), None).unwrap_err();
         assert_eq!(
             error.to_string(),
             "OAuth broker sentinel belongs to another grant"
@@ -3930,9 +4008,22 @@ mod tests {
         assert_eq!(grants[0].refresh_sentinel, "$MSB_OAUTH_REFRESH_123");
 
         // A sentinel this grant already holds as an alias may not be adopted
-        // for the other token either.
+        // for the other token either, nor may one that overlaps it.
         let error = adopt(&mut grants, None, Some("$MSB_OAUTH_ACCESS_123")).unwrap_err();
         assert_eq!(error.to_string(), "OAuth broker sentinels must differ");
+
+        let error = adopt(&mut grants, None, Some("$MSB_OAUTH_ACCESS_123_TOO")).unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinels must differ");
+
+        // A substring of the sentinel this grant just adopted is no better:
+        // substituting one would leave the rest of the other behind.
+        let error = adopt(&mut grants, None, Some(&JWT_ACCESS_SENTINEL[..20])).unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinels must differ");
+
+        // Re-naming the sentinel it already holds is not a collision with
+        // itself.
+        adopt(&mut grants, Some(JWT_ACCESS_SENTINEL), None).unwrap();
+        assert_eq!(grants[0].access_aliases, ["$MSB_OAUTH_ACCESS_123"]);
     }
 
     #[test]
@@ -3944,7 +4035,7 @@ mod tests {
             adopt_sentinels(
                 &mut grants,
                 0,
-                Some(format!("$ACCESS_{round}")),
+                Some(format!("$ACCESS_{round:03}")),
                 None,
                 &seen,
             )
@@ -3958,8 +4049,39 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "too many OAuth sentinels for one grant");
         // Re-naming one the grant already holds is not a new sentinel.
-        adopt_sentinels(&mut grants, 0, Some("$ACCESS_0".into()), None, &seen).unwrap();
-        assert_eq!(grants[0].access_sentinel, "$ACCESS_0");
+        adopt_sentinels(&mut grants, 0, Some("$ACCESS_000".into()), None, &seen).unwrap();
+        assert_eq!(grants[0].access_sentinel, "$ACCESS_000");
+    }
+
+    #[test]
+    fn a_pair_that_cannot_be_adopted_leaves_the_grant_untouched() {
+        let mut grants = vec![loaded(config())];
+        let seen: Vec<Zeroizing<String>> = vec![];
+        for round in 0..MAX_GRANT_SENTINEL_ALIASES {
+            adopt_sentinels(
+                &mut grants,
+                0,
+                None,
+                Some(format!("$REFRESH_{round:03}")),
+                &seen,
+            )
+            .unwrap();
+        }
+
+        // The access half is adoptable, the refresh half is one too many.
+        let error = adopt_sentinels(
+            &mut grants,
+            0,
+            Some("$NEW_ACCESS".into()),
+            Some("$REFRESH_OVER".into()),
+            &seen,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "too many OAuth sentinels for one grant");
+        assert_eq!(grants[0].access_sentinel, "$MSB_OAUTH_ACCESS_123");
+        assert!(grants[0].access_aliases.is_empty());
+        assert_eq!(grants[0].refresh_sentinel, "$REFRESH_063");
     }
 
     #[tokio::test]
@@ -4024,6 +4146,77 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "OAuth broker sentinel is a live token");
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel overlaps a live token"
+        );
+    }
+
+    #[test]
+    fn every_bearer_header_carrying_the_sentinel_is_replaced() {
+        // One request, three Authorization headers: a client retrying with a
+        // second one, and a third holding something else entirely.
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\nAuthorization: Bearer someone-elses\r\n\r\n"
+        );
+
+        let output = replace_bearer_header(
+            request.as_bytes(),
+            JWT_ACCESS_SENTINEL.as_bytes(),
+            b"real-access",
+        );
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("Bearer real-access").count(), 2);
+        assert!(output.contains("Bearer someone-elses"));
+        assert!(!output.contains("eyJ"));
+    }
+
+    #[tokio::test]
+    async fn a_grant_may_not_take_a_sentinel_another_grant_was_configured_with() {
+        let first_broker = start_broker("first-access", "first-refresh");
+        let second_broker = start_broker("second-access", "second-refresh");
+        let first = broker_config(&first_broker);
+        let mut second = broker_config(&second_broker);
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        // The first grant's broker names the sentinel the second grant's
+        // guest already holds in its environment.
+        first_broker.set_sentinels("$OTHER_ACCESS", JWT_REFRESH_SENTINEL);
+
+        let Err(error) = OAuthConnection::new(&[first, second], "api.example.com", 443, None).await
+        else {
+            panic!("the connection must not open with a colliding sentinel");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel belongs to another grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_may_not_take_a_sentinel_that_is_another_grants_token() {
+        let first_broker = start_broker("first-access", "first-refresh");
+        let second_broker = start_broker("second-access", "second-refresh");
+        let first = broker_config(&first_broker);
+        let mut second = broker_config(&second_broker);
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        // The second grant is loaded after the first, so only a check that
+        // waits for the whole connection sees this.
+        first_broker.set_sentinels("second-access", JWT_REFRESH_SENTINEL);
+
+        let Err(error) = OAuthConnection::new(&[first, second], "api.example.com", 443, None).await
+        else {
+            panic!("the connection must not open with a colliding sentinel");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth broker sentinel overlaps a live token"
+        );
     }
 }
