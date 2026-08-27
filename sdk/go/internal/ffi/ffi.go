@@ -1743,6 +1743,7 @@ type OAuthMintEndpointOptions struct {
 	Host  string `json:"host"`
 	Path  string `json:"path"`
 	Field string `json:"field"`
+	Port  uint16 `json:"port,omitempty"`
 }
 
 // PatchOptions is the JSON representation of a single rootfs patch.

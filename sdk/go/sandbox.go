@@ -193,6 +193,7 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 				Host:  mint.Host,
 				Path:  mint.Path,
 				Field: mint.Field,
+				Port:  mint.Port,
 			})
 		}
 		ffiOpts.OAuthSecrets = append(ffiOpts.OAuthSecrets, ffi.OAuthSecretOptions{

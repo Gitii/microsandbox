@@ -1318,10 +1318,13 @@ type OAuthSecretConfig struct {
 type OAuthMintEndpoint struct {
 	// Host is the bare hostname the request is addressed to.
 	Host string
-	// Path is the exact request target, including any query string.
+	// Path is the exact request path, with no query string of its own: a
+	// request is matched on its path, whatever query the sandbox appends.
 	Path string
 	// Field is the top-level JSON response field carrying the new secret.
 	Field string
+	// Port is the TCP port the endpoint is reached on. Zero means 443.
+	Port uint16
 }
 
 // secretFactory is the factory namespace matching Node's `Secret.env(...)` and

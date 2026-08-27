@@ -941,6 +941,8 @@ struct MintEndpointOpts {
     host: String,
     path: String,
     field: String,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1756,6 +1758,7 @@ fn apply_oauth_secret(
                 host: mint.host,
                 path: mint.path,
                 field: mint.field,
+                port: mint.port,
             })
             .collect(),
         inject_hosts: oauth

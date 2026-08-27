@@ -101,6 +101,15 @@ export type MintEndpoint = {
    */
   path: string;
   /**
+   * TCP port the endpoint is reached on. `None` is 443.
+   *
+   * The other endpoints carry their port in their URL and match on it;
+   * this one is a host and a path, so it says its port here. A grant whose
+   * inject host is served on another port names that port, or its mint
+   * endpoint quietly never matches.
+   */
+  port?: number | null;
+  /**
    * Top-level JSON field of the response that carries the minted secret.
    */
   field: string;

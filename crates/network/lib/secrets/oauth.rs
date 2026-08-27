@@ -29,6 +29,8 @@ const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 /// new sentinels is not a session any client runs.
 const MAX_GRANT_SENTINEL_ALIASES: usize = 64;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Port a configured endpoint is on when it does not say otherwise.
+const DEFAULT_HTTPS_PORT: u16 = 443;
 /// How many secrets one grant may hold minted at once. A session mints an API
 /// key, not a stream of them, and every one of them is another pass over every
 /// request; past this the connection fails closed.
@@ -792,18 +794,22 @@ impl OAuthConnection {
                         .nth(1)
                         .ok_or_else(invalid_http)?;
                     let port = self.connection_port;
-                    // A target that is only another spelling of a protected
-                    // endpoint's path is refused outright. Matching it would
-                    // guess that the upstream host normalises the same way we
-                    // do; not matching it would hand whatever that endpoint
-                    // answers straight to the guest.
-                    if let Some(kind) = self.equivalent_endpoint(sni, target) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "OAuth {kind} endpoint request target is not the configured path"
-                            ),
-                        ));
+                    // Where a protected endpoint lives on this connection,
+                    // every target on it has to be one this proxy can compare
+                    // with confidence. Anything else is refused rather than
+                    // decoded: the spellings of one path are not a list that
+                    // ends, and each one we do not recognise is a request
+                    // whose response would reach the guest unread.
+                    if self.has_protected_endpoint(sni) {
+                        reject_unnormalized_target(target)?;
+                        if let Some(kind) = self.equivalent_endpoint(sni, target) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "OAuth {kind} endpoint request target is not the configured path"
+                                ),
+                            ));
+                        }
                     }
                     // A grant matches at most once even when its poll endpoint
                     // is its token endpoint, which is what a device flow with a
@@ -1338,11 +1344,21 @@ impl OAuthConnection {
 
     /// Turn the secret a mint endpoint handed back into a sentinel.
     ///
-    /// Only a 2xx JSON body whose named field is a top-level string is a
-    /// minted secret; any other response is one the endpoint happens to share
-    /// and is scrubbed like any other. A broker that will not store the value
-    /// fails the connection rather than the response being forwarded: a secret
-    /// the broker never saw is one nothing can substitute back or revoke.
+    /// A 2xx JSON body is the shape this endpoint was configured for, so it
+    /// has to carry the named field as a top-level string; one that does not
+    /// fails the connection. The alternative is forwarding a body nothing
+    /// understood from an endpoint known to hand out credentials — and the
+    /// credential-shaped-response detector, which would otherwise be the net
+    /// under that, does not run here: a grant is relevant to this connection,
+    /// which is exactly what switches the detector off.
+    ///
+    /// A non-2xx response is an error, and a 2xx that is not JSON at all is
+    /// not this endpoint answering the call it was configured for. Both are
+    /// scrubbed and forwarded like any other response.
+    ///
+    /// A broker that will not store the value fails the connection too: a
+    /// secret the broker never saw is one nothing can substitute back or
+    /// revoke.
     async fn finish_mint(
         &mut self,
         mint: PendingMint,
@@ -1355,11 +1371,18 @@ impl OAuthConnection {
             Ok(json) if (200..300).contains(&status) => json,
             _ => return Ok(self.scrub_tokens(response)),
         };
-        let Some(object) = json.as_object_mut() else {
-            return Ok(self.scrub_tokens(response));
+        let missing = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "OAuth mint endpoint response did not carry field {}",
+                    mint.field
+                ),
+            )
         };
+        let object = json.as_object_mut().ok_or_else(missing)?;
         let Some(Value::String(value)) = object.get(&mint.field) else {
-            return Ok(self.scrub_tokens(response));
+            return Err(missing());
         };
         let value = value.clone();
         let sentinel = broker_mint(&self.grants[mint.grant].config, &mint.field, &value).await?;
@@ -1496,6 +1519,29 @@ impl OAuthConnection {
         Ok(response)
     }
 
+    /// Whether a grant on this connection has an endpoint of its own here,
+    /// rather than only an inject host.
+    ///
+    /// It is the endpoints that are compared with a request target, so it is
+    /// their presence that makes the target's spelling matter. An inject-host
+    /// connection carries ordinary API traffic whose targets are the client's
+    /// business.
+    fn has_protected_endpoint(&self, sni: &str) -> bool {
+        let port = self.connection_port;
+        let here =
+            |endpoint: &Endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(sni);
+        self.grants.iter().any(|grant| {
+            here(&grant.token)
+                || grant.device_code.as_ref().is_some_and(&here)
+                || grant.poll.as_ref().is_some_and(&here)
+                || grant
+                    .config
+                    .mint_endpoints
+                    .iter()
+                    .any(|endpoint| mint_endpoint_here(endpoint, sni, port))
+        })
+    }
+
     /// The kind of protected endpoint this target is only a near-miss for.
     ///
     /// Scanned across every grant on the connection, because any of them
@@ -1516,7 +1562,7 @@ impl OAuthConnection {
                 }
             }
             let mint = grant.config.mint_endpoints.iter().any(|endpoint| {
-                mint_endpoint_matches(endpoint, sni, target) == PathMatch::Equivalent
+                mint_endpoint_matches(endpoint, sni, port, target) == PathMatch::Equivalent
             });
             if mint {
                 return Some("mint");
@@ -1532,7 +1578,10 @@ impl OAuthConnection {
                 .config
                 .mint_endpoints
                 .iter()
-                .find(|endpoint| mint_endpoint_matches(endpoint, sni, target) == PathMatch::Exact)
+                .find(|endpoint| {
+                    mint_endpoint_matches(endpoint, sni, self.connection_port, target)
+                        == PathMatch::Exact
+                })
                 .map(|endpoint| PendingMint {
                     grant,
                     field: endpoint.field.clone(),
@@ -2100,7 +2149,7 @@ fn parse_https_endpoint(endpoint: &str) -> io::Result<Endpoint> {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid OAuth endpoint port")
             })?,
         ),
-        None => (authority, 443),
+        None => (authority, DEFAULT_HTTPS_PORT),
     };
     if host.is_empty() || authority.contains('@') {
         return Err(io::Error::new(
@@ -2457,11 +2506,57 @@ fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
 /// Whether a request line reached exactly this mint endpoint. The endpoint
 /// names a host and a target rather than a URL, because that is what a request
 /// on an intercepted connection carries: the TLS SNI and the request target.
-fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, target: &str) -> PathMatch {
-    if !endpoint.host.eq_ignore_ascii_case(sni) {
+fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, port: u16, target: &str) -> PathMatch {
+    if !mint_endpoint_here(endpoint, sni, port) {
         return PathMatch::None;
     }
     match_endpoint_path(&endpoint.path, target)
+}
+
+/// Whether a mint endpoint is served by the host and port of this connection.
+///
+/// A mint endpoint names a host and a path rather than a URL, so its port is
+/// its own optional field, defaulting to the HTTPS port the rest of the
+/// configuration's URLs default to.
+fn mint_endpoint_here(endpoint: &MintEndpoint, sni: &str, port: u16) -> bool {
+    endpoint.port.unwrap_or(DEFAULT_HTTPS_PORT) == port && endpoint.host.eq_ignore_ascii_case(sni)
+}
+
+/// Refuse a request target this proxy would have to normalise to compare.
+///
+/// The comparison against a configured path is a byte comparison, and the
+/// number of ways to spell one path — percent-encoding, dot segments, doubled
+/// slashes, an absolute-form target, a stray parameter — is not a list that
+/// can be completed. So the target is held to the already-normalised
+/// origin form instead: a path that is what it looks like. Everything else is
+/// refused on a connection carrying a protected endpoint, where guessing
+/// wrong in either direction ends with a credential in the sandbox.
+///
+/// Only the path is judged. A query string may hold anything a client wants
+/// to put in it, because nothing here is compared with it.
+fn reject_unnormalized_target(target: &str) -> io::Result<()> {
+    let refuse = || {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth request target is not an already-normalised origin-form path",
+        ))
+    };
+    let path = target.split('?').next().unwrap_or(target);
+    // An absolute-form (`https://host/path`) or authority-form target does not
+    // start with a slash, and neither does the asterisk-form of OPTIONS.
+    if !path.starts_with('/') {
+        return refuse();
+    }
+    if path.contains('%') || path.contains("//") || path.contains(';') || path.contains('#') {
+        return refuse();
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return refuse();
+    }
+    Ok(())
 }
 
 /// Compare a request target with a configured endpoint path.
@@ -2471,61 +2566,30 @@ fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, target: &str) -> Pa
 /// treating it as somewhere else is how a guest would have a token or a minted
 /// key forwarded to it unread.
 ///
-/// What is left is compared byte for byte. A target that only matches once
-/// both are normalised — `//api/keys`, `/api%2Fkeys` — is reported as
-/// [`PathMatch::Equivalent`] rather than quietly accepted or quietly ignored,
+/// What is left is compared byte for byte, on a target
+/// [`reject_unnormalized_target`] has already held to the origin form. The one
+/// difference that survives that is a trailing slash, which is a different
+/// path by the letter of RFC 3986 and the same handler in most routers, so it
+/// is reported as [`PathMatch::Equivalent`]: neither accepted nor ignored,
 /// because which of the two the upstream host agrees with is not ours to
-/// guess: it may route it to the protected handler, and a guess either way is
-/// a guess about where a credential ends up.
+/// guess when a credential rides on the answer.
 fn match_endpoint_path(path: &str, target: &str) -> PathMatch {
     let target_path = target.split('?').next().unwrap_or(target);
     if target_path == path {
         return PathMatch::Exact;
     }
-    if normalized_path(target_path) == normalized_path(path) {
+    if without_trailing_slash(target_path) == without_trailing_slash(path) {
         return PathMatch::Equivalent;
     }
     PathMatch::None
 }
 
-/// One path's spellings collapsed: percent-decoded, runs of slashes reduced to
-/// one, and any trailing slash removed.
-fn normalized_path(path: &str) -> String {
-    let decoded = percent_decoded(path);
-    let mut output = String::with_capacity(decoded.len());
-    let mut after_slash = false;
-    for character in decoded.chars() {
-        if character == '/' && after_slash {
-            continue;
-        }
-        after_slash = character == '/';
-        output.push(character);
+/// A path without the trailing slash it may or may not carry.
+fn without_trailing_slash(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some("") | None => path,
+        Some(trimmed) => trimmed,
     }
-    while output.len() > 1 && output.ends_with('/') {
-        output.pop();
-    }
-    output
-}
-
-/// Percent-decode a path, leaving anything that is not a `%XX` escape alone.
-fn percent_decoded(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%'
-            && cursor + 2 < bytes.len()
-            && let Some(high) = char::from(bytes[cursor + 1]).to_digit(16)
-            && let Some(low) = char::from(bytes[cursor + 2]).to_digit(16)
-        {
-            output.push((high * 16 + low) as u8);
-            cursor += 3;
-            continue;
-        }
-        output.push(bytes[cursor]);
-        cursor += 1;
-    }
-    String::from_utf8_lossy(&output).into_owned()
 }
 
 fn expects_100_continue(headers: &[u8]) -> io::Result<bool> {
@@ -5000,6 +5064,7 @@ mod tests {
             host: "api.anthropic.com".into(),
             path: "/api/oauth/claude_cli/create_api_key".into(),
             field: "raw_key".into(),
+            port: None,
         }];
         config
     }
@@ -5177,33 +5242,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_near_miss_token_target_fails_closed() {
-        for target in [
-            "//oauth/token",
-            "/oauth%2Ftoken",
-            "/oauth/token/",
-            "//oauth/token?retry=1",
-        ] {
-            let request = format!(
-                "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
-            );
-            let mut connection = connection();
-
-            let error = connection
-                .transform_requests(request.as_bytes(), "auth.example.com")
-                .await
-                .unwrap_err();
-
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(
-                error.to_string(),
-                "OAuth token endpoint request target is not the configured path",
-                "target {target}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn a_mint_target_carrying_a_query_still_mints() {
         let broker = start_broker("real-access", "real-refresh");
         let config = anthropic_config(&broker);
@@ -5225,35 +5263,6 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains(RAW_KEY), "{output}");
         assert!(output.contains("$MSB_OAUTH_MINT_00"), "{output}");
-    }
-
-    #[tokio::test]
-    async fn a_near_miss_mint_target_fails_closed() {
-        for target in [
-            "//api/oauth/claude_cli/create_api_key",
-            "/api%2Foauth/claude_cli/create_api_key",
-            "/api/oauth/claude_cli/create_api_key/",
-        ] {
-            let broker = start_broker("real-access", "real-refresh");
-            let config = anthropic_config(&broker);
-            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
-                .await
-                .unwrap();
-            let request = json_request(target, "{}");
-
-            let error = connection
-                .transform_requests(request.as_bytes(), "api.anthropic.com")
-                .await
-                .unwrap_err();
-
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(
-                error.to_string(),
-                "OAuth mint endpoint request target is not the configured path",
-                "target {target}"
-            );
-            assert!(broker.mints().is_empty());
-        }
     }
 
     #[tokio::test]
@@ -5372,43 +5381,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mint_endpoint_response_that_carries_no_secret_is_forwarded_as_it_is() {
-        let broker = start_broker("real-access", "real-refresh");
-        let config = anthropic_config(&broker);
-        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
-            .await
-            .unwrap();
-
-        let responses = [
-            json_response(400, r#"{"error":"invalid_scope"}"#),
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 8\r\n\r\nnot json"
-                .to_string(),
-            json_response(200, r#"{"ok":true}"#),
-            json_response(200, r#"{"raw_key":{"nested":"no"}}"#),
-        ];
-        for response in responses {
-            connection
-                .transform_requests(
-                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
-                    "api.anthropic.com",
-                )
-                .await
-                .unwrap();
-
-            let output = connection
-                .scrub_response_chunk(response.as_bytes())
-                .await
-                .unwrap();
-
-            assert_eq!(String::from_utf8(output).unwrap(), response);
-        }
-        assert!(
-            broker.mints().is_empty(),
-            "none of those responses minted anything",
-        );
-    }
-
-    #[tokio::test]
     async fn a_held_request_body_is_not_a_new_place_to_substitute_the_access_sentinel() {
         // Holding the body so a minted sentinel in it can be substituted must
         // not widen where the access token goes: on an inject host it belongs
@@ -5432,5 +5404,373 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Bearer real-access"), "{output}");
         assert!(output.ends_with(body), "{output}");
+    }
+
+    /// A grant whose whole device flow lives on one host, so the near-miss
+    /// arms for the device code and poll endpoints have something to hit.
+    fn device_flow_config() -> OAuthSecret {
+        let mut config = config();
+        config.device_code_endpoint = Some("https://auth.example.com/oauth/device/code".into());
+        config.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn a_target_this_proxy_would_have_to_normalise_is_refused() {
+        // Every one of these is a spelling of a path, and which of them the
+        // upstream host resolves to the token endpoint is its business, not a
+        // guess to make with a refresh token riding on the answer.
+        for target in [
+            "//oauth/token",
+            "/oauth%2Ftoken",
+            "/%2e/oauth/token",
+            "/oauth/./token",
+            "/oauth/x/../token",
+            "/oauth/token%20",
+            "https://auth.example.com/oauth/token",
+            "auth.example.com:443",
+            "*",
+            "/oauth/token;v=1",
+            "/oauth/token#fragment",
+            "//oauth/token?retry=1",
+        ] {
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
+            );
+            let mut connection = connection_for(vec![device_flow_config()]);
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth request target is not an already-normalised origin-form path",
+                "target {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trailing_slash_on_a_protected_endpoint_fails_closed() {
+        // The one difference the origin-form rule lets through, and the one
+        // most routers treat as the same handler.
+        for (target, kind) in [
+            ("/oauth/token/", "token"),
+            ("/oauth/device/code/", "device code"),
+            ("/oauth/device/token/", "poll"),
+        ] {
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
+            );
+            let mut connection = connection_for(vec![device_flow_config()]);
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("OAuth {kind} endpoint request target is not the configured path"),
+                "target {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inject_host_without_an_endpoint_keeps_its_own_targets() {
+        // Nothing on this connection is compared with a request target, so
+        // the origin-form rule has no business narrowing what the guest may
+        // ask an ordinary API for.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut connection = connection_for(vec![broker_config(&broker)]);
+        let request = "GET /v1/files/a%20b//c HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+        let output = connection
+            .transform_requests(request.as_bytes(), "api.example.com")
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("/v1/files/a%20b//c"),
+            "the target reaches the upstream host as it was written",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_near_miss_mint_target_fails_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        for (target, expected) in [
+            (
+                "//api/oauth/claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api%2Foauth/claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api/oauth/claude_cli/../claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api/oauth/claude_cli/create_api_key/",
+                "OAuth mint endpoint request target is not the configured path",
+            ),
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            let request = json_request(target, "{}");
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "api.anthropic.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected, "target {target}");
+        }
+        assert!(broker.mints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_on_another_port_is_not_this_connection() {
+        // The other endpoints match on the port in their URL; a mint endpoint
+        // says its port itself, and a connection to another one is not it.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].port = Some(8443);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), response);
+        assert!(broker.mints().is_empty());
+
+        // On the port it names, the same request mints.
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].port = Some(8443);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 8443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        assert!(!String::from_utf8(output).unwrap().contains(RAW_KEY));
+        assert_eq!(broker.mints().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mint_response_without_the_field_fails_closed() {
+        // The detector that would otherwise notice a credential in an
+        // unrecognised body is off here: a grant is relevant to this
+        // connection. So the endpoint answers in the shape it was configured
+        // for, or the connection ends.
+        let broker = start_broker("real-access", "real-refresh");
+        for body in [
+            r#"{"ok":true}"#,
+            r#"{"raw_key":{"nested":"no"}}"#,
+            r#"["raw_key"]"#,
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+
+            let error = connection
+                .scrub_response_chunk(json_response(200, body).as_bytes())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth mint endpoint response did not carry field raw_key",
+                "body {body}"
+            );
+        }
+        assert!(broker.mints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_error_or_non_json_response_is_forwarded_as_it_is() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        let responses = [
+            json_response(400, r#"{"error":"invalid_scope"}"#),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 8\r\n\r\nnot json"
+                .to_string(),
+        ];
+        for response in responses {
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+
+            let output = connection
+                .scrub_response_chunk(response.as_bytes())
+                .await
+                .unwrap();
+
+            assert_eq!(String::from_utf8(output).unwrap(), response);
+        }
+        assert!(
+            broker.mints().is_empty(),
+            "neither response minted anything",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_before_the_mint_response_reaches_the_guest_unchanged() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                b"GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n",
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+
+        // Both responses arrive in one read, the way a pipelining server's do.
+        let first = json_response(200, r#"{"models":["a"]}"#);
+        let second = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let output = connection
+            .scrub_response_chunk(format!("{first}{second}").as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(&first), "{output}");
+        assert!(!output.contains(RAW_KEY), "{output}");
+        assert!(output.contains("$MSB_OAUTH_MINT_00"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_mint_response_drops_its_trailers() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+
+        let body = format!(r#"{{"raw_key":"{RAW_KEY}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTrailer: X-Checksum\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\nX-Checksum: abc\r\n\r\n",
+            body.len(),
+        );
+
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        // The body is identity-framed now, so a trailer has nowhere to live.
+        assert!(!output.contains("X-Checksum: abc"), "{output}");
+        assert!(
+            output.ends_with(r#"{"raw_key":"$MSB_OAUTH_MINT_00"}"#),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_malformed_chunked_mint_response_fails_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        for chunks in [
+            // A chunk that claims more than any OAuth message may carry.
+            "fffffffff\r\n",
+            // A size line that is not a size.
+            "zz\r\nbody\r\n0\r\n\r\n",
+            // A chunk whose data is not followed by CRLF.
+            "4\r\nbodyX0\r\n\r\n",
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}"
+            );
+
+            let error = connection
+                .scrub_response_chunk(response.as_bytes())
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "chunks {chunks:?}"
+            );
+        }
+        assert!(broker.mints().is_empty());
     }
 }

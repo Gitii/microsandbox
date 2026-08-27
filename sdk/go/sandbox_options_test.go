@@ -658,6 +658,7 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 			Host:  "api.example.com",
 			Path:  "/api/oauth/claude_cli/create_api_key",
 			Field: "raw_key",
+			Port:  8443,
 		}},
 		InjectHosts:       []string{"api.example.com", "*.service.example.com"},
 		AccessTokenField:  "access_token",
@@ -702,6 +703,9 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 		if mint[key] != want {
 			t.Fatalf("mint_endpoints[0].%s = %v, want %q", key, mint[key], want)
 		}
+	}
+	if mint["port"] != float64(8443) {
+		t.Fatalf("mint_endpoints[0].port = %v", mint["port"])
 	}
 	fields, ok := grant["poll_secret_fields"].([]any)
 	if !ok || len(fields) != 2 || fields[0] != "authorization_code" || fields[1] != "code_verifier" {

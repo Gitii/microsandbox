@@ -1959,6 +1959,15 @@ pub struct MintEndpoint {
     /// appends, the endpoint it reached is this one. Must start with `/`.
     pub path: String,
 
+    /// TCP port the endpoint is reached on. `None` is 443.
+    ///
+    /// The other endpoints carry their port in their URL and match on it;
+    /// this one is a host and a path, so it says its port here. A grant whose
+    /// inject host is served on another port names that port, or its mint
+    /// endpoint quietly never matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
     /// Top-level JSON field of the response that carries the minted secret.
     pub field: String,
 }
@@ -2423,6 +2432,9 @@ fn validate_mint_endpoint(
     }
     if mint.field.is_empty() {
         return Err(invalid("mint endpoint field must not be empty"));
+    }
+    if mint.port == Some(0) {
+        return Err(invalid("mint endpoint port must not be zero"));
     }
     let token_host = oauth_endpoint_host(&oauth.token_endpoint);
     let reachable = token_host.is_some_and(|host| host.eq_ignore_ascii_case(&mint.host))
@@ -3261,6 +3273,7 @@ mod tests {
             host: host.into(),
             path: path.into(),
             field: field.into(),
+            port: None,
         };
 
         let mut oauth = device_flow_oauth();
@@ -3315,6 +3328,7 @@ mod tests {
             host: "keys.example.com".into(),
             path: "/api/keys".into(),
             field: "raw_key".into(),
+            port: None,
         }];
         assert_eq!(
             oauth.validate(0),
@@ -3331,6 +3345,7 @@ mod tests {
             host: "github.com".into(),
             path: "/api/keys".into(),
             field: "raw_key".into(),
+            port: None,
         }];
         assert_eq!(oauth.validate(0), Ok(()));
     }
