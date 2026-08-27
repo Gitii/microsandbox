@@ -2567,18 +2567,18 @@ fn reject_unnormalized_target(target: &str) -> io::Result<()> {
 /// key forwarded to it unread.
 ///
 /// What is left is compared byte for byte, on a target
-/// [`reject_unnormalized_target`] has already held to the origin form. The one
-/// difference that survives that is a trailing slash, which is a different
-/// path by the letter of RFC 3986 and the same handler in most routers, so it
-/// is reported as [`PathMatch::Equivalent`]: neither accepted nor ignored,
-/// because which of the two the upstream host agrees with is not ours to
-/// guess when a credential rides on the answer.
+/// [`reject_unnormalized_target`] has already held to the origin form. Two
+/// differences survive that: a trailing slash, and letter case. Neither is the
+/// same path by the letter of RFC 3986, and both are the same handler in
+/// plenty of routers, so each is reported as [`PathMatch::Equivalent`] —
+/// neither accepted nor ignored, because which of the two the upstream host
+/// agrees with is not ours to guess when a credential rides on the answer.
 fn match_endpoint_path(path: &str, target: &str) -> PathMatch {
     let target_path = target.split('?').next().unwrap_or(target);
     if target_path == path {
         return PathMatch::Exact;
     }
-    if without_trailing_slash(target_path) == without_trailing_slash(path) {
+    if without_trailing_slash(target_path).eq_ignore_ascii_case(without_trailing_slash(path)) {
         return PathMatch::Equivalent;
     }
     PathMatch::None
@@ -5454,13 +5454,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_trailing_slash_on_a_protected_endpoint_fails_closed() {
-        // The one difference the origin-form rule lets through, and the one
-        // most routers treat as the same handler.
+    async fn a_trailing_slash_or_a_change_of_case_fails_closed() {
+        // The two differences the origin-form rule lets through, and the two
+        // plenty of routers treat as the same handler.
         for (target, kind) in [
             ("/oauth/token/", "token"),
             ("/oauth/device/code/", "device code"),
             ("/oauth/device/token/", "poll"),
+            ("/OAUTH/TOKEN", "token"),
+            ("/oauth/Device/code", "device code"),
+            ("/oauth/device/TOKEN/", "poll"),
         ] {
             let request = format!(
                 "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
@@ -5520,6 +5523,10 @@ mod tests {
             ),
             (
                 "/api/oauth/claude_cli/create_api_key/",
+                "OAuth mint endpoint request target is not the configured path",
+            ),
+            (
+                "/api/oauth/claude_cli/Create_API_Key",
                 "OAuth mint endpoint request target is not the configured path",
             ),
         ] {
