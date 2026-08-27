@@ -87,6 +87,34 @@ export type HostPermissions = "private" | "mirror";
 
 export type HostPattern = { "exact": string } | { "wildcard": string } | "any";
 
+export type MintEndpoint = {
+  /**
+   * Exact hostname the request is addressed to, matched case-insensitively
+   * against the TLS SNI. Bare host only: no scheme, port, path or userinfo.
+   */
+  host: string;
+  /**
+   * Exact request path, with no query string of its own.
+   *
+   * A request is matched on its path alone: whatever query the sandbox
+   * appends, the endpoint it reached is this one. Must start with `/`.
+   */
+  path: string;
+  /**
+   * TCP port the endpoint is reached on. `None` is 443.
+   *
+   * The other endpoints carry their port in their URL and match on it;
+   * this one is a host and a path, so it says its port here. A grant whose
+   * inject host is served on another port names that port, or its mint
+   * endpoint quietly never matches.
+   */
+  port?: number | null;
+  /**
+   * Top-level JSON field of the response that carries the minted secret.
+   */
+  field: string;
+};
+
 export type OAuthSecret = {
   /**
    * Host broker Unix-domain socket path.
@@ -135,6 +163,27 @@ export type OAuthSecret = {
    * listed here, stays on the verbatim path and reaches the sandbox.
    */
   poll_secret_fields: Array<string>;
+  /**
+   * Endpoints that mint a new long-lived secret in their response.
+   *
+   * A token endpoint hands back the grant's own tokens; these hand back
+   * something else. Anthropic's console mode, for instance, `POST`s to
+   * `https://api.anthropic.com/api/oauth/claude_cli/create_api_key` with
+   * the access token and gets a fresh API key in `raw_key`. Nothing about
+   * that key is known to the broker beforehand, so without an entry here
+   * it reaches the sandbox in the clear.
+   *
+   * A `POST` to an exact host and path listed here whose 2xx JSON response
+   * carries [`field`](MintEndpoint::field) as a top-level string is minted:
+   * the broker stores the value and names a sentinel, the sandbox is handed
+   * the sentinel instead, and later requests to this grant's inject hosts
+   * have the sentinel substituted back.
+   *
+   * The host must be one of [`inject_hosts`](Self::inject_hosts) or the
+   * token endpoint's host — anywhere else, the grant is not loaded for the
+   * connection and nothing would inspect the response.
+   */
+  mint_endpoints: Array<MintEndpoint>;
   /**
    * Hosts where the access sentinel may be substituted.
    */

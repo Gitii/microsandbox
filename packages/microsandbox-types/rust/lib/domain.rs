@@ -1889,6 +1889,26 @@ pub struct OAuthSecret {
     /// listed here, stays on the verbatim path and reaches the sandbox.
     #[serde(default)]
     pub poll_secret_fields: Vec<String>,
+    /// Endpoints that mint a new long-lived secret in their response.
+    ///
+    /// A token endpoint hands back the grant's own tokens; these hand back
+    /// something else. Anthropic's console mode, for instance, `POST`s to
+    /// `https://api.anthropic.com/api/oauth/claude_cli/create_api_key` with
+    /// the access token and gets a fresh API key in `raw_key`. Nothing about
+    /// that key is known to the broker beforehand, so without an entry here
+    /// it reaches the sandbox in the clear.
+    ///
+    /// A `POST` to an exact host and path listed here whose 2xx JSON response
+    /// carries [`field`](MintEndpoint::field) as a top-level string is minted:
+    /// the broker stores the value and names a sentinel, the sandbox is handed
+    /// the sentinel instead, and later requests to this grant's inject hosts
+    /// have the sentinel substituted back.
+    ///
+    /// The host must be one of [`inject_hosts`](Self::inject_hosts) or the
+    /// token endpoint's host — anywhere else, the grant is not loaded for the
+    /// connection and nothing would inspect the response.
+    #[serde(default)]
+    pub mint_endpoints: Vec<MintEndpoint>,
     /// Hosts where the access sentinel may be substituted.
     #[serde(default)]
     pub inject_hosts: Vec<HostPattern>,
@@ -1920,6 +1940,36 @@ pub struct OAuthSecret {
     /// Per-sandbox refresh-token sentinel, under the same rules as the access
     /// sentinel above.
     pub refresh_sentinel: String,
+}
+
+/// One exact endpoint whose response mints a new secret.
+///
+/// Carried in [`OAuthSecret::mint_endpoints`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MintEndpoint {
+    /// Exact hostname the request is addressed to, matched case-insensitively
+    /// against the TLS SNI. Bare host only: no scheme, port, path or userinfo.
+    pub host: String,
+
+    /// Exact request path, with no query string of its own.
+    ///
+    /// A request is matched on its path alone: whatever query the sandbox
+    /// appends, the endpoint it reached is this one. Must start with `/`.
+    pub path: String,
+
+    /// TCP port the endpoint is reached on. `None` is 443.
+    ///
+    /// The other endpoints carry their port in their URL and match on it;
+    /// this one is a host and a path, so it says its port here. A grant whose
+    /// inject host is served on another port names that port, or its mint
+    /// endpoint quietly never matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// Top-level JSON field of the response that carries the minted secret.
+    pub field: String,
 }
 
 /// A single secret entry.
@@ -2214,6 +2264,9 @@ impl OAuthSecret {
                 return Err(invalid("poll secret fields must not be token fields"));
             }
         }
+        for mint in &self.mint_endpoints {
+            validate_mint_endpoint(mint, self, grant_index)?;
+        }
         validate_env_var(&self.access_env_var, grant_index)?;
         validate_env_var(&self.refresh_env_var, grant_index)?;
         validate_sentinel(&self.access_sentinel, grant_index)?;
@@ -2335,6 +2388,75 @@ fn validate_oauth_endpoint(
         return Err(invalid(missing_path));
     }
     Ok(())
+}
+
+/// Check one minting endpoint.
+///
+/// The host is a bare hostname rather than a URL: it is compared with the TLS
+/// SNI, which carries no scheme, port or path. It has to be a host the grant is
+/// already loaded for — an inject host, or the token endpoint's own host —
+/// because a connection to anywhere else never has this grant's response
+/// inspected, and a mint endpoint that silently does nothing is the failure
+/// this feature exists to prevent.
+fn validate_mint_endpoint(
+    mint: &MintEndpoint,
+    oauth: &OAuthSecret,
+    grant_index: usize,
+) -> Result<(), SecretConfigError> {
+    let invalid = |reason| SecretConfigError::InvalidOAuth {
+        grant_index,
+        reason,
+    };
+    if mint.host.is_empty() {
+        return Err(invalid("mint endpoint host must not be empty"));
+    }
+    if mint.host.contains("://")
+        || mint
+            .host
+            .contains(['/', '@', ':', '?', '#', ' ', '\0', '\r', '\n'])
+    {
+        return Err(invalid("mint endpoint host must be a bare hostname"));
+    }
+    if !mint.path.starts_with('/') {
+        return Err(invalid("mint endpoint path must start with `/`"));
+    }
+    // The request's query is dropped before the comparison, so a configured
+    // one could never match anything.
+    if mint.path.contains('?') {
+        return Err(invalid(
+            "mint endpoint path must not contain a query string",
+        ));
+    }
+    if mint.path.contains([' ', '\0', '\r', '\n']) {
+        return Err(invalid("mint endpoint path must not contain whitespace"));
+    }
+    if mint.field.is_empty() {
+        return Err(invalid("mint endpoint field must not be empty"));
+    }
+    if mint.port == Some(0) {
+        return Err(invalid("mint endpoint port must not be zero"));
+    }
+    let token_host = oauth_endpoint_host(&oauth.token_endpoint);
+    let reachable = token_host.is_some_and(|host| host.eq_ignore_ascii_case(&mint.host))
+        || oauth
+            .inject_hosts
+            .iter()
+            .any(|pattern| pattern.matches(&mint.host));
+    if !reachable {
+        return Err(invalid(
+            "mint endpoint host must be an inject host or the token endpoint host",
+        ));
+    }
+    Ok(())
+}
+
+/// The bare hostname of an `https://host[:port]/path` endpoint.
+fn oauth_endpoint_host(endpoint: &str) -> Option<&str> {
+    let authority = endpoint.strip_prefix("https://")?.split('/').next()?;
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    (!host.is_empty()).then_some(host)
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
@@ -2953,6 +3075,7 @@ mod tests {
             device_code_endpoint: Some("https://github.com/login/device/code".into()),
             poll_endpoint: Some("https://github.com/login/oauth/access_token".into()),
             poll_secret_fields: vec![],
+            mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.github.com".into())],
             access_token_field: "access_token".into(),
             refresh_token_field: "access_token".into(),
@@ -3142,6 +3265,89 @@ mod tests {
                 reason: "device_code_endpoint must differ from the token and poll endpoints",
             })
         );
+    }
+
+    #[test]
+    fn oauth_mint_endpoints_take_a_bare_host_an_absolute_path_and_a_field() {
+        let mint = |host: &str, path: &str, field: &str| MintEndpoint {
+            host: host.into(),
+            path: path.into(),
+            field: field.into(),
+            port: None,
+        };
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("api.github.com", "/api/keys", "raw_key")];
+        assert_eq!(oauth.validate(0), Ok(()));
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("https://api.github.com", "/api/keys", "raw_key")];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint host must be a bare hostname",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("api.github.com", "api/keys", "raw_key")];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint path must start with `/`",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("api.github.com", "/api/keys?scope=all", "raw_key")];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint path must not contain a query string",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("api.github.com", "/api/keys", "")];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint field must not be empty",
+            })
+        );
+    }
+
+    #[test]
+    fn an_unreachable_mint_endpoint_host_is_refused() {
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![MintEndpoint {
+            host: "keys.example.com".into(),
+            path: "/api/keys".into(),
+            field: "raw_key".into(),
+            port: None,
+        }];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint host must be an inject host or the token endpoint host",
+            })
+        );
+
+        // The token endpoint's own host is reachable: the grant is loaded for
+        // every connection that carries the flow.
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![MintEndpoint {
+            host: "github.com".into(),
+            path: "/api/keys".into(),
+            field: "raw_key".into(),
+            port: None,
+        }];
+        assert_eq!(oauth.validate(0), Ok(()));
     }
 
     #[test]

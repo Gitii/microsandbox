@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use zeroize::Zeroizing;
 
-use super::config::{MAX_OAUTH_SENTINEL_BYTES, OAuthSecret};
+use super::config::{MAX_OAUTH_SENTINEL_BYTES, MintEndpoint, OAuthSecret};
 use super::handler::host_pattern_allowed_for_tls;
 use crate::shared::SharedState;
 
@@ -29,6 +29,16 @@ const MAX_SEEN_TOKENS: usize = MAX_OUTSTANDING_API_REQUESTS * 2;
 /// new sentinels is not a session any client runs.
 const MAX_GRANT_SENTINEL_ALIASES: usize = 64;
 const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Port a configured endpoint is on when it does not say otherwise.
+const DEFAULT_HTTPS_PORT: u16 = 443;
+/// How many secrets one grant may hold minted at once. A session mints an API
+/// key, not a stream of them, and every one of them is another pass over every
+/// request; past this the connection fails closed.
+const MAX_GRANT_MINTED_SECRETS: usize = 16;
+/// Largest request body held whole so a minted sentinel inside it can be
+/// substituted. A body past this streams to the upstream host as it arrives,
+/// with only its headers substituted, rather than being buffered wholesale.
+const MAX_MINTED_REQUEST_BODY_BYTES: usize = 256 * 1024;
 
 /// Kind, and so the prefix, of every minted poll secret sentinel. Sentinels
 /// are per-connection, so one that survives substitution belongs to a
@@ -62,9 +72,14 @@ pub(crate) struct OAuthConnection {
     response_scrub_framing: Vec<u8>,
     response_scrub_tail: Vec<u8>,
     response_scrub_state: ResponseScrubState,
-    response_head_requests: VecDeque<bool>,
+    pending_responses: VecDeque<PendingResponse>,
     seen_tokens: Vec<Zeroizing<String>>,
     request_state: RequestState,
+    /// Whether any grant on this connection configures a mint endpoint. It
+    /// decides how responses are read: without one the scrubber streams as it
+    /// always did, with one every response is followed to its end so a mint
+    /// response cannot slip past unrecognised.
+    mints_configured: bool,
 }
 
 struct LoadedGrant {
@@ -91,6 +106,9 @@ struct LoadedGrant {
     generation: u64,
     lease: Option<UnixStream>,
     poll_secrets: Vec<PollSecret>,
+    /// Secrets minted on this grant, held by the broker and substituted back
+    /// into requests to the grant's inject hosts and its token endpoint.
+    minted: Vec<MintedSecret>,
 }
 
 /// One exact HTTPS endpoint a request line is matched against.
@@ -108,6 +126,28 @@ struct PollSecret {
     value: Zeroizing<String>,
 }
 
+/// A secret a mint endpoint handed back, now stored by the broker.
+struct MintedSecret {
+    sentinel: String,
+    value: Zeroizing<String>,
+}
+
+/// An API request whose response has not been read yet.
+struct PendingResponse {
+    /// Whether the request was a `HEAD`, whose response carries no body.
+    head: bool,
+    /// The mint this response may complete, when the request reached a
+    /// configured mint endpoint.
+    mint: Option<PendingMint>,
+}
+
+/// The grant and field a mint response is expected to carry.
+#[derive(Clone)]
+struct PendingMint {
+    grant: usize,
+    field: String,
+}
+
 /// The result of scrubbing one streamed chunk of response bytes.
 struct Scrubbed {
     output: Vec<u8>,
@@ -115,11 +155,40 @@ struct Scrubbed {
     complete: bool,
 }
 
-/// Which of a grant's two tokens a sentinel stands for.
+/// How far the response scrubber reads before handing bytes back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    /// Stream to the guest as the bytes arrive. A response that ends at EOF
+    /// is fine: nothing on this connection has to be read whole.
+    Continuous,
+    /// Stop at the end of each message, because a device code exchange is
+    /// interleaved with responses that are held and rewritten.
+    DeviceCode,
+    /// Stop at the end of each message, because a mint response is.
+    Mint,
+}
+
+/// How a request target relates to a configured endpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathMatch {
+    /// The target's path is the endpoint's, whatever query follows it.
+    Exact,
+    /// The target is another spelling of the endpoint's path — a doubled
+    /// slash, a percent-encoded separator — which the upstream host may well
+    /// route to the same handler while a byte comparison here does not.
+    Equivalent,
+    /// Somewhere else entirely.
+    None,
+}
+
+/// Which of a grant's secrets a sentinel stands for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SentinelKind {
     Access,
     Refresh,
+    /// A secret minted on an inject host, which has no configured sentinel and
+    /// no aliases: the broker names it once and it stays that name.
+    Minted,
 }
 
 /// A request whose response is still outstanding on a token connection.
@@ -151,6 +220,11 @@ enum BrokerRequest<'a> {
     Acquire {
         grant_id: &'a str,
     },
+    Mint {
+        grant_id: &'a str,
+        field: &'a str,
+        value: &'a str,
+    },
     Commit {
         grant_id: &'a str,
         generation: u64,
@@ -173,6 +247,27 @@ struct LoadResponse {
     /// The sentinel the broker currently stands behind for the refresh token.
     #[serde(default)]
     refresh_sentinel: Option<String>,
+    /// Secrets already minted for this grant, so a connection opened after the
+    /// one that minted them still substitutes them.
+    #[serde(default)]
+    minted: Vec<MintedEntry>,
+}
+
+/// One minted secret as the broker reports it.
+#[derive(Deserialize)]
+struct MintedEntry {
+    sentinel: String,
+    value: String,
+}
+
+/// What the broker answers a `mint` with. An `error` it may send alongside
+/// `ok: false` is not read: the connection fails closed either way, and the
+/// text is the broker's to log.
+#[derive(Deserialize)]
+struct MintResponse {
+    ok: bool,
+    #[serde(default)]
+    sentinel: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +295,20 @@ struct Committed {
 struct HttpMessage<'a> {
     headers: &'a [u8],
     body: &'a [u8],
+    total_len: usize,
+}
+
+/// One complete response to a mint request, with any chunked framing undone.
+///
+/// Both framings are read: a minted key is small enough to arrive in a single
+/// chunk, and an endpoint that streams JSON is not obliged to say how long it
+/// is up front. The body comes back de-chunked and the response handed to the
+/// guest is rebuilt with a `Content-Length`, since rewriting the field changes
+/// its length anyway and re-chunking to preserve a framing no client depends
+/// on would only add a way to get it wrong.
+struct MintMessage {
+    headers: Vec<u8>,
+    body: Vec<u8>,
     total_len: usize,
 }
 
@@ -317,17 +426,26 @@ impl OAuthConnection {
                 generation: loaded.generation,
                 lease: None,
                 poll_secrets: Vec::new(),
+                minted: Vec::new(),
             };
             grants.push(grant);
-            reported.push((loaded.access_sentinel, loaded.refresh_sentinel));
+            reported.push((
+                loaded.access_sentinel,
+                loaded.refresh_sentinel,
+                loaded.minted,
+            ));
         }
         // The guest may already hold a sentinel minted after this sandbox was
         // configured, so the broker's answer wins over the config. Adoption
         // waits for every grant to be loaded: a sentinel is checked against
         // the whole connection, and half a connection is not the whole of it.
-        for (index, (access, refresh)) in reported.into_iter().enumerate() {
+        for (index, (access, refresh, minted)) in reported.into_iter().enumerate() {
+            adopt_minted(&mut grants, index, &minted, &mut seen_tokens)?;
             adopt_sentinels(&mut grants, index, access, refresh, &seen_tokens)?;
         }
+        let mints_configured = grants
+            .iter()
+            .any(|grant| !grant.config.mint_endpoints.is_empty());
         Ok(Self {
             token_connection: None,
             connection_port: port,
@@ -339,9 +457,10 @@ impl OAuthConnection {
             response_scrub_framing: Vec::new(),
             response_scrub_tail: Vec::new(),
             response_scrub_state: ResponseScrubState::Headers,
-            response_head_requests: VecDeque::new(),
+            pending_responses: VecDeque::new(),
             seen_tokens,
             request_state: RequestState::Headers,
+            mints_configured,
         })
     }
 
@@ -353,13 +472,74 @@ impl OAuthConnection {
         self.token_connection == Some(true)
     }
 
-    pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        Ok(self.scrub_stream(data, false)?.output)
+    /// Scrub a streamed API response, minting any secret a mint endpoint just
+    /// handed back.
+    ///
+    /// Without a mint endpoint this is the streaming scrubber and nothing
+    /// else. With one, responses are followed message by message so that the
+    /// mint response is recognised, held whole and rewritten before any of it
+    /// reaches the guest — which is why a close-delimited response is refused
+    /// on such a connection: nothing marks where the next response begins, so
+    /// a minted secret could stream past inside what followed.
+    pub(crate) async fn scrub_response_chunk(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if !self.mints_configured {
+            return Ok(self.scrub_stream(data, StreamMode::Continuous)?.output);
+        }
+        self.response_buffer.extend_from_slice(data);
+        enforce_limit(&self.response_buffer)?;
+        let mut output = Vec::new();
+        while !self.response_buffer.is_empty() {
+            let Some(mint) = self.pending_mint() else {
+                let buffered = std::mem::take(&mut self.response_buffer);
+                let scrubbed = self.scrub_stream(&buffered, StreamMode::Mint)?;
+                self.response_buffer = scrubbed.remaining;
+                output.extend_from_slice(&scrubbed.output);
+                if !scrubbed.complete {
+                    break;
+                }
+                continue;
+            };
+            // A `100 Continue` ahead of the mint response would be counted as
+            // the response itself by the framing below, so it is refused here
+            // rather than misread there.
+            if let Some(boundary) = header_boundary(&self.response_buffer)
+                && (100..200).contains(&response_status(&self.response_buffer[..boundary])?)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OAuth informational responses are unsupported",
+                ));
+            }
+            let Some(message) = parse_mint_response(&self.response_buffer)? else {
+                break;
+            };
+            let total_len = message.total_len;
+            let response = self.response_buffer[..total_len].to_vec();
+            let rewritten = self
+                .finish_mint(mint, &message.headers, &message.body, response)
+                .await?;
+            output.extend_from_slice(&rewritten);
+            self.response_buffer.drain(..total_len);
+            self.pending_responses.pop_front();
+        }
+        Ok(output)
     }
 
-    /// Scrub a streamed response, optionally stopping at the end of the first
-    /// complete message and handing the rest back to the caller.
-    fn scrub_stream(&mut self, data: &[u8], stop_at_message_end: bool) -> io::Result<Scrubbed> {
+    /// The mint this connection is waiting on, when the next byte in the
+    /// buffer starts the response to a mint request.
+    fn pending_mint(&self) -> Option<PendingMint> {
+        if !matches!(self.response_scrub_state, ResponseScrubState::Headers)
+            || !self.response_scrub_buffer.is_empty()
+        {
+            return None;
+        }
+        self.pending_responses.front()?.mint.clone()
+    }
+
+    /// Scrub a streamed response, stopping at the end of the first complete
+    /// message and handing the rest back to the caller when the mode says to.
+    fn scrub_stream(&mut self, data: &[u8], mode: StreamMode) -> io::Result<Scrubbed> {
+        let stop_at_message_end = mode != StreamMode::Continuous;
         let mut output = Vec::new();
         let mut pending = data.to_vec();
         let mut complete = false;
@@ -384,10 +564,9 @@ impl OAuthConnection {
                     }
                     self.response_scrub_state = response_body_state(
                         &headers,
-                        self.response_head_requests
+                        self.pending_responses
                             .front()
-                            .copied()
-                            .unwrap_or(false),
+                            .is_some_and(|pending| pending.head),
                     )?;
                     // A close-delimited response ends at EOF, so nothing marks
                     // where the next response starts. On a token connection
@@ -401,13 +580,20 @@ impl OAuthConnection {
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "OAuth device code responses require Content-Length or chunked framing",
+                            match mode {
+                                StreamMode::Mint => {
+                                    "OAuth responses on a minting connection require Content-Length or chunked framing"
+                                }
+                                _ => {
+                                    "OAuth device code responses require Content-Length or chunked framing"
+                                }
+                            },
                         ));
                     }
                     self.scrub_stream_bytes(&headers, &mut output);
                     self.flush_scrub_tail(&mut output);
                     if !(100..200).contains(&status) {
-                        self.response_head_requests.pop_front();
+                        self.pending_responses.pop_front();
                     }
                     if matches!(
                         self.response_scrub_state,
@@ -534,6 +720,7 @@ impl OAuthConnection {
             return Ok(output);
         }
         if !self.response_scrub_buffer.is_empty()
+            || !self.response_buffer.is_empty()
             || matches!(
                 self.response_scrub_state,
                 ResponseScrubState::ContentLength(_)
@@ -607,6 +794,23 @@ impl OAuthConnection {
                         .nth(1)
                         .ok_or_else(invalid_http)?;
                     let port = self.connection_port;
+                    // Where a protected endpoint lives on this connection,
+                    // every target on it has to be one this proxy can compare
+                    // with confidence. Anything else is refused rather than
+                    // decoded: the spellings of one path are not a list that
+                    // ends, and each one we do not recognise is a request
+                    // whose response would reach the guest unread.
+                    if self.has_protected_endpoint(sni) {
+                        reject_unnormalized_target(target)?;
+                        if let Some(kind) = self.equivalent_endpoint(sni, target) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "OAuth {kind} endpoint request target is not the configured path"
+                                ),
+                            ));
+                        }
+                    }
                     // A grant matches at most once even when its poll endpoint
                     // is its token endpoint, which is what a device flow with a
                     // refresh grant looks like.
@@ -636,6 +840,31 @@ impl OAuthConnection {
                         RequestBodyFraming::ContentLength(length) => length,
                     };
                     let total_len = header_end.checked_add(body_len).ok_or_else(invalid_http)?;
+                    // A mint endpoint is an ordinary API request whose
+                    // response has to be held and rewritten, so it is
+                    // recognised here and remembered against its response.
+                    let mint = (!endpoint_request
+                        && !device_code_request
+                        && method.eq_ignore_ascii_case("POST"))
+                    .then(|| self.mint_match(sni, target))
+                    .flatten();
+                    // An inject-host request may carry a minted sentinel in
+                    // its body as well as its headers, and substituting it
+                    // changes the body's length, so the body is held whole
+                    // instead of streamed. Only where minting is configured,
+                    // only up to a bound, and never where the client is
+                    // waiting for a `100 Continue` before it sends the body.
+                    let buffered_body = !endpoint_request
+                        && !device_code_request
+                        && self.mints_configured
+                        && matches!(
+                            framing,
+                            RequestBodyFraming::ContentLength(1..=MAX_MINTED_REQUEST_BODY_BYTES)
+                        )
+                        && !expects_100_continue(&headers)?;
+                    if buffered_body && self.request_buffer.len() < total_len {
+                        break;
+                    }
                     if endpoint_request || device_code_request {
                         let endpoint = if endpoint_request {
                             "token"
@@ -709,14 +938,16 @@ impl OAuthConnection {
                     self.token_connection = Some(is_token_request);
                     if !is_token_request {
                         reject_protocol_upgrade(&headers)?;
-                        if self.response_head_requests.len() >= MAX_OUTSTANDING_API_REQUESTS {
+                        if self.pending_responses.len() >= MAX_OUTSTANDING_API_REQUESTS {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "too many outstanding OAuth API requests",
                             ));
                         }
-                        self.response_head_requests
-                            .push_back(method.eq_ignore_ascii_case("HEAD"));
+                        self.pending_responses.push_back(PendingResponse {
+                            head: method.eq_ignore_ascii_case("HEAD"),
+                            mint,
+                        });
                     }
                     if device_code_request && self.exchanges.len() >= MAX_OUTSTANDING_API_REQUESTS {
                         return Err(io::Error::new(
@@ -735,7 +966,7 @@ impl OAuthConnection {
                             "OAuth token request pipelining is unsupported",
                         ));
                     }
-                    let request_len = if is_token_request {
+                    let request_len = if is_token_request || buffered_body {
                         total_len
                     } else {
                         header_end
@@ -753,6 +984,12 @@ impl OAuthConnection {
                         grant.refresh = Zeroizing::new(loaded.refresh);
                         grant.generation = loaded.generation;
                         grant.lease = Some(lease);
+                        adopt_minted(
+                            &mut self.grants,
+                            index,
+                            &loaded.minted,
+                            &mut self.seen_tokens,
+                        )?;
                         adopt_sentinels(
                             &mut self.grants,
                             index,
@@ -775,6 +1012,12 @@ impl OAuthConnection {
                             grant.access = Zeroizing::new(loaded.access);
                             grant.refresh = Zeroizing::new(loaded.refresh);
                             grant.generation = loaded.generation;
+                            adopt_minted(
+                                &mut self.grants,
+                                index,
+                                &loaded.minted,
+                                &mut self.seen_tokens,
+                            )?;
                             adopt_sentinels(
                                 &mut self.grants,
                                 index,
@@ -821,6 +1064,20 @@ impl OAuthConnection {
                                 );
                             }
                         }
+                        // A minted secret substitutes in any header, not only
+                        // a bearer one: an API key travels as `x-api-key` as
+                        // often as it does as `Authorization`. It substitutes
+                        // in a held body too, which is where a form or JSON
+                        // field carrying it would be.
+                        if inject || token_grant == Some(index) {
+                            for secret in &grant.minted {
+                                rewritten = replace_all(
+                                    &rewritten,
+                                    secret.sentinel.as_bytes(),
+                                    secret.value.as_bytes(),
+                                );
+                            }
+                        }
                     }
                     if is_token_request
                         && contains_bytes(&rewritten, POLL_SENTINEL_PREFIX.as_bytes())
@@ -839,11 +1096,13 @@ impl OAuthConnection {
                         });
                     } else if device_code_request {
                         self.exchanges.push_back(Exchange::PassThrough);
+                    } else if buffered_body {
+                        rewritten = update_content_length(&rewritten)?;
                     }
                     output.extend_from_slice(&rewritten);
                     pending = self.request_buffer.split_off(request_len);
                     self.request_buffer.clear();
-                    self.request_state = if is_token_request {
+                    self.request_state = if is_token_request || buffered_body {
                         RequestState::Headers
                     } else {
                         match framing {
@@ -942,7 +1201,7 @@ impl OAuthConnection {
             // rather than held to the token response's framing rules.
             if matches!(self.exchanges.front(), Some(Exchange::PassThrough)) {
                 let buffered = std::mem::take(&mut self.response_buffer);
-                let scrubbed = self.scrub_stream(&buffered, true)?;
+                let scrubbed = self.scrub_stream(&buffered, StreamMode::DeviceCode)?;
                 self.response_buffer = scrubbed.remaining;
                 output.extend_from_slice(&scrubbed.output);
                 if !scrubbed.complete {
@@ -1083,6 +1342,66 @@ impl OAuthConnection {
         Ok(sentinel)
     }
 
+    /// Turn the secret a mint endpoint handed back into a sentinel.
+    ///
+    /// A 2xx JSON body is the shape this endpoint was configured for, so it
+    /// has to carry the named field as a top-level string; one that does not
+    /// fails the connection. The alternative is forwarding a body nothing
+    /// understood from an endpoint known to hand out credentials — and the
+    /// credential-shaped-response detector, which would otherwise be the net
+    /// under that, does not run here: a grant is relevant to this connection,
+    /// which is exactly what switches the detector off.
+    ///
+    /// A non-2xx response is an error, and a 2xx that is not JSON at all is
+    /// not this endpoint answering the call it was configured for. Both are
+    /// scrubbed and forwarded like any other response.
+    ///
+    /// A broker that will not store the value fails the connection too: a
+    /// secret the broker never saw is one nothing can substitute back or
+    /// revoke.
+    async fn finish_mint(
+        &mut self,
+        mint: PendingMint,
+        headers: &[u8],
+        body: &[u8],
+        response: Vec<u8>,
+    ) -> io::Result<Vec<u8>> {
+        let status = response_status(headers)?;
+        let mut json = match serde_json::from_slice::<Value>(body) {
+            Ok(json) if (200..300).contains(&status) => json,
+            _ => return Ok(self.scrub_tokens(response)),
+        };
+        let missing = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "OAuth mint endpoint response did not carry field {}",
+                    mint.field
+                ),
+            )
+        };
+        let object = json.as_object_mut().ok_or_else(missing)?;
+        let Some(Value::String(value)) = object.get(&mint.field) else {
+            return Err(missing());
+        };
+        let value = value.clone();
+        let sentinel = broker_mint(&self.grants[mint.grant].config, &mint.field, &value).await?;
+        adopt_minted(
+            &mut self.grants,
+            mint.grant,
+            &[MintedEntry {
+                sentinel: sentinel.clone(),
+                value,
+            }],
+            &mut self.seen_tokens,
+        )?;
+        object.insert(mint.field, Value::String(sentinel));
+        let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
+        let mut response = rebuild_identity_message(headers, &body)?;
+        scrub_seen_tokens(&mut response, &self.seen_tokens);
+        Ok(response)
+    }
+
     async fn sanitize_token_response(
         &mut self,
         index: usize,
@@ -1200,6 +1519,76 @@ impl OAuthConnection {
         Ok(response)
     }
 
+    /// Whether a grant on this connection has an endpoint of its own here,
+    /// rather than only an inject host.
+    ///
+    /// It is the endpoints that are compared with a request target, so it is
+    /// their presence that makes the target's spelling matter. An inject-host
+    /// connection carries ordinary API traffic whose targets are the client's
+    /// business.
+    fn has_protected_endpoint(&self, sni: &str) -> bool {
+        let port = self.connection_port;
+        let here =
+            |endpoint: &Endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(sni);
+        self.grants.iter().any(|grant| {
+            here(&grant.token)
+                || grant.device_code.as_ref().is_some_and(&here)
+                || grant.poll.as_ref().is_some_and(&here)
+                || grant
+                    .config
+                    .mint_endpoints
+                    .iter()
+                    .any(|endpoint| mint_endpoint_here(endpoint, sni, port))
+        })
+    }
+
+    /// The kind of protected endpoint this target is only a near-miss for.
+    ///
+    /// Scanned across every grant on the connection, because any of them
+    /// answers with material the guest may not have.
+    fn equivalent_endpoint(&self, sni: &str, target: &str) -> Option<&'static str> {
+        let port = self.connection_port;
+        let equivalent =
+            |endpoint: &Endpoint| endpoint.match_target(sni, port, target) == PathMatch::Equivalent;
+        for grant in &self.grants {
+            let named = [
+                (Some(&grant.token), "token"),
+                (grant.device_code.as_ref(), "device code"),
+                (grant.poll.as_ref(), "poll"),
+            ];
+            for (endpoint, kind) in named {
+                if endpoint.is_some_and(&equivalent) {
+                    return Some(kind);
+                }
+            }
+            let mint = grant.config.mint_endpoints.iter().any(|endpoint| {
+                mint_endpoint_matches(endpoint, sni, port, target) == PathMatch::Equivalent
+            });
+            if mint {
+                return Some("mint");
+            }
+        }
+        None
+    }
+
+    /// The mint endpoint this request line reached, if any.
+    fn mint_match(&self, sni: &str, target: &str) -> Option<PendingMint> {
+        self.grants.iter().enumerate().find_map(|(grant, loaded)| {
+            loaded
+                .config
+                .mint_endpoints
+                .iter()
+                .find(|endpoint| {
+                    mint_endpoint_matches(endpoint, sni, self.connection_port, target)
+                        == PathMatch::Exact
+                })
+                .map(|endpoint| PendingMint {
+                    grant,
+                    field: endpoint.field.clone(),
+                })
+        })
+    }
+
     fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
         scrub_seen_tokens(&mut response, &self.seen_tokens);
         response
@@ -1217,27 +1606,54 @@ impl LoadedGrant {
         self.sentinels_of(SentinelKind::Refresh)
     }
 
-    /// Every sentinel live for this grant, of either kind.
+    /// Every sentinel live for this grant, of any kind.
     fn sentinels(&self) -> impl Iterator<Item = &str> {
-        self.access_sentinels().chain(self.refresh_sentinels())
+        self.access_sentinels()
+            .chain(self.refresh_sentinels())
+            .chain(self.sentinels_of(SentinelKind::Minted))
     }
 
-    /// Every sentinel live for one of this grant's tokens, current one first.
+    /// Every sentinel live for one of this grant's secrets, current one first.
     fn sentinels_of(&self, kind: SentinelKind) -> impl Iterator<Item = &str> {
-        let (current, aliases) = match kind {
-            SentinelKind::Access => (&self.access_sentinel, &self.access_aliases),
-            SentinelKind::Refresh => (&self.refresh_sentinel, &self.refresh_aliases),
-        };
-        std::iter::once(current.as_str()).chain(aliases.iter().map(String::as_str))
+        let aliased = self.aliased(kind);
+        let minted = matches!(kind, SentinelKind::Minted).then_some(&self.minted);
+        aliased
+            .map(|(current, _)| current.as_str())
+            .into_iter()
+            .chain(
+                aliased
+                    .into_iter()
+                    .flat_map(|(_, aliases)| aliases.iter().map(String::as_str)),
+            )
+            .chain(
+                minted
+                    .into_iter()
+                    .flatten()
+                    .map(|secret| secret.sentinel.as_str()),
+            )
+    }
+
+    /// The current sentinel and the aliases of a kind that has them.
+    ///
+    /// [`SentinelKind::Minted`] has neither: the broker names a minted
+    /// sentinel once, and a second name for the same secret is another entry
+    /// in `minted` rather than an alias of the first.
+    fn aliased(&self, kind: SentinelKind) -> Option<(&String, &Vec<String>)> {
+        match kind {
+            SentinelKind::Access => Some((&self.access_sentinel, &self.access_aliases)),
+            SentinelKind::Refresh => Some((&self.refresh_sentinel, &self.refresh_aliases)),
+            SentinelKind::Minted => None,
+        }
     }
 
     /// Whether adopting `sentinel` would grow this kind's alias set past its
     /// bound. Checked for both kinds before either is adopted, so a rejected
     /// pair leaves the grant as it was.
     fn exceeds_alias_limit(&self, kind: SentinelKind, sentinel: &str) -> bool {
-        let (current, aliases) = match kind {
-            SentinelKind::Access => (&self.access_sentinel, &self.access_aliases),
-            SentinelKind::Refresh => (&self.refresh_sentinel, &self.refresh_aliases),
+        // Only `adopt_sentinels` reaches this, and only for the two token
+        // sentinels; a minted one is bounded by `adopt_minted` instead.
+        let Some((current, aliases)) = self.aliased(kind) else {
+            return false;
         };
         current != sentinel
             && !aliases.iter().any(|alias| alias == sentinel)
@@ -1250,6 +1666,8 @@ impl LoadedGrant {
         let (current, aliases) = match kind {
             SentinelKind::Access => (&mut self.access_sentinel, &mut self.access_aliases),
             SentinelKind::Refresh => (&mut self.refresh_sentinel, &mut self.refresh_aliases),
+            // A minted sentinel supersedes nothing: `adopt_minted` appends.
+            SentinelKind::Minted => return,
         };
         if *current == sentinel {
             return;
@@ -1262,7 +1680,28 @@ impl LoadedGrant {
 impl Endpoint {
     /// Whether a request line on this connection reached exactly this endpoint.
     fn matches(&self, sni: &str, port: u16, target: &str) -> bool {
-        self.port == port && self.target == target && self.host.eq_ignore_ascii_case(sni)
+        self.match_target(sni, port, target) == PathMatch::Exact
+    }
+
+    /// How a request line on this connection relates to this endpoint.
+    ///
+    /// A configured endpoint whose own target carries a query string is
+    /// compared whole: the query is part of what was configured, so nothing
+    /// about it can be dropped. Otherwise only the path is compared, and the
+    /// request's own query is ignored — a guest that appends one to the token
+    /// endpoint must not thereby have the response forwarded unsanitized.
+    fn match_target(&self, sni: &str, port: u16, target: &str) -> PathMatch {
+        if self.port != port || !self.host.eq_ignore_ascii_case(sni) {
+            return PathMatch::None;
+        }
+        if self.target.contains('?') {
+            return if self.target == target {
+                PathMatch::Exact
+            } else {
+                PathMatch::None
+            };
+        }
+        match_endpoint_path(&self.target, target)
     }
 }
 
@@ -1349,6 +1788,61 @@ fn adopt_sentinels(
     }
     if let Some(refresh) = refresh {
         grant.supersede(SentinelKind::Refresh, refresh);
+    }
+    Ok(())
+}
+
+/// Adopt the secrets the broker reports as minted for the grant at `index`.
+///
+/// A minted sentinel joins the same substitution set as the token sentinels,
+/// so it is checked on the same terms: bounds, control characters, and no
+/// overlap with a live token or another live sentinel. The value is remembered
+/// as a seen token first, which is both what scrubs an echo of it out of later
+/// responses and what makes a sentinel that shares bytes with its own secret a
+/// rejection rather than a half-substitution.
+///
+/// The same entry arriving again — every `load` on the connection reports the
+/// whole list — refreshes the value it stands for and costs no slot.
+fn adopt_minted(
+    grants: &mut [LoadedGrant],
+    index: usize,
+    minted: &[MintedEntry],
+    seen: &mut Vec<Zeroizing<String>>,
+) -> io::Result<()> {
+    for entry in minted {
+        if entry.value.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth minted secret is empty",
+            ));
+        }
+        remember_token(seen, &entry.value)?;
+        let sentinel = validate_sentinel(
+            entry.sentinel.clone(),
+            grants,
+            index,
+            SentinelKind::Minted,
+            seen,
+        )?;
+        let grant = &mut grants[index];
+        if let Some(held) = grant
+            .minted
+            .iter_mut()
+            .find(|held| held.sentinel == sentinel)
+        {
+            held.value = Zeroizing::new(entry.value.clone());
+            continue;
+        }
+        if grant.minted.len() >= MAX_GRANT_MINTED_SECRETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many OAuth minted secrets for one grant",
+            ));
+        }
+        grant.minted.push(MintedSecret {
+            sentinel,
+            value: Zeroizing::new(entry.value.clone()),
+        });
     }
     Ok(())
 }
@@ -1467,6 +1961,32 @@ async fn broker_acquire(config: &OAuthSecret) -> io::Result<(LoadResponse, UnixS
     .await?;
     let response = broker_read(&mut stream).await?;
     Ok((response, stream))
+}
+
+/// Ask the broker to store a secret an endpoint just minted, and to name the
+/// sentinel that stands for it.
+async fn broker_mint(config: &OAuthSecret, field: &str, value: &str) -> io::Result<String> {
+    let response: MintResponse = broker_call(
+        &config.broker_endpoint,
+        &BrokerRequest::Mint {
+            grant_id: &config.grant_id,
+            field,
+            value,
+        },
+    )
+    .await?;
+    if !response.ok {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "OAuth broker refused to mint a secret",
+        ));
+    }
+    response.sentinel.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth broker omitted the minted sentinel",
+        )
+    })
 }
 
 async fn broker_commit(
@@ -1629,7 +2149,7 @@ fn parse_https_endpoint(endpoint: &str) -> io::Result<Endpoint> {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid OAuth endpoint port")
             })?,
         ),
-        None => (authority, 443),
+        None => (authority, DEFAULT_HTTPS_PORT),
     };
     if host.is_empty() || authority.contains('@') {
         return Err(io::Error::new(
@@ -1835,6 +2355,83 @@ fn parse_token_response(data: &[u8]) -> io::Result<Option<HttpMessage<'_>>> {
     }))
 }
 
+fn parse_mint_response(data: &[u8]) -> io::Result<Option<MintMessage>> {
+    let Some(header_end) = header_boundary(data) else {
+        return Ok(None);
+    };
+    let headers = data[..header_end].to_vec();
+    match response_body_state(&headers, false)? {
+        ResponseScrubState::ContentLength(length) => {
+            let total_len = header_end.checked_add(length).ok_or_else(invalid_http)?;
+            if total_len > MAX_OAUTH_MESSAGE_BYTES {
+                return Err(invalid_http());
+            }
+            if data.len() < total_len {
+                return Ok(None);
+            }
+            Ok(Some(MintMessage {
+                headers,
+                body: data[header_end..total_len].to_vec(),
+                total_len,
+            }))
+        }
+        ResponseScrubState::ChunkSize => {
+            let Some((body, consumed)) = collect_chunked_body(&data[header_end..])? else {
+                return Ok(None);
+            };
+            Ok(Some(MintMessage {
+                headers,
+                body,
+                total_len: header_end + consumed,
+            }))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth mint endpoint responses require Content-Length or chunked framing",
+        )),
+    }
+}
+
+/// De-chunk a body, reporting how many bytes of `data` it took. `None` means
+/// the terminating chunk and its trailers have not arrived yet.
+fn collect_chunked_body(data: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
+    let mut body = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let Some(end) = line_boundary(&data[cursor..]) else {
+            return Ok(None);
+        };
+        let size = parse_chunk_size(&data[cursor..cursor + end])?;
+        cursor += end;
+        if size == 0 {
+            // The trailers, if any, end at the first blank line.
+            loop {
+                let Some(end) = line_boundary(&data[cursor..]) else {
+                    return Ok(None);
+                };
+                let line = &data[cursor..cursor + end];
+                cursor += end;
+                if line == b"\r\n" {
+                    return Ok(Some((body, cursor)));
+                }
+            }
+        }
+        let chunk_end = cursor.checked_add(size).ok_or_else(invalid_http)?;
+        if chunk_end > MAX_OAUTH_MESSAGE_BYTES {
+            return Err(invalid_http());
+        }
+        if data.len() < chunk_end + 2 {
+            return Ok(None);
+        }
+        body.extend_from_slice(&data[cursor..chunk_end]);
+        cursor = chunk_end;
+        if &data[cursor..cursor + 2] != b"\r\n" {
+            return Err(invalid_http());
+        }
+        cursor += 2;
+    }
+}
+
 fn request_body_framing(headers: &[u8]) -> io::Result<RequestBodyFraming> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
     let mut content_length = None;
@@ -1906,13 +2503,106 @@ fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
     })
 }
 
-fn reject_expect_100_continue(headers: &[u8]) -> io::Result<()> {
+/// Whether a request line reached exactly this mint endpoint. The endpoint
+/// names a host and a target rather than a URL, because that is what a request
+/// on an intercepted connection carries: the TLS SNI and the request target.
+fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, port: u16, target: &str) -> PathMatch {
+    if !mint_endpoint_here(endpoint, sni, port) {
+        return PathMatch::None;
+    }
+    match_endpoint_path(&endpoint.path, target)
+}
+
+/// Whether a mint endpoint is served by the host and port of this connection.
+///
+/// A mint endpoint names a host and a path rather than a URL, so its port is
+/// its own optional field, defaulting to the HTTPS port the rest of the
+/// configuration's URLs default to.
+fn mint_endpoint_here(endpoint: &MintEndpoint, sni: &str, port: u16) -> bool {
+    endpoint.port.unwrap_or(DEFAULT_HTTPS_PORT) == port && endpoint.host.eq_ignore_ascii_case(sni)
+}
+
+/// Refuse a request target this proxy would have to normalise to compare.
+///
+/// The comparison against a configured path is a byte comparison, and the
+/// number of ways to spell one path — percent-encoding, dot segments, doubled
+/// slashes, an absolute-form target, a stray parameter — is not a list that
+/// can be completed. So the target is held to the already-normalised
+/// origin form instead: a path that is what it looks like. Everything else is
+/// refused on a connection carrying a protected endpoint, where guessing
+/// wrong in either direction ends with a credential in the sandbox.
+///
+/// Only the path is judged. A query string may hold anything a client wants
+/// to put in it, because nothing here is compared with it.
+fn reject_unnormalized_target(target: &str) -> io::Result<()> {
+    let refuse = || {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth request target is not an already-normalised origin-form path",
+        ))
+    };
+    let path = target.split('?').next().unwrap_or(target);
+    // An absolute-form (`https://host/path`) or authority-form target does not
+    // start with a slash, and neither does the asterisk-form of OPTIONS.
+    if !path.starts_with('/') {
+        return refuse();
+    }
+    if path.contains('%') || path.contains("//") || path.contains(';') || path.contains('#') {
+        return refuse();
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return refuse();
+    }
+    Ok(())
+}
+
+/// Compare a request target with a configured endpoint path.
+///
+/// The query string is not part of the path, so it is dropped before the
+/// comparison: an endpoint reached with `?retry=1` is still that endpoint, and
+/// treating it as somewhere else is how a guest would have a token or a minted
+/// key forwarded to it unread.
+///
+/// What is left is compared byte for byte, on a target
+/// [`reject_unnormalized_target`] has already held to the origin form. Two
+/// differences survive that: a trailing slash, and letter case. Neither is the
+/// same path by the letter of RFC 3986, and both are the same handler in
+/// plenty of routers, so each is reported as [`PathMatch::Equivalent`] —
+/// neither accepted nor ignored, because which of the two the upstream host
+/// agrees with is not ours to guess when a credential rides on the answer.
+fn match_endpoint_path(path: &str, target: &str) -> PathMatch {
+    let target_path = target.split('?').next().unwrap_or(target);
+    if target_path == path {
+        return PathMatch::Exact;
+    }
+    if without_trailing_slash(target_path).eq_ignore_ascii_case(without_trailing_slash(path)) {
+        return PathMatch::Equivalent;
+    }
+    PathMatch::None
+}
+
+/// A path without the trailing slash it may or may not carry.
+fn without_trailing_slash(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some("") | None => path,
+        Some(trimmed) => trimmed,
+    }
+}
+
+fn expects_100_continue(headers: &[u8]) -> io::Result<bool> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
-    if text.lines().any(|line| {
+    Ok(text.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue")
         })
-    }) {
+    }))
+}
+
+fn reject_expect_100_continue(headers: &[u8]) -> io::Result<()> {
+    if expects_100_continue(headers)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "OAuth Expect: 100-continue is unsupported",
@@ -1974,6 +2664,28 @@ fn rebuild_message(headers: &[u8], body: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
     output.push_str("\r\n");
+    let mut bytes = output.into_bytes();
+    bytes.extend_from_slice(body);
+    Ok(bytes)
+}
+
+/// Rebuild a message around an identity-framed body, dropping whatever
+/// framing the original carried.
+fn rebuild_identity_message(headers: &[u8], body: &[u8]) -> io::Result<Vec<u8>> {
+    let boundary = header_boundary(headers).ok_or_else(invalid_http)?;
+    let text = std::str::from_utf8(&headers[..boundary]).map_err(|_| invalid_http())?;
+    let mut output = String::new();
+    for line in text.trim_end_matches("\r\n\r\n").split("\r\n") {
+        if line.split_once(':').is_some_and(|(name, _)| {
+            name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+        }) {
+            continue;
+        }
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     let mut bytes = output.into_bytes();
     bytes.extend_from_slice(body);
     Ok(bytes)
@@ -2066,6 +2778,7 @@ mod tests {
             device_code_endpoint: None,
             poll_endpoint: None,
             poll_secret_fields: vec![],
+            mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
             access_token_field: "access_token".into(),
             refresh_token_field: "refresh_token".into(),
@@ -2090,6 +2803,12 @@ mod tests {
         sentinels: Option<(String, String)>,
         /// Sentinels the next `commit` mints for the tokens it stores.
         commit_sentinels: Option<(String, String)>,
+        /// Secrets minted so far, reported back on every `load` and `acquire`.
+        minted: Vec<(String, String)>,
+        /// Every `mint` request the broker was sent.
+        mints: Vec<Value>,
+        /// Whether the broker refuses to store a minted secret.
+        refuse_mint: bool,
     }
 
     /// A JWT-shaped sentinel: a real header and payload, a random signature.
@@ -2128,6 +2847,26 @@ mod tests {
         fn set_commit_sentinels(&self, access: &str, refresh: &str) {
             self.state.lock().unwrap().commit_sentinels = Some((access.into(), refresh.into()));
         }
+
+        fn mints(&self) -> Vec<Value> {
+            self.state.lock().unwrap().mints.clone()
+        }
+
+        /// Refuse the next `mint`, the way a broker with no room for the
+        /// grant, or no grant at all, answers.
+        fn refuse_mint(&self) {
+            self.state.lock().unwrap().refuse_mint = true;
+        }
+
+        /// Report this secret as already minted, as it would be to a
+        /// connection opened after the one that minted it.
+        fn add_minted(&self, sentinel: &str, value: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .minted
+                .push((sentinel.into(), value.into()));
+        }
     }
 
     impl Drop for FakeBroker {
@@ -2151,6 +2890,9 @@ mod tests {
             commits: Vec::new(),
             sentinels: None,
             commit_sentinels: None,
+            minted: Vec::new(),
+            mints: Vec::new(),
+            refuse_mint: false,
         }));
         let task = tokio::spawn({
             let state = Arc::clone(&state);
@@ -2177,7 +2919,38 @@ mod tests {
                                             reply["access_sentinel"] = access.into();
                                             reply["refresh_sentinel"] = refresh.into();
                                         }
+                                        if !state.minted.is_empty() {
+                                            reply["minted"] = state
+                                                .minted
+                                                .iter()
+                                                .map(|(sentinel, value)| {
+                                                    serde_json::json!({
+                                                        "sentinel": sentinel,
+                                                        "value": value,
+                                                    })
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .into();
+                                        }
                                         reply
+                                    }
+                                    "mint" => {
+                                        state.mints.push(request.clone());
+                                        if state.refuse_mint {
+                                            serde_json::json!({
+                                                "ok": false,
+                                                "error": "grant may not mint",
+                                            })
+                                        } else {
+                                            let sentinel = format!(
+                                                "$MSB_OAUTH_MINT_{:02}",
+                                                state.minted.len()
+                                            );
+                                            let value =
+                                                request["value"].as_str().unwrap().to_string();
+                                            state.minted.push((sentinel.clone(), value));
+                                            serde_json::json!({"ok": true, "sentinel": sentinel})
+                                        }
                                     }
                                     "commit" => {
                                         assert_eq!(request["generation"], state.generation);
@@ -2273,12 +3046,17 @@ mod tests {
             generation: 4,
             lease: None,
             poll_secrets: Vec::new(),
+            minted: Vec::new(),
         }
     }
 
     fn connection_for(configs: Vec<OAuthSecret>) -> OAuthConnection {
+        let grants: Vec<LoadedGrant> = configs.into_iter().map(loaded).collect();
+        let mints_configured = grants
+            .iter()
+            .any(|grant| !grant.config.mint_endpoints.is_empty());
         OAuthConnection {
-            grants: configs.into_iter().map(loaded).collect(),
+            grants,
             request_buffer: vec![],
             response_buffer: vec![],
             exchanges: VecDeque::new(),
@@ -2288,12 +3066,13 @@ mod tests {
             response_scrub_framing: Vec::new(),
             response_scrub_tail: Vec::new(),
             response_scrub_state: ResponseScrubState::Headers,
-            response_head_requests: VecDeque::new(),
+            pending_responses: VecDeque::new(),
             seen_tokens: vec![
                 Zeroizing::new("real-access".into()),
                 Zeroizing::new("real-refresh".into()),
             ],
             request_state: RequestState::Headers,
+            mints_configured,
         }
     }
 
@@ -2424,8 +3203,11 @@ mod tests {
     async fn api_request_metadata_is_bounded_before_forwarding() {
         let mut connection = connection();
         connection
-            .response_head_requests
-            .resize(MAX_OUTSTANDING_API_REQUESTS, false);
+            .pending_responses
+            .resize_with(MAX_OUTSTANDING_API_REQUESTS, || PendingResponse {
+                head: false,
+                mint: None,
+            });
 
         let error = connection
             .transform_requests(
@@ -2438,7 +3220,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "too many outstanding OAuth API requests");
         assert_eq!(
-            connection.response_head_requests.len(),
+            connection.pending_responses.len(),
             MAX_OUTSTANDING_API_REQUESTS
         );
     }
@@ -2522,7 +3304,7 @@ mod tests {
                 error.to_string(),
                 "OAuth API protocol upgrades are unsupported"
             );
-            assert!(connection.response_head_requests.is_empty());
+            assert!(connection.pending_responses.is_empty());
         }
     }
 
@@ -2843,17 +3625,19 @@ mod tests {
         assert_eq!(json["nested"]["access"], "***********");
     }
 
-    #[test]
-    fn api_response_echoes_are_scrubbed() {
+    #[tokio::test]
+    async fn api_response_echoes_are_scrubbed() {
         let mut connection = connection();
         let input =
             b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nechoed real-access and real-refresh";
         let mut output = connection
             .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nechoed real-ac")
+            .await
             .unwrap();
         output.extend(
             connection
                 .scrub_response_chunk(b"cess and real-refresh")
+                .await
                 .unwrap(),
         );
         assert_eq!(output.len(), input.len());
@@ -2974,22 +3758,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_scrubbing_preserves_innocent_token_prefix_at_response_end() {
+    #[tokio::test]
+    async fn response_scrubbing_preserves_innocent_token_prefix_at_response_end() {
         let mut connection = connection();
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\ninnocent real-ac";
-        let output = connection.scrub_response_chunk(response).unwrap();
+        let output = connection.scrub_response_chunk(response).await.unwrap();
 
         assert_eq!(output, response);
     }
 
-    #[test]
-    fn response_scrubbing_redacts_a_token_split_across_reads() {
+    #[tokio::test]
+    async fn response_scrubbing_redacts_a_token_split_across_reads() {
         let mut connection = connection();
         let mut output = connection
             .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\necho real-ac")
+            .await
             .unwrap();
-        output.extend(connection.scrub_response_chunk(b"cess done").unwrap());
+        output.extend(connection.scrub_response_chunk(b"cess done").await.unwrap());
 
         assert_eq!(
             output,
@@ -2997,22 +3782,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_boundary_flushes_matcher_tail_on_keep_alive() {
+    #[tokio::test]
+    async fn response_boundary_flushes_matcher_tail_on_keep_alive() {
         let mut connection = connection();
         let responses = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nreal-acHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ncess";
-        let output = connection.scrub_response_chunk(responses).unwrap();
+        let output = connection.scrub_response_chunk(responses).await.unwrap();
 
         assert_eq!(output, responses);
     }
 
-    #[test]
-    fn chunked_response_redacts_token_split_across_chunks() {
+    #[tokio::test]
+    async fn chunked_response_redacts_token_split_across_chunks() {
         let mut connection = connection();
         let first = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nreal-\r\n";
         let second = b"6\r\naccess\r\n0\r\n\r\n";
-        let mut output = connection.scrub_response_chunk(first).unwrap();
-        output.extend(connection.scrub_response_chunk(second).unwrap());
+        let mut output = connection.scrub_response_chunk(first).await.unwrap();
+        output.extend(connection.scrub_response_chunk(second).await.unwrap());
 
         assert_eq!(
             output,
@@ -3020,12 +3805,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chunked_response_redacts_tokens_in_extensions() {
+    #[tokio::test]
+    async fn chunked_response_redacts_tokens_in_extensions() {
         let mut connection = connection();
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;token=real-access\r\nbody\r\n0\r\n\r\n";
 
-        let output = connection.scrub_response_chunk(response).unwrap();
+        let output = connection.scrub_response_chunk(response).await.unwrap();
 
         assert_eq!(output.len(), response.len());
         assert!(
@@ -3035,8 +3820,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unresolved_token_prefix_cannot_grow_chunk_framing_past_limit() {
+    #[tokio::test]
+    async fn unresolved_token_prefix_cannot_grow_chunk_framing_past_limit() {
         let mut connection = connection();
         connection.seen_tokens = vec![Zeroizing::new("aaa".into())];
         let extension = "x".repeat(MAX_RESPONSE_SCRUB_FRAMING_BYTES / 2);
@@ -3046,11 +3831,16 @@ mod tests {
             .scrub_response_chunk(
                 format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{chunk}").as_bytes(),
             )
+            .await
             .unwrap();
-        connection.scrub_response_chunk(chunk.as_bytes()).unwrap();
+        connection
+            .scrub_response_chunk(chunk.as_bytes())
+            .await
+            .unwrap();
         let framing_len = connection.response_scrub_framing.len();
         let error = connection
             .scrub_response_chunk(chunk.as_bytes())
+            .await
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -3082,25 +3872,28 @@ mod tests {
         assert_eq!(response, b"******* overflow-token");
     }
 
-    #[test]
-    fn encoded_api_response_is_rejected_before_headers_are_released() {
+    #[tokio::test]
+    async fn encoded_api_response_is_rejected_before_headers_are_released() {
         let mut connection = connection();
         let response =
             b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\n\r\nreal-access";
 
-        let error = connection.scrub_response_chunk(response).unwrap_err();
+        let error = connection.scrub_response_chunk(response).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "encoded OAuth responses are unsupported");
     }
 
-    #[test]
-    fn switching_protocols_response_is_rejected_before_release() {
+    #[tokio::test]
+    async fn switching_protocols_response_is_rejected_before_release() {
         let mut connection = connection();
-        connection.response_head_requests.push_back(false);
+        connection.pending_responses.push_back(PendingResponse {
+            head: false,
+            mint: None,
+        });
         let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
-        let error = connection.scrub_response_chunk(response).unwrap_err();
+        let error = connection.scrub_response_chunk(response).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
@@ -3109,14 +3902,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn head_response_completes_at_headers_on_keep_alive() {
+    #[tokio::test]
+    async fn head_response_completes_at_headers_on_keep_alive() {
         let mut connection = connection();
-        connection.response_head_requests.push_back(true);
-        connection.response_head_requests.push_back(false);
+        connection.pending_responses.push_back(PendingResponse {
+            head: true,
+            mint: None,
+        });
+        connection.pending_responses.push_back(PendingResponse {
+            head: false,
+            mint: None,
+        });
         let responses = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
 
-        let output = connection.scrub_response_chunk(responses).unwrap();
+        let output = connection.scrub_response_chunk(responses).await.unwrap();
 
         assert_eq!(output, responses);
     }
@@ -3890,8 +4689,8 @@ mod tests {
         assert_eq!(lowercased, request.as_bytes());
     }
 
-    #[test]
-    fn scrubbing_carries_a_split_token_without_touching_a_jwt_sentinel() {
+    #[tokio::test]
+    async fn scrubbing_carries_a_split_token_without_touching_a_jwt_sentinel() {
         let body = format!(r#"{{"token":"real-access","sentinel":"{JWT_ACCESS_SENTINEL}"}}"#);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
@@ -3911,15 +4710,20 @@ mod tests {
         let second = response.len() - 12;
         assert!(first > token_at && first < token_at + b"real-access".len());
         assert!(second > response.len() - JWT_ACCESS_SENTINEL.len());
-        let mut output = connection.scrub_response_chunk(&response[..first]).unwrap();
+        let mut output = connection
+            .scrub_response_chunk(&response[..first])
+            .await
+            .unwrap();
         output.extend(
             connection
                 .scrub_response_chunk(&response[first..second])
+                .await
                 .unwrap(),
         );
         output.extend(
             connection
                 .scrub_response_chunk(&response[second..])
+                .await
                 .unwrap(),
         );
         output.extend(connection.finish_response_scrubbing().unwrap());
@@ -4248,5 +5052,732 @@ mod tests {
             error.to_string(),
             "OAuth broker sentinel overlaps a live token"
         );
+    }
+
+    /// Anthropic's console mode: the CLI posts to an inject host with the
+    /// access token and is handed a brand new API key in `raw_key`.
+    fn anthropic_config(broker: &FakeBroker) -> OAuthSecret {
+        let mut config = broker_config(broker);
+        config.token_endpoint = "https://console.anthropic.com/v1/oauth/token".into();
+        config.inject_hosts = vec![HostPattern::Exact("api.anthropic.com".into())];
+        config.mint_endpoints = vec![MintEndpoint {
+            host: "api.anthropic.com".into(),
+            path: "/api/oauth/claude_cli/create_api_key".into(),
+            field: "raw_key".into(),
+            port: None,
+        }];
+        config
+    }
+
+    const RAW_KEY: &str = "sk-ant-api03-real-minted-key";
+
+    #[tokio::test]
+    async fn a_minted_api_key_is_sentineled_and_substituted_back() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        let request = json_request(
+            "/api/oauth/claude_cli/create_api_key",
+            r#"{"scopes":["user:inference"]}"#,
+        );
+        connection
+            .transform_requests(request.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        assert!(
+            response.contains(RAW_KEY),
+            "the upstream body carries the key"
+        );
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(!output.contains(RAW_KEY), "guest body: {output}");
+        assert!(
+            output.contains("$MSB_OAUTH_MINT_00"),
+            "guest body: {output}"
+        );
+        assert_eq!(broker.mints().len(), 1);
+        assert_eq!(broker.mints()[0]["action"], "mint");
+        assert_eq!(broker.mints()[0]["grant_id"], "opaque-grant");
+        assert_eq!(broker.mints()[0]["field"], "raw_key");
+        assert_eq!(broker.mints()[0]["value"], RAW_KEY);
+        assert!(
+            connection
+                .seen_tokens
+                .iter()
+                .any(|token| token.as_str() == RAW_KEY),
+            "the real key is scrubbed out of later responses",
+        );
+
+        // The guest sends the sentinel back in the header an API key travels
+        // in, and the real key goes upstream.
+        let keyed = "GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: $MSB_OAUTH_MINT_00\r\n\r\n";
+        let upstream = connection
+            .transform_requests(keyed.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+        let upstream = String::from_utf8(upstream).unwrap();
+        assert!(
+            upstream.contains(&format!("x-api-key: {RAW_KEY}")),
+            "{upstream}"
+        );
+
+        // And in a JSON body, whose length is corrected on the way out.
+        let body = r#"{"key":"$MSB_OAUTH_MINT_00"}"#;
+        let bodied = json_request("/v1/messages", body);
+        let upstream = connection
+            .transform_requests(bodied.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+        let upstream = String::from_utf8(upstream).unwrap();
+        let expected = format!(r#"{{"key":"{RAW_KEY}"}}"#);
+        assert!(upstream.ends_with(&expected), "{upstream}");
+        assert!(
+            upstream.contains(&format!("Content-Length: {}", expected.len())),
+            "{upstream}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_will_not_mint_fails_the_response_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        broker.refuse_mint();
+
+        let request = json_request("/api/oauth/claude_cli/create_api_key", "{}");
+        connection
+            .transform_requests(request.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let error = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "OAuth broker refused to mint a secret");
+    }
+
+    #[tokio::test]
+    async fn a_minted_secret_the_broker_reports_substitutes_on_a_fresh_connection() {
+        let broker = start_broker("real-access", "real-refresh");
+        broker.add_minted("$MSB_OAUTH_MINT_00", RAW_KEY);
+        let config = anthropic_config(&broker);
+
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        assert_eq!(connection.grants[0].minted.len(), 1);
+        let keyed = "GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer $MSB_OAUTH_MINT_00\r\n\r\n";
+        let upstream = connection
+            .transform_requests(keyed.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+
+        let upstream = String::from_utf8(upstream).unwrap();
+        assert!(
+            upstream.contains(&format!("Bearer {RAW_KEY}")),
+            "{upstream}"
+        );
+    }
+
+    #[tokio::test]
+    async fn minted_secrets_per_grant_are_bounded() {
+        let broker = start_broker("real-access", "real-refresh");
+        for index in 0..=MAX_GRANT_MINTED_SECRETS {
+            broker.add_minted(
+                &format!("$MSB_OAUTH_MINT_{index:02}"),
+                &format!("minted-secret-{index:02}"),
+            );
+        }
+        let config = anthropic_config(&broker);
+
+        let Err(error) = OAuthConnection::new(&[config], "api.anthropic.com", 443, None).await
+        else {
+            panic!("the connection must not open past the minted secret bound");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "too many OAuth minted secrets for one grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_carrying_a_query_still_reaches_the_configured_endpoint() {
+        // The query is not part of the path, so appending one must not turn a
+        // token request into an API request whose response nothing sanitizes.
+        let body = r#"{"refresh":"$MSB_OAUTH_REFRESH_123"}"#;
+        let request = format!(
+            "POST /oauth/token?retry=1 HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut connection = connection();
+        connection.grants[0].lease = Some(UnixStream::pair().unwrap().0);
+
+        let output = connection
+            .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("real-refresh"), "{output}");
+        assert!(!output.contains("$MSB_OAUTH_"), "{output}");
+        assert_eq!(connection.exchanges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mint_target_carrying_a_query_still_mints() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        let request = json_request("/api/oauth/claude_cli/create_api_key?source=cli", "{}");
+        connection
+            .transform_requests(request.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains(RAW_KEY), "{output}");
+        assert!(output.contains("$MSB_OAUTH_MINT_00"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_mint_response_is_read_and_handed_back_with_a_length() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+
+        let body = format!(r#"{{"raw_key":"{RAW_KEY}"}}"#);
+        let (first, second) = body.split_at(10);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len(),
+        );
+        // Split mid-body: the response is only rewritten once all of it is in.
+        let split = response.len() - 12;
+        let held = connection
+            .scrub_response_chunk(&response.as_bytes()[..split])
+            .await
+            .unwrap();
+        assert!(held.is_empty(), "nothing is released before the last chunk");
+
+        let output = connection
+            .scrub_response_chunk(&response.as_bytes()[split..])
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains(RAW_KEY), "{output}");
+        assert!(output.contains("$MSB_OAUTH_MINT_00"), "{output}");
+        assert!(
+            !output.to_ascii_lowercase().contains("transfer-encoding"),
+            "{output}"
+        );
+        let minted = r#"{"raw_key":"$MSB_OAUTH_MINT_00"}"#;
+        assert!(output.ends_with(minted), "{output}");
+        assert!(
+            output.contains(&format!("Content-Length: {}", minted.len())),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unframed_response_on_a_minting_connection_fails_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        // An ordinary API response, which the scrubber has to follow to its
+        // end so that it knows where the mint response begins.
+        connection
+            .transform_requests(
+                b"GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n",
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let error = connection
+            .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth responses on a minting connection require Content-Length or chunked framing"
+        );
+
+        // And the mint response itself, which is read whole or not at all.
+        let mut connection =
+            OAuthConnection::new(&[anthropic_config(&broker)], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let error = connection
+            .scrub_response_chunk(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth mint endpoint responses require Content-Length or chunked framing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unframed_response_without_a_mint_endpoint_streams_untouched() {
+        // Nothing on a connection without mint endpoints has to be read
+        // whole, so the framing rule above must not reach it.
+        let mut connection = connection();
+        connection.pending_responses.push_back(PendingResponse {
+            head: false,
+            mint: None,
+        });
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
+
+        let output = connection.scrub_response_chunk(response).await.unwrap();
+
+        assert_eq!(output, response);
+        assert!(connection.finish_response_scrubbing().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_held_request_body_is_not_a_new_place_to_substitute_the_access_sentinel() {
+        // Holding the body so a minted sentinel in it can be substituted must
+        // not widen where the access token goes: on an inject host it belongs
+        // in a bearer header and nowhere else.
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        let body = r#"{"token":"$MSB_OAUTH_ACCESS_123"}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let output = connection
+            .transform_requests(request.as_bytes(), "api.anthropic.com")
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Bearer real-access"), "{output}");
+        assert!(output.ends_with(body), "{output}");
+    }
+
+    /// A grant whose whole device flow lives on one host, so the near-miss
+    /// arms for the device code and poll endpoints have something to hit.
+    fn device_flow_config() -> OAuthSecret {
+        let mut config = config();
+        config.device_code_endpoint = Some("https://auth.example.com/oauth/device/code".into());
+        config.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn a_target_this_proxy_would_have_to_normalise_is_refused() {
+        // Every one of these is a spelling of a path, and which of them the
+        // upstream host resolves to the token endpoint is its business, not a
+        // guess to make with a refresh token riding on the answer.
+        for target in [
+            "//oauth/token",
+            "/oauth%2Ftoken",
+            "/%2e/oauth/token",
+            "/oauth/./token",
+            "/oauth/x/../token",
+            "/oauth/token%20",
+            "https://auth.example.com/oauth/token",
+            "auth.example.com:443",
+            "*",
+            "/oauth/token;v=1",
+            "/oauth/token#fragment",
+            "//oauth/token?retry=1",
+        ] {
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
+            );
+            let mut connection = connection_for(vec![device_flow_config()]);
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth request target is not an already-normalised origin-form path",
+                "target {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trailing_slash_or_a_change_of_case_fails_closed() {
+        // The two differences the origin-form rule lets through, and the two
+        // plenty of routers treat as the same handler.
+        for (target, kind) in [
+            ("/oauth/token/", "token"),
+            ("/oauth/device/code/", "device code"),
+            ("/oauth/device/token/", "poll"),
+            ("/OAUTH/TOKEN", "token"),
+            ("/oauth/Device/code", "device code"),
+            ("/oauth/device/TOKEN/", "poll"),
+        ] {
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: auth.example.com\r\nContent-Length: 0\r\n\r\n"
+            );
+            let mut connection = connection_for(vec![device_flow_config()]);
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("OAuth {kind} endpoint request target is not the configured path"),
+                "target {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inject_host_without_an_endpoint_keeps_its_own_targets() {
+        // Nothing on this connection is compared with a request target, so
+        // the origin-form rule has no business narrowing what the guest may
+        // ask an ordinary API for.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut connection = connection_for(vec![broker_config(&broker)]);
+        let request = "GET /v1/files/a%20b//c HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+        let output = connection
+            .transform_requests(request.as_bytes(), "api.example.com")
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("/v1/files/a%20b//c"),
+            "the target reaches the upstream host as it was written",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_near_miss_mint_target_fails_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        for (target, expected) in [
+            (
+                "//api/oauth/claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api%2Foauth/claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api/oauth/claude_cli/../claude_cli/create_api_key",
+                "OAuth request target is not an already-normalised origin-form path",
+            ),
+            (
+                "/api/oauth/claude_cli/create_api_key/",
+                "OAuth mint endpoint request target is not the configured path",
+            ),
+            (
+                "/api/oauth/claude_cli/Create_API_Key",
+                "OAuth mint endpoint request target is not the configured path",
+            ),
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            let request = json_request(target, "{}");
+
+            let error = connection
+                .transform_requests(request.as_bytes(), "api.anthropic.com")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected, "target {target}");
+        }
+        assert!(broker.mints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_on_another_port_is_not_this_connection() {
+        // The other endpoints match on the port in their URL; a mint endpoint
+        // says its port itself, and a connection to another one is not it.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].port = Some(8443);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), response);
+        assert!(broker.mints().is_empty());
+
+        // On the port it names, the same request mints.
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].port = Some(8443);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 8443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        assert!(!String::from_utf8(output).unwrap().contains(RAW_KEY));
+        assert_eq!(broker.mints().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mint_response_without_the_field_fails_closed() {
+        // The detector that would otherwise notice a credential in an
+        // unrecognised body is off here: a grant is relevant to this
+        // connection. So the endpoint answers in the shape it was configured
+        // for, or the connection ends.
+        let broker = start_broker("real-access", "real-refresh");
+        for body in [
+            r#"{"ok":true}"#,
+            r#"{"raw_key":{"nested":"no"}}"#,
+            r#"["raw_key"]"#,
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+
+            let error = connection
+                .scrub_response_chunk(json_response(200, body).as_bytes())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth mint endpoint response did not carry field raw_key",
+                "body {body}"
+            );
+        }
+        assert!(broker.mints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_error_or_non_json_response_is_forwarded_as_it_is() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+
+        let responses = [
+            json_response(400, r#"{"error":"invalid_scope"}"#),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 8\r\n\r\nnot json"
+                .to_string(),
+        ];
+        for response in responses {
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+
+            let output = connection
+                .scrub_response_chunk(response.as_bytes())
+                .await
+                .unwrap();
+
+            assert_eq!(String::from_utf8(output).unwrap(), response);
+        }
+        assert!(
+            broker.mints().is_empty(),
+            "neither response minted anything",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_before_the_mint_response_reaches_the_guest_unchanged() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                b"GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n",
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+
+        // Both responses arrive in one read, the way a pipelining server's do.
+        let first = json_response(200, r#"{"models":["a"]}"#);
+        let second = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        let output = connection
+            .scrub_response_chunk(format!("{first}{second}").as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(&first), "{output}");
+        assert!(!output.contains(RAW_KEY), "{output}");
+        assert!(output.contains("$MSB_OAUTH_MINT_00"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_mint_response_drops_its_trailers() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = anthropic_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "api.anthropic.com",
+            )
+            .await
+            .unwrap();
+
+        let body = format!(r#"{{"raw_key":"{RAW_KEY}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTrailer: X-Checksum\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\nX-Checksum: abc\r\n\r\n",
+            body.len(),
+        );
+
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        // The body is identity-framed now, so a trailer has nowhere to live.
+        assert!(!output.contains("X-Checksum: abc"), "{output}");
+        assert!(
+            output.ends_with(r#"{"raw_key":"$MSB_OAUTH_MINT_00"}"#),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_malformed_chunked_mint_response_fails_closed() {
+        let broker = start_broker("real-access", "real-refresh");
+        for chunks in [
+            // A chunk that claims more than any OAuth message may carry.
+            "fffffffff\r\n",
+            // A size line that is not a size.
+            "zz\r\nbody\r\n0\r\n\r\n",
+            // A chunk whose data is not followed by CRLF.
+            "4\r\nbodyX0\r\n\r\n",
+        ] {
+            let config = anthropic_config(&broker);
+            let mut connection = OAuthConnection::new(&[config], "api.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            connection
+                .transform_requests(
+                    json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                    "api.anthropic.com",
+                )
+                .await
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}"
+            );
+
+            let error = connection
+                .scrub_response_chunk(response.as_bytes())
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "chunks {chunks:?}"
+            );
+        }
+        assert!(broker.mints().is_empty());
     }
 }

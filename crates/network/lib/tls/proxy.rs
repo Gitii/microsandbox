@@ -22,6 +22,7 @@ use crate::conn::ProxyConnectState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::connect_upstream;
 use crate::secrets::config::ViolationAction;
+use crate::secrets::detector::CredentialDetector;
 use crate::secrets::handler::SecretsHandler;
 use crate::secrets::oauth::OAuthConnection;
 use crate::shared::SharedState;
@@ -339,6 +340,16 @@ pub(crate) async fn intercept_relay(
         .await?
     };
 
+    // Nothing on this connection substitutes or sanitizes when no grant is
+    // relevant to it, so that is exactly where a credential-shaped response
+    // means the catalogue is missing an endpoint.
+    let mut detector = CredentialDetector::new(
+        &secrets.oauth,
+        sni_name,
+        connect_dst.port(),
+        oauth.is_empty(),
+    );
+
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
         .get_or_generate_cert(sni_name)
@@ -413,6 +424,7 @@ pub(crate) async fn intercept_relay(
         &mut server_tls,
         &mut secrets_handler,
         &mut oauth,
+        &mut detector,
         &mut traffic,
         &shared,
         &mut plaintext_buf,
@@ -453,6 +465,7 @@ pub(crate) async fn intercept_relay(
                         &mut server_tls,
                         &mut secrets_handler,
                         &mut oauth,
+                        &mut detector,
                         &mut traffic,
                         &shared,
                         &mut plaintext_buf,
@@ -478,8 +491,9 @@ pub(crate) async fn intercept_relay(
                         let data = if oauth.is_token_host() {
                             oauth.transform_responses(&server_buf[..n]).await?
                         } else if !oauth.is_empty() {
-                            oauth.scrub_response_chunk(&server_buf[..n])?
+                            oauth.scrub_response_chunk(&server_buf[..n]).await?
                         } else {
+                            detector.observe_response(&server_buf[..n]);
                             server_buf[..n].to_vec()
                         };
                         if data.is_empty() {
@@ -540,11 +554,13 @@ pub(crate) async fn extract_sni_from_channel(
 /// Read all available decrypted plaintext from the guest-facing TLS
 /// connection and forward it to the upstream server, applying secret
 /// substitution when configured.
+#[allow(clippy::too_many_arguments)]
 async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
     oauth: &mut OAuthConnection,
+    detector: &mut CredentialDetector,
     traffic: &mut TrafficTrace<'_>,
     shared: &SharedState,
     buf: &mut [u8],
@@ -560,6 +576,7 @@ async fn forward_plaintext(
         };
 
         traffic.record("guest-request", &buf[..n]);
+        detector.observe_request(&buf[..n]);
 
         if secrets_handler.is_empty() && oauth.is_empty() {
             server_tls.write_all(&buf[..n]).await?;

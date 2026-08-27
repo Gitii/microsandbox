@@ -1722,19 +1722,28 @@ type SecretOptions struct {
 
 // OAuthSecretOptions is the durable JSON representation of an OAuth grant.
 type OAuthSecretOptions struct {
-	BrokerEndpoint     string   `json:"broker_endpoint"`
-	GrantID            string   `json:"grant_id"`
-	TokenEndpoint      string   `json:"token_endpoint"`
-	DeviceCodeEndpoint string   `json:"device_code_endpoint,omitempty"`
-	PollEndpoint       string   `json:"poll_endpoint,omitempty"`
-	PollSecretFields   []string `json:"poll_secret_fields,omitempty"`
-	InjectHosts        []string `json:"inject_hosts"`
-	AccessTokenField   string   `json:"access_token_field"`
-	RefreshTokenField  string   `json:"refresh_token_field"`
-	AccessEnvVar       string   `json:"access_env_var"`
-	RefreshEnvVar      string   `json:"refresh_env_var"`
-	AccessSentinel     string   `json:"access_sentinel"`
-	RefreshSentinel    string   `json:"refresh_sentinel"`
+	BrokerEndpoint     string                     `json:"broker_endpoint"`
+	GrantID            string                     `json:"grant_id"`
+	TokenEndpoint      string                     `json:"token_endpoint"`
+	DeviceCodeEndpoint string                     `json:"device_code_endpoint,omitempty"`
+	PollEndpoint       string                     `json:"poll_endpoint,omitempty"`
+	PollSecretFields   []string                   `json:"poll_secret_fields,omitempty"`
+	MintEndpoints      []OAuthMintEndpointOptions `json:"mint_endpoints,omitempty"`
+	InjectHosts        []string                   `json:"inject_hosts"`
+	AccessTokenField   string                     `json:"access_token_field"`
+	RefreshTokenField  string                     `json:"refresh_token_field"`
+	AccessEnvVar       string                     `json:"access_env_var"`
+	RefreshEnvVar      string                     `json:"refresh_env_var"`
+	AccessSentinel     string                     `json:"access_sentinel"`
+	RefreshSentinel    string                     `json:"refresh_sentinel"`
+}
+
+// OAuthMintEndpointOptions is the JSON representation of one minting endpoint.
+type OAuthMintEndpointOptions struct {
+	Host  string `json:"host"`
+	Path  string `json:"path"`
+	Field string `json:"field"`
+	Port  uint16 `json:"port,omitempty"`
 }
 
 // PatchOptions is the JSON representation of a single rootfs patch.

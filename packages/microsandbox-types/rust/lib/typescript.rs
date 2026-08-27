@@ -15,9 +15,9 @@ use crate::{
     CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus, CloudSandboxStatusReason,
     CloudSecretEntry, CloudSecretSource, CloudSecretsConfig, CloudViolationAction,
     CloudVolumeMount, CpuPlacement, Destination, DestinationGroup, Direction, EnvVar, HandoffInit,
-    HostPattern, HostPermissions, MountOptions, NetworkPolicy, OAuthSecret, PortRange, Protocol,
-    Rule, SandboxLogLevel, SandboxPolicy, SecretInjection, SecurityProfile, StatVirtualization,
-    TransparentHugePagePolicy,
+    HostPattern, HostPermissions, MintEndpoint, MountOptions, NetworkPolicy, OAuthSecret,
+    PortRange, Protocol, Rule, SandboxLogLevel, SandboxPolicy, SecretInjection, SecurityProfile,
+    StatVirtualization, TransparentHugePagePolicy,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -39,6 +39,7 @@ const DOMAIN_TYPE_NAMES: &[&str] = &[
     "HandoffInit",
     "HostPermissions",
     "HostPattern",
+    "MintEndpoint",
     "MountOptions",
     "NetworkPolicy",
     "OAuthSecret",
@@ -123,6 +124,7 @@ pub fn domain_declarations() -> Vec<String> {
         TransparentHugePagePolicy::decl(&cfg),
         HostPermissions::decl(&cfg),
         HostPattern::decl(&cfg),
+        MintEndpoint::decl(&cfg),
         OAuthSecret::decl(&cfg),
         SecretInjection::decl(&cfg),
         NetworkPolicy::decl(&cfg),

@@ -1299,7 +1299,12 @@ type OAuthSecretConfig struct {
 	PollEndpoint string
 	// PollSecretFields names extra secret JSON fields in a poll response that
 	// are replaced with sentinels before the sandbox sees them.
-	PollSecretFields  []string
+	PollSecretFields []string
+	// MintEndpoints names exact endpoints whose response mints a new
+	// long-lived secret, such as an API key created from an OAuth session.
+	// The secret is stored by the broker and the sandbox is handed a
+	// sentinel instead.
+	MintEndpoints     []OAuthMintEndpoint
 	InjectHosts       []string
 	AccessTokenField  string
 	RefreshTokenField string
@@ -1307,6 +1312,19 @@ type OAuthSecretConfig struct {
 	RefreshEnvVar     string
 	AccessSentinel    string
 	RefreshSentinel   string
+}
+
+// OAuthMintEndpoint is one exact endpoint whose response mints a new secret.
+type OAuthMintEndpoint struct {
+	// Host is the bare hostname the request is addressed to.
+	Host string
+	// Path is the exact request path, with no query string of its own: a
+	// request is matched on its path, whatever query the sandbox appends.
+	Path string
+	// Field is the top-level JSON response field carrying the new secret.
+	Field string
+	// Port is the TCP port the endpoint is reached on. Zero means 443.
+	Port uint16
 }
 
 // secretFactory is the factory namespace matching Node's `Secret.env(...)` and

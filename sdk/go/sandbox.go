@@ -187,6 +187,15 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 		})
 	}
 	for _, grant := range o.OAuthSecrets {
+		var mints []ffi.OAuthMintEndpointOptions
+		for _, mint := range grant.MintEndpoints {
+			mints = append(mints, ffi.OAuthMintEndpointOptions{
+				Host:  mint.Host,
+				Path:  mint.Path,
+				Field: mint.Field,
+				Port:  mint.Port,
+			})
+		}
 		ffiOpts.OAuthSecrets = append(ffiOpts.OAuthSecrets, ffi.OAuthSecretOptions{
 			BrokerEndpoint:     grant.BrokerEndpoint,
 			GrantID:            grant.GrantID,
@@ -194,6 +203,7 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 			DeviceCodeEndpoint: grant.DeviceCodeEndpoint,
 			PollEndpoint:       grant.PollEndpoint,
 			PollSecretFields:   grant.PollSecretFields,
+			MintEndpoints:      mints,
 			InjectHosts:        grant.InjectHosts,
 			AccessTokenField:   grant.AccessTokenField,
 			RefreshTokenField:  grant.RefreshTokenField,

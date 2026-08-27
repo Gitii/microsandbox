@@ -41,6 +41,11 @@ pub struct LogArgs {
 
 const DENIAL_TARGET: &str = "microsandbox::network::policy::denial";
 
+/// Target of the credential-shaped-response detector's warnings. Like a
+/// denial, the finding is only ever seen by a consumer reading the runtime
+/// log, so it survives the silent default too.
+const DETECTOR_TARGET: &str = "microsandbox::network::secrets::detector";
+
 /// Install a tracing subscriber for the selected level.
 ///
 /// `ansi` controls whether the formatter emits color escape sequences.
@@ -65,7 +70,8 @@ pub fn init_tracing(log_level: Option<LogLevel>, ansi: bool) {
 }
 
 /// Install tracing for a sandbox subprocess whose stderr is its runtime log.
-/// With no requested diagnostic level, only policy denials remain visible.
+/// With no requested diagnostic level, only policy denials and
+/// credential-shaped-response warnings remain visible.
 pub fn init_sandbox_tracing(log_level: Option<LogLevel>) {
     let filter = sandbox_filter(log_level);
     tracing_subscriber::fmt()
@@ -80,11 +86,17 @@ fn sandbox_filter(log_level: Option<LogLevel>) -> EnvFilter {
         Some(level) => EnvFilter::new(level.as_tracing_level().to_string())
             // oci_client logs auth tokens at debug level.
             .add_directive("oci_client=info".parse::<Directive>().unwrap()),
-        None => EnvFilter::new("off").add_directive(
-            format!("{DENIAL_TARGET}=warn")
-                .parse::<Directive>()
-                .unwrap(),
-        ),
+        None => EnvFilter::new("off")
+            .add_directive(
+                format!("{DENIAL_TARGET}=warn")
+                    .parse::<Directive>()
+                    .unwrap(),
+            )
+            .add_directive(
+                format!("{DETECTOR_TARGET}=warn")
+                    .parse::<Directive>()
+                    .unwrap(),
+            ),
     }
 }
 
@@ -166,6 +178,19 @@ mod tests {
             assert!(tracing::enabled!(target: DENIAL_TARGET, Level::WARN));
             assert!(!tracing::enabled!(target: DENIAL_TARGET, Level::INFO));
             assert!(!tracing::enabled!(target: "oci_client", Level::INFO));
+        });
+    }
+
+    #[test]
+    fn test_sandbox_without_a_level_keeps_credential_detector_warnings() {
+        // The detector exists to say a credential reached the sandbox that
+        // nothing was watching for. A default that filtered it out would be
+        // the same silence it is built to break.
+        let subscriber = tracing_subscriber::registry().with(sandbox_filter(None));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: DETECTOR_TARGET, Level::WARN));
+            assert!(!tracing::enabled!(target: DETECTOR_TARGET, Level::INFO));
         });
     }
 
