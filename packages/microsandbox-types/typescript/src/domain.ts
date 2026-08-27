@@ -129,6 +129,10 @@ export type OAuthSecret = {
    * substituted back on a later token request. The real values are held in
    * memory for the life of the connection that received them, so the
    * exchange has to happen on that connection.
+   *
+   * Only top-level string fields of the response object are inspected: a
+   * secret nested inside another object, or under a field name that is not
+   * listed here, stays on the verbatim path and reaches the sandbox.
    */
   poll_secret_fields: Array<string>;
   /**

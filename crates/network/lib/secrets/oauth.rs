@@ -29,6 +29,12 @@ const BROKER_TIMEOUT: Duration = Duration::from_secs(5);
 /// RFC 8628 poll errors that say the device flow has not produced a token.
 /// None of them is a failure of the grant the broker holds, so the response is
 /// forwarded to the guest untouched and nothing is committed.
+/// Kind, and so the prefix, of every minted poll secret sentinel. Sentinels
+/// are per-connection, so one that survives substitution belongs to a
+/// connection that is gone and must not leave the sandbox.
+const POLL_SENTINEL_KIND: &str = "POLL";
+const POLL_SENTINEL_PREFIX: &str = "$MSB_OAUTH_POLL_";
+
 const POLL_WAITING_ERRORS: [&str; 4] = [
     "authorization_pending",
     "slow_down",
@@ -323,6 +329,21 @@ impl OAuthConnection {
                             .copied()
                             .unwrap_or(false),
                     )?;
+                    // A close-delimited response ends at EOF, so nothing marks
+                    // where the next response starts. On a token connection
+                    // that would stream whatever follows it -- a token
+                    // response among it -- straight to the guest.
+                    if stop_at_message_end
+                        && matches!(
+                            self.response_scrub_state,
+                            ResponseScrubState::CloseDelimited
+                        )
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "OAuth device code responses require Content-Length or chunked framing",
+                        ));
+                    }
                     self.scrub_stream_bytes(&headers, &mut output);
                     self.flush_scrub_tail(&mut output);
                     if !(100..200).contains(&status) {
@@ -442,19 +463,7 @@ impl OAuthConnection {
 
     pub(crate) fn finish_response_scrubbing(&mut self) -> io::Result<Vec<u8>> {
         if self.token_connection == Some(true) {
-            // A close-delimited device code response ends at EOF, so its
-            // pass-through exchange is still outstanding here and the bytes
-            // held back by the token matcher are released.
-            let close_delimited_passthrough = self.exchanges.len() == 1
-                && matches!(self.exchanges.front(), Some(Exchange::PassThrough))
-                && matches!(
-                    self.response_scrub_state,
-                    ResponseScrubState::CloseDelimited
-                )
-                && self.response_buffer.is_empty();
-            if !close_delimited_passthrough
-                && (!self.response_buffer.is_empty() || !self.exchanges.is_empty())
-            {
+            if !self.response_buffer.is_empty() || !self.exchanges.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "incomplete OAuth token response",
@@ -733,6 +742,14 @@ impl OAuthConnection {
                             }
                         }
                     }
+                    if is_token_request
+                        && contains_bytes(&rewritten, POLL_SENTINEL_PREFIX.as_bytes())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "OAuth poll secret sentinel is unknown to this connection",
+                        ));
+                    }
                     if let Some(index) = token_grant {
                         validate_token_request_content_type(&headers)?;
                         rewritten = update_content_length(&rewritten)?;
@@ -977,7 +994,7 @@ impl OAuthConnection {
             secret.value = Zeroizing::new(value.to_string());
             return Ok(secret.sentinel.clone());
         }
-        let sentinel = random_sentinel("POLL");
+        let sentinel = random_sentinel(POLL_SENTINEL_KIND);
         grant.poll_secrets.push(PollSecret {
             field: field.to_string(),
             sentinel: sentinel.clone(),
@@ -2926,8 +2943,8 @@ mod tests {
         let json: Value = serde_json::from_slice(message.body).unwrap();
         let code = json["authorization_code"].as_str().unwrap().to_string();
         let verifier = json["code_verifier"].as_str().unwrap().to_string();
-        assert!(code.starts_with("$MSB_OAUTH_POLL_"));
-        assert!(verifier.starts_with("$MSB_OAUTH_POLL_"));
+        assert!(code.starts_with(POLL_SENTINEL_PREFIX));
+        assert!(verifier.starts_with(POLL_SENTINEL_PREFIX));
         assert_ne!(code, verifier);
         assert_eq!(json["expires_in"], 600);
 
@@ -3094,7 +3111,7 @@ mod tests {
         )
         .unwrap();
         assert!(!guest.contains("ac-real"));
-        assert!(guest.contains("$MSB_OAUTH_POLL_"));
+        assert!(guest.contains(POLL_SENTINEL_PREFIX));
         assert_eq!(broker.commits().len(), 1);
     }
 
@@ -3209,5 +3226,74 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "too many outstanding OAuth API requests");
         assert_eq!(connection.exchanges.len(), MAX_OUTSTANDING_API_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn close_delimited_device_code_response_fails_closed_before_the_poll() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://github.com/login/oauth/access_token".into();
+        config.device_code_endpoint = Some("https://github.com/login/device/code".into());
+        config.poll_endpoint = Some("https://github.com/login/oauth/access_token".into());
+        let mut connection = OAuthConnection::new(&[config], "github.com", 443, None)
+            .await
+            .unwrap();
+
+        let device = json_request("/login/device/code", r#"{"client_id":"Iv1.b507"}"#);
+        connection
+            .transform_requests(device.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        let poll = json_request("/login/oauth/access_token", r#"{"device_code":"dc"}"#);
+        connection
+            .transform_requests(poll.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        assert_eq!(connection.exchanges.len(), 2);
+
+        // Unframed, so the poll response behind it would be streamed out with
+        // it rather than committed and sanitized.
+        let unframed =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"device_code\":\"dc\"}";
+        let granted = json_response(200, r#"{"access_token":"gho_new"}"#);
+        let error = connection
+            .transform_responses(format!("{unframed}{granted}").as_bytes())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth device code responses require Content-Length or chunked framing"
+        );
+        assert!(broker.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_poll_sentinel_from_another_connection_is_rejected() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://auth.openai.com/oauth/token".into();
+        config.poll_endpoint = Some("https://auth.openai.com/oauth/device/token".into());
+        config.poll_secret_fields = vec!["authorization_code".into()];
+        let mut connection = OAuthConnection::new(&[config], "auth.openai.com", 443, None)
+            .await
+            .unwrap();
+
+        let stale = format!("{POLL_SENTINEL_PREFIX}0123456789abcdef");
+        let exchange = json_request(
+            "/oauth/token",
+            &format!(r#"{{"authorization_code":"{stale}"}}"#),
+        );
+        let error = connection
+            .transform_requests(exchange.as_bytes(), "auth.openai.com")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "OAuth poll secret sentinel is unknown to this connection"
+        );
     }
 }
