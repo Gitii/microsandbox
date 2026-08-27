@@ -84,6 +84,13 @@ struct PollSecret {
     value: Zeroizing<String>,
 }
 
+/// The result of scrubbing one streamed chunk of response bytes.
+struct Scrubbed {
+    output: Vec<u8>,
+    remaining: Vec<u8>,
+    complete: bool,
+}
+
 /// A request whose response is still outstanding on a token connection.
 enum Exchange {
     /// Forwarded unchanged; the response carries no grant material.
@@ -281,8 +288,15 @@ impl OAuthConnection {
     }
 
     pub(crate) fn scrub_response_chunk(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+        Ok(self.scrub_stream(data, false)?.output)
+    }
+
+    /// Scrub a streamed response, optionally stopping at the end of the first
+    /// complete message and handing the rest back to the caller.
+    fn scrub_stream(&mut self, data: &[u8], stop_at_message_end: bool) -> io::Result<Scrubbed> {
         let mut output = Vec::new();
         let mut pending = data.to_vec();
+        let mut complete = false;
         while !pending.is_empty() {
             match self.response_scrub_state {
                 ResponseScrubState::Headers => {
@@ -319,6 +333,10 @@ impl OAuthConnection {
                         ResponseScrubState::ContentLength(0)
                     ) {
                         self.response_scrub_state = ResponseScrubState::Headers;
+                        complete = true;
+                        if stop_at_message_end {
+                            break;
+                        }
                     }
                 }
                 ResponseScrubState::ContentLength(remaining) => {
@@ -328,6 +346,10 @@ impl OAuthConnection {
                     if consumed == remaining {
                         self.flush_scrub_tail(&mut output);
                         self.response_scrub_state = ResponseScrubState::Headers;
+                        complete = true;
+                        if stop_at_message_end {
+                            break;
+                        }
                     } else {
                         self.response_scrub_state =
                             ResponseScrubState::ContentLength(remaining - consumed);
@@ -400,25 +422,47 @@ impl OAuthConnection {
                     self.scrub_stream_bytes(&trailers, &mut output);
                     self.flush_scrub_tail(&mut output);
                     self.response_scrub_state = ResponseScrubState::Headers;
+                    complete = true;
+                    if stop_at_message_end {
+                        break;
+                    }
                 }
                 ResponseScrubState::CloseDelimited => {
                     self.scrub_stream_bytes(&pending, &mut output);
-                    break;
+                    pending.clear();
                 }
             }
         }
-        Ok(output)
+        Ok(Scrubbed {
+            output,
+            remaining: pending,
+            complete,
+        })
     }
 
     pub(crate) fn finish_response_scrubbing(&mut self) -> io::Result<Vec<u8>> {
         if self.token_connection == Some(true) {
-            if !self.response_buffer.is_empty() || !self.exchanges.is_empty() {
+            // A close-delimited device code response ends at EOF, so its
+            // pass-through exchange is still outstanding here and the bytes
+            // held back by the token matcher are released.
+            let close_delimited_passthrough = self.exchanges.len() == 1
+                && matches!(self.exchanges.front(), Some(Exchange::PassThrough))
+                && matches!(
+                    self.response_scrub_state,
+                    ResponseScrubState::CloseDelimited
+                )
+                && self.response_buffer.is_empty();
+            if !close_delimited_passthrough
+                && (!self.response_buffer.is_empty() || !self.exchanges.is_empty())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "incomplete OAuth token response",
                 ));
             }
-            return Ok(Vec::new());
+            let mut output = Vec::new();
+            self.flush_scrub_tail(&mut output);
+            return Ok(output);
         }
         if !self.response_scrub_buffer.is_empty()
             || matches!(
@@ -573,12 +617,17 @@ impl OAuthConnection {
                         [] => return Err(invalid_http()),
                         _ => return Err(invalid_http()),
                     };
-                    let poll_request = token_grant.is_some_and(|index| {
-                        self.grants[index]
-                            .poll
-                            .as_ref()
-                            .is_some_and(|poll| poll.matches(sni, port, target))
-                    });
+                    // A device code poll carries a device code, never a
+                    // sentinel. When the poll endpoint is also the token
+                    // endpoint, that is what separates a poll from the refresh
+                    // requests that share the URL.
+                    let poll_request = matching_grants.is_empty()
+                        && token_grant.is_some_and(|index| {
+                            self.grants[index]
+                                .poll
+                                .as_ref()
+                                .is_some_and(|poll| poll.matches(sni, port, target))
+                        });
                     // A device code request holds no secret, but it belongs to
                     // the same conversation: buffered whole, forwarded
                     // unchanged, and its response released only once parsed.
@@ -603,6 +652,12 @@ impl OAuthConnection {
                         }
                         self.response_head_requests
                             .push_back(method.eq_ignore_ascii_case("HEAD"));
+                    }
+                    if device_code_request && self.exchanges.len() >= MAX_OUTSTANDING_API_REQUESTS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many outstanding OAuth API requests",
+                        ));
                     }
                     if token_grant.is_some()
                         && self
@@ -784,7 +839,24 @@ impl OAuthConnection {
         self.response_buffer.extend_from_slice(data);
         enforce_limit(&self.response_buffer)?;
         let mut output = Vec::new();
-        while let Some(message) = parse_token_response(&self.response_buffer)? {
+        loop {
+            // A device code response holds no grant material and is forwarded
+            // as it arrives, so it is streamed like an ordinary API response
+            // rather than held to the token response's framing rules.
+            if matches!(self.exchanges.front(), Some(Exchange::PassThrough)) {
+                let buffered = std::mem::take(&mut self.response_buffer);
+                let scrubbed = self.scrub_stream(&buffered, true)?;
+                self.response_buffer = scrubbed.remaining;
+                output.extend_from_slice(&scrubbed.output);
+                if !scrubbed.complete {
+                    break;
+                }
+                self.exchanges.pop_front();
+                continue;
+            }
+            let Some(message) = parse_token_response(&self.response_buffer)? else {
+                break;
+            };
             let total_len = message.total_len;
             let headers = message.headers.to_vec();
             let body = message.body.to_vec();
@@ -1203,33 +1275,40 @@ fn parse_broker_response<T: for<'de> Deserialize<'de>>(response: &str) -> io::Re
 }
 
 /// Classify a poll (RFC 8628) response body.
+///
+/// Secret material outranks the waiting set: only a body that carries none of
+/// the fields this grant treats as secret is ever forwarded to the guest as it
+/// arrived, so a waiting error cannot smuggle a token past sanitizing.
 fn poll_outcome(status: u16, body: &[u8], config: &OAuthSecret) -> PollOutcome {
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
         return PollOutcome::Failed;
     };
+    let has_string = |field: &str| object.get(field).and_then(Value::as_str).is_some();
+    let success = (200..300).contains(&status);
+    if has_string(&config.access_token_field) || has_string(&config.refresh_token_field) {
+        return if success {
+            PollOutcome::Granted
+        } else {
+            PollOutcome::Failed
+        };
+    }
+    if config
+        .poll_secret_fields
+        .iter()
+        .any(|field| has_string(field))
+    {
+        return if success {
+            PollOutcome::Secrets
+        } else {
+            PollOutcome::Failed
+        };
+    }
     // GitHub answers a pending poll with HTTP 200 and RFC 8628 answers it with
     // 400, so the body decides, not the status.
     if let Some(error) = object.get("error").and_then(Value::as_str)
         && POLL_WAITING_ERRORS.contains(&error)
     {
         return PollOutcome::Waiting;
-    }
-    if !(200..300).contains(&status) {
-        return PollOutcome::Failed;
-    }
-    if object
-        .get(&config.access_token_field)
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        return PollOutcome::Granted;
-    }
-    if config
-        .poll_secret_fields
-        .iter()
-        .any(|field| object.get(field).and_then(Value::as_str).is_some())
-    {
-        return PollOutcome::Secrets;
     }
     PollOutcome::Failed
 }
@@ -2324,18 +2403,26 @@ mod tests {
 
     #[tokio::test]
     async fn token_responses_require_identity_content_length_framing() {
-        for response in [
-            b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
-            b"HTTP/1.1 400 Bad Request\r\n\r\nsecret".as_slice(),
-            b"HTTP/1.1 400 Bad Request\r\nContent-Encoding: gzip\r\nContent-Length: 6\r\n\r\nsecret".as_slice(),
-        ] {
+        let chunked = "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let unframed = "HTTP/1.1 400 Bad Request\r\n\r\nsecret";
+        let encoded = concat!(
+            "HTTP/1.1 400 Bad Request\r\n",
+            "Content-Encoding: gzip\r\n",
+            "Content-Length: 6\r\n\r\nsecret"
+        );
+        for response in [chunked, unframed, encoded] {
             let mut connection = connection();
             connection.token_connection = Some(true);
             connection.exchanges.push_back(Exchange::Token {
-            grant: 0,
-            poll: false,
-        });
-            assert!(connection.transform_responses(response).await.is_err());
+                grant: 0,
+                poll: false,
+            });
+            assert!(
+                connection
+                    .transform_responses(response.as_bytes())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -2921,5 +3008,206 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "OAuth access token is missing");
         assert!(broker.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waiting_poll_error_carrying_secret_material_is_never_forwarded_raw() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut base = broker_config(&broker);
+        base.token_endpoint = "https://auth.example.com/oauth/token".into();
+        base.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        let poll = json_request("/oauth/device/token", r#"{"device_code":"dc"}"#);
+
+        // A pending error that also carries a token is a token response.
+        let mut connection = OAuthConnection::new(&[base.clone()], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(
+                    json_response(
+                        200,
+                        r#"{"error":"authorization_pending","access_token":"gho-real"}"#,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!guest.contains("gho-real"));
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert_eq!(broker.commits().len(), 1);
+
+        // The same body on a failing status is sanitized, not committed.
+        let mut connection = OAuthConnection::new(&[base.clone()], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(
+                    json_response(
+                        400,
+                        r#"{"error":"authorization_pending","access_token":"gho-real"}"#,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!guest.contains("gho-real"));
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(guest.contains("authorization_pending"));
+        assert!(connection.grants[0].lease.is_none());
+        assert_eq!(broker.commits().len(), 1);
+
+        // A pending error carrying a poll secret is a secret response.
+        let mut config = base;
+        config.poll_secret_fields = vec!["authorization_code".into()];
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(
+                    json_response(
+                        200,
+                        r#"{"error":"slow_down","authorization_code":"ac-real"}"#,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!guest.contains("ac-real"));
+        assert!(guest.contains("$MSB_OAUTH_POLL_"));
+        assert_eq!(broker.commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_at_a_shared_poll_endpoint_is_sanitized() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://auth.x.ai/oauth2/token".into();
+        config.poll_endpoint = Some("https://auth.x.ai/oauth2/token".into());
+        let mut connection = OAuthConnection::new(&[config], "auth.x.ai", 443, None)
+            .await
+            .unwrap();
+
+        // The sentinel makes this a refresh rather than a device code poll,
+        // even though both use the same URL.
+        let refresh = form_request(
+            "/oauth2/token",
+            "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+        );
+        connection
+            .transform_requests(refresh.as_bytes(), "auth.x.ai")
+            .await
+            .unwrap();
+        assert!(connection.grants[0].lease.is_some());
+
+        let denied = json_response(400, r#"{ "error" : "access_denied" }"#);
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(denied.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Sanitizing re-serializes the body; a forwarded response would not.
+        assert!(guest.ends_with(r#"{"error":"access_denied"}"#));
+        assert!(connection.grants[0].lease.is_none());
+        assert!(broker.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunked_device_code_response_streams_to_the_guest() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://github.com/login/oauth/access_token".into();
+        config.device_code_endpoint = Some("https://github.com/login/device/code".into());
+        config.poll_endpoint = Some("https://github.com/login/oauth/access_token".into());
+        let mut connection = OAuthConnection::new(&[config], "github.com", 443, None)
+            .await
+            .unwrap();
+
+        let device = json_request("/login/device/code", r#"{"client_id":"Iv1.b507"}"#);
+        connection
+            .transform_requests(device.as_bytes(), "github.com")
+            .await
+            .unwrap();
+
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n{\"device_code\":\"dc\",\r\n";
+        let tail = "d\r\n\"interval\":5}\r\n0\r\n\r\n";
+        let mut guest = connection
+            .transform_responses(head.as_bytes())
+            .await
+            .unwrap();
+        guest.extend(
+            connection
+                .transform_responses(tail.as_bytes())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(guest, format!("{head}{tail}").as_bytes());
+        assert!(connection.exchanges.is_empty());
+
+        // The connection carries on with the poll the device code was for.
+        let poll = json_request("/login/oauth/access_token", r#"{"device_code":"dc"}"#);
+        connection
+            .transform_requests(poll.as_bytes(), "github.com")
+            .await
+            .unwrap();
+        let granted = json_response(200, r#"{"access_token":"gho_new","refresh_token":"r"}"#);
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(!guest.contains("gho_new"));
+        assert!(connection.finish_response_scrubbing().unwrap().is_empty());
+        assert_eq!(broker.commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outstanding_device_code_requests_are_bounded() {
+        let broker = start_broker("old-access", "old-refresh");
+        let mut config = broker_config(&broker);
+        config.token_endpoint = "https://github.com/login/oauth/access_token".into();
+        config.device_code_endpoint = Some("https://github.com/login/device/code".into());
+        let mut connection = OAuthConnection::new(&[config], "github.com", 443, None)
+            .await
+            .unwrap();
+        connection
+            .exchanges
+            .resize_with(MAX_OUTSTANDING_API_REQUESTS, || Exchange::PassThrough);
+
+        let device = json_request("/login/device/code", r#"{"client_id":"Iv1.b507"}"#);
+        let error = connection
+            .transform_requests(device.as_bytes(), "github.com")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "too many outstanding OAuth API requests");
+        assert_eq!(connection.exchanges.len(), MAX_OUTSTANDING_API_REQUESTS);
     }
 }

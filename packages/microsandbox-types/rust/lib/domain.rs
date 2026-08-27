@@ -2137,6 +2137,14 @@ impl OAuthSecret {
                 "device_code_endpoint must include a host and path",
                 grant_index,
             )?;
+            // A device code request is forwarded as it stands; sharing a URL
+            // with an endpoint whose responses hold token material would let
+            // one past unsanitized.
+            if *endpoint == self.token_endpoint || self.poll_endpoint.as_ref() == Some(endpoint) {
+                return Err(invalid(
+                    "device_code_endpoint must differ from the token and poll endpoints",
+                ));
+            }
         }
         if let Some(endpoint) = &self.poll_endpoint {
             validate_oauth_endpoint(
@@ -2911,6 +2919,29 @@ mod tests {
             Err(SecretConfigError::InvalidOAuth {
                 grant_index: 0,
                 reason: "poll_endpoint must include a host and path",
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_device_code_endpoint_may_not_be_a_token_bearing_endpoint() {
+        let mut oauth = device_flow_oauth();
+        oauth.device_code_endpoint = Some(oauth.token_endpoint.clone());
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "device_code_endpoint must differ from the token and poll endpoints",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.poll_endpoint = Some("https://github.com/login/device/code".into());
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "device_code_endpoint must differ from the token and poll endpoints",
             })
         );
     }
