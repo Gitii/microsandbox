@@ -160,11 +160,22 @@ export type OAuthSecret = {
    */
   refresh_env_var: string;
   /**
-   * Per-sandbox access-token sentinel.
+   * Per-sandbox access-token sentinel, the value the guest starts with.
+   *
+   * It may be opaque, or JWT-shaped for a client that decodes the token to
+   * read its claims: the real token's header and payload copied verbatim with
+   * only the signature replaced. A JWT-shaped sentinel mirrors claims that
+   * change on every login and refresh, so the broker may hand back a
+   * replacement with the tokens it loads or commits, and that replacement
+   * supersedes this value for the connection that received it.
+   *
+   * Must be non-empty, at most 8192 bytes, and must not contain NUL, CR, or
+   * LF.
    */
   access_sentinel: string;
   /**
-   * Per-sandbox refresh-token sentinel.
+   * Per-sandbox refresh-token sentinel, under the same rules as
+   * `access_sentinel`.
    */
   refresh_sentinel: string;
 };

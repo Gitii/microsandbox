@@ -31,12 +31,12 @@ pub use domain::{
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
     DestinationGroup, Direction, DiskImageFormat, DnsConfig, EnvVar, FlatClone, HandoffInit,
     HostPattern, HostPermissions, InterceptCaConfig, InterfaceOverrides, LogSource,
-    MAX_SECRET_PLACEHOLDER_BYTES, MountOptions, NamedVolumeCreate, NamedVolumeMode, NetworkPolicy,
-    NetworkSpec, OAuthSecret, OciRootfsSource, Patch, PortProtocol, PortRange, Protocol,
-    PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootDisk, RootfsSource, Rule,
-    SandboxLogLevel, SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
-    ScopedUpstreamCaCert, ScopedVerifyUpstream, SecretConfigError, SecretEntry, SecretInjection,
-    SecretsConfig, SecurityProfile, SnapshotSpec, StatVirtualization, TlsConfig,
+    MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, MountOptions, NamedVolumeCreate,
+    NamedVolumeMode, NetworkPolicy, NetworkSpec, OAuthSecret, OciRootfsSource, Patch, PortProtocol,
+    PortRange, Protocol, PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootDisk,
+    RootfsSource, Rule, SandboxLogLevel, SandboxPolicy, SandboxResources, SandboxRuntimeOptions,
+    SandboxSpec, ScopedUpstreamCaCert, ScopedVerifyUpstream, SecretConfigError, SecretEntry,
+    SecretInjection, SecretsConfig, SecurityProfile, SnapshotSpec, StatVirtualization, TlsConfig,
     TransparentHugePagePolicy, ViolationAction, VolumeKind, VolumeMount, VolumeSpec,
 };
 pub use error::{TypesError, TypesResult};
