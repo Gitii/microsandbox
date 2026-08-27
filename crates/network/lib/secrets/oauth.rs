@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use zeroize::Zeroizing;
 
-use super::config::OAuthSecret;
+use super::config::{MAX_OAUTH_SENTINEL_BYTES, OAuthSecret};
 use super::handler::host_pattern_allowed_for_tls;
 use crate::shared::SharedState;
 
@@ -70,6 +70,12 @@ struct LoadedGrant {
     poll: Option<Endpoint>,
     access: Zeroizing<String>,
     refresh: Zeroizing<String>,
+    /// The sentinel the guest currently holds for the access token. It starts
+    /// as the configured one and is replaced whenever the broker mints a new
+    /// one, which a JWT-shaped sentinel does on every login or refresh.
+    access_sentinel: String,
+    /// The sentinel the guest currently holds for the refresh token.
+    refresh_sentinel: String,
     generation: u64,
     lease: Option<UnixStream>,
     poll_secrets: Vec<PollSecret>,
@@ -141,6 +147,13 @@ struct LoadResponse {
     access: String,
     refresh: String,
     generation: u64,
+    /// The sentinel the broker currently stands behind for the access token.
+    /// Absent means the configured sentinel still applies.
+    #[serde(default)]
+    access_sentinel: Option<String>,
+    /// The sentinel the broker currently stands behind for the refresh token.
+    #[serde(default)]
+    refresh_sentinel: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +162,20 @@ struct CommitResponse {
     #[serde(default)]
     conflict: bool,
     generation: Option<u64>,
+    /// The sentinel minted for the access token just committed. Absent means
+    /// the sentinel this connection already uses is still the right one.
+    #[serde(default)]
+    access_sentinel: Option<String>,
+    /// The sentinel minted for the refresh token just committed.
+    #[serde(default)]
+    refresh_sentinel: Option<String>,
+}
+
+/// What a successful broker commit reports back.
+struct Committed {
+    generation: u64,
+    access_sentinel: Option<String>,
+    refresh_sentinel: Option<String>,
 }
 
 struct HttpMessage<'a> {
@@ -256,17 +283,27 @@ impl OAuthConnection {
             let loaded = broker_load(config).await?;
             remember_token(&mut seen_tokens, &loaded.access)?;
             remember_token(&mut seen_tokens, &loaded.refresh)?;
-            grants.push(LoadedGrant {
+            let mut grant = LoadedGrant {
                 config: config.clone(),
                 token,
                 device_code,
                 poll,
                 access: Zeroizing::new(loaded.access),
                 refresh: Zeroizing::new(loaded.refresh),
+                access_sentinel: config.access_sentinel.clone(),
+                refresh_sentinel: config.refresh_sentinel.clone(),
                 generation: loaded.generation,
                 lease: None,
                 poll_secrets: Vec::new(),
-            });
+            };
+            // The guest may already hold a sentinel minted after this sandbox
+            // was configured, so the broker's answer wins over the config.
+            grant.adopt_sentinels(
+                loaded.access_sentinel,
+                loaded.refresh_sentinel,
+                &seen_tokens,
+            )?;
+            grants.push(grant);
         }
         Ok(Self {
             token_connection: None,
@@ -606,13 +643,11 @@ impl OAuthConnection {
                         endpoint_grants
                             .iter()
                             .filter(|(_, grant)| {
-                                contains_bytes(
-                                    framed_request,
-                                    grant.config.access_sentinel.as_bytes(),
-                                ) || contains_bytes(
-                                    framed_request,
-                                    grant.config.refresh_sentinel.as_bytes(),
-                                )
+                                contains_bytes(framed_request, grant.access_sentinel.as_bytes())
+                                    || contains_bytes(
+                                        framed_request,
+                                        grant.refresh_sentinel.as_bytes(),
+                                    )
                             })
                             .map(|(index, _)| *index)
                             .collect::<Vec<_>>()
@@ -697,6 +732,11 @@ impl OAuthConnection {
                         grant.refresh = Zeroizing::new(loaded.refresh);
                         grant.generation = loaded.generation;
                         grant.lease = Some(lease);
+                        grant.adopt_sentinels(
+                            loaded.access_sentinel,
+                            loaded.refresh_sentinel,
+                            &self.seen_tokens,
+                        )?;
                     }
                     for (index, grant) in self.grants.iter_mut().enumerate() {
                         let inject = grant
@@ -711,18 +751,23 @@ impl OAuthConnection {
                             grant.access = Zeroizing::new(loaded.access);
                             grant.refresh = Zeroizing::new(loaded.refresh);
                             grant.generation = loaded.generation;
+                            grant.adopt_sentinels(
+                                loaded.access_sentinel,
+                                loaded.refresh_sentinel,
+                                &self.seen_tokens,
+                            )?;
                         }
                         if inject || token_grant == Some(index) {
                             rewritten = if inject && token_grant != Some(index) {
                                 replace_bearer_header(
                                     &rewritten,
-                                    grant.config.access_sentinel.as_bytes(),
+                                    grant.access_sentinel.as_bytes(),
                                     grant.access.as_bytes(),
                                 )
                             } else {
                                 replace_all(
                                     &rewritten,
-                                    grant.config.access_sentinel.as_bytes(),
+                                    grant.access_sentinel.as_bytes(),
                                     grant.access.as_bytes(),
                                 )
                             };
@@ -730,7 +775,7 @@ impl OAuthConnection {
                         if token_grant == Some(index) {
                             rewritten = replace_all(
                                 &rewritten,
-                                grant.config.refresh_sentinel.as_bytes(),
+                                grant.refresh_sentinel.as_bytes(),
                                 grant.refresh.as_bytes(),
                             );
                             for secret in &grant.poll_secrets {
@@ -1045,12 +1090,22 @@ impl OAuthConnection {
                     .as_millis() as u64
                     + seconds.saturating_mul(1000)
             });
-        let generation = broker_commit(grant, &access, &refresh, expires_at).await?;
+        let committed = broker_commit(grant, &access, &refresh, expires_at).await?;
         remember_token(&mut self.seen_tokens, &access)?;
         remember_token(&mut self.seen_tokens, &refresh)?;
+        // A JWT-shaped sentinel mirrors the claims of the token it stands for,
+        // so the commit that replaces the token also replaces the sentinel the
+        // guest is handed here and substitutes for the rest of the connection.
+        // The broker's answer is checked before any of it is adopted.
+        let grant = &mut self.grants[index];
+        grant.adopt_sentinels(
+            committed.access_sentinel,
+            committed.refresh_sentinel,
+            &self.seen_tokens,
+        )?;
         grant.access = Zeroizing::new(access);
         grant.refresh = Zeroizing::new(refresh);
-        grant.generation = generation;
+        grant.generation = committed.generation;
         grant.lease = None;
         // A device flow without a refresh grant names one field for both
         // tokens; the access sentinel is the one the guest gets back.
@@ -1059,12 +1114,12 @@ impl OAuthConnection {
         {
             object.insert(
                 grant.config.refresh_token_field.clone(),
-                Value::String(grant.config.refresh_sentinel.clone()),
+                Value::String(grant.refresh_sentinel.clone()),
             );
         }
         object.insert(
             grant.config.access_token_field.clone(),
-            Value::String(grant.config.access_sentinel.clone()),
+            Value::String(grant.access_sentinel.clone()),
         );
         self.replace_poll_secrets(index, object)?;
         let body = serde_json::to_vec(&json).map_err(io::Error::other)?;
@@ -1092,13 +1147,13 @@ impl OAuthConnection {
         {
             object.insert(
                 grant.config.refresh_token_field.clone(),
-                Value::String(grant.config.refresh_sentinel.clone()),
+                Value::String(grant.refresh_sentinel.clone()),
             );
         }
         if object.contains_key(&grant.config.access_token_field) {
             object.insert(
                 grant.config.access_token_field.clone(),
-                Value::String(grant.config.access_sentinel.clone()),
+                Value::String(grant.access_sentinel.clone()),
             );
         }
         self.replace_poll_secrets(index, object)?;
@@ -1111,6 +1166,37 @@ impl OAuthConnection {
     fn scrub_tokens(&self, mut response: Vec<u8>) -> Vec<u8> {
         scrub_seen_tokens(&mut response, &self.seen_tokens);
         response
+    }
+}
+
+impl LoadedGrant {
+    /// Adopt sentinels the broker minted for the tokens it just handed back.
+    /// An absent field keeps the sentinel this connection already uses, which
+    /// is what a broker that mints opaque sentinels once, at configuration
+    /// time, always sends.
+    fn adopt_sentinels(
+        &mut self,
+        access: Option<String>,
+        refresh: Option<String>,
+        seen: &[Zeroizing<String>],
+    ) -> io::Result<()> {
+        let access = access
+            .map(|access| validate_sentinel(access, seen))
+            .transpose()?;
+        let refresh = refresh
+            .map(|refresh| validate_sentinel(refresh, seen))
+            .transpose()?;
+        let next_access = access.unwrap_or_else(|| self.access_sentinel.clone());
+        let next_refresh = refresh.unwrap_or_else(|| self.refresh_sentinel.clone());
+        if next_access == next_refresh {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth broker sentinels must differ",
+            ));
+        }
+        self.access_sentinel = next_access;
+        self.refresh_sentinel = next_refresh;
+        Ok(())
     }
 }
 
@@ -1151,6 +1237,45 @@ fn longest_token_prefix_suffix(data: &[u8], tokens: &[Zeroizing<String>]) -> usi
         }
     }
     longest
+}
+
+/// Check one broker-supplied sentinel before it is used for substitution.
+///
+/// A sentinel may be JWT-shaped — the real token's header and payload copied
+/// verbatim with only the signature replaced — so it carries base64url bytes
+/// (`.`, `-`, `_` included) and runs to at most
+/// [`MAX_OAUTH_SENTINEL_BYTES`] bytes. It is matched and replaced byte for
+/// byte, so only bytes that could not survive an HTTP message are rejected,
+/// along with any value this connection has seen as a real token.
+fn validate_sentinel(sentinel: String, seen: &[Zeroizing<String>]) -> io::Result<String> {
+    if sentinel.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth broker sentinel is empty",
+        ));
+    }
+    if sentinel.len() > MAX_OAUTH_SENTINEL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth broker sentinel exceeds limit",
+        ));
+    }
+    if sentinel.contains(['\0', '\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth broker sentinel contains a control character",
+        ));
+    }
+    // A sentinel that is one of the real tokens would be written into the
+    // guest's response body as itself, and the body the token response takes
+    // is the one path that is not scrubbed afterwards.
+    if seen.iter().any(|token| token.as_str() == sentinel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OAuth broker sentinel is a live token",
+        ));
+    }
+    Ok(sentinel)
 }
 
 /// Fill omitted sentinels with independent random per-sandbox values.
@@ -1194,7 +1319,7 @@ async fn broker_commit(
     access: &str,
     refresh: &str,
     expires_at: Option<u64>,
-) -> io::Result<u64> {
+) -> io::Result<Committed> {
     let stream = grant.lease.as_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1218,11 +1343,16 @@ async fn broker_commit(
             "OAuth broker commit conflict",
         ));
     }
-    response.generation.ok_or_else(|| {
+    let generation = response.generation.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "OAuth broker omitted generation",
         )
+    })?;
+    Ok(Committed {
+        generation,
+        access_sentinel: response.access_sentinel,
+        refresh_sentinel: response.refresh_sentinel,
     })
 }
 
@@ -1374,26 +1504,35 @@ fn replace_same_length(data: &[u8], token: &[u8]) -> Vec<u8> {
     replace_all(data, token, &replacement)
 }
 
+/// Replace a sentinel that stands alone as an `Authorization: Bearer` value.
+///
+/// The header name and scheme are matched case-insensitively, as HTTP defines
+/// them, but the sentinel itself is matched byte for byte: a JWT-shaped
+/// sentinel is base64url, where case is significant.
 fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> {
-    let marker = [b"authorization: bearer ".as_slice(), sentinel].concat();
-    let marker = marker
-        .iter()
-        .map(u8::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    let Some(start) = lower
-        .windows(marker.len())
-        .position(|window| window == marker)
-    else {
+    const MARKER: &[u8] = b"authorization: bearer ";
+    if sentinel.is_empty() || data.len() < MARKER.len() {
         return data.to_vec();
-    };
-    let value_start = start + b"authorization: bearer ".len();
-    let mut output = data.to_vec();
-    output.splice(
-        value_start..value_start + sentinel.len(),
-        token.iter().copied(),
-    );
-    output
+    }
+    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let mut searched = 0;
+    while let Some(offset) = lower[searched..]
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
+        let value_start = searched + offset + MARKER.len();
+        let value_end = value_start + sentinel.len();
+        if data.len() >= value_end && &data[value_start..value_end] == sentinel {
+            let mut output = data.to_vec();
+            output.splice(value_start..value_end, token.iter().copied());
+            return output;
+        }
+        searched = value_start;
+        if searched + MARKER.len() > lower.len() {
+            break;
+        }
+    }
+    data.to_vec()
 }
 
 fn response_body_state(headers: &[u8], head_response: bool) -> io::Result<ResponseScrubState> {
@@ -1777,7 +1916,25 @@ mod tests {
         refresh: String,
         generation: u64,
         commits: Vec<Value>,
+        /// Sentinels reported on `load` and `acquire`, when the broker mints
+        /// them rather than leaving the configured ones in place.
+        sentinels: Option<(String, String)>,
+        /// Sentinels the next `commit` mints for the tokens it stores.
+        commit_sentinels: Option<(String, String)>,
     }
+
+    /// A JWT-shaped sentinel: a real header and payload, a random signature.
+    const JWT_ACCESS_SENTINEL: &str = concat!(
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.",
+        "eyJzdWIiOiJhY2N0XzEyMyIsImV4cCI6MjUzMzcwNzY0ODAwfQ.",
+        "c2VudGluZWwtc2lnbmF0dXJlLXJhbmRvbQ"
+    );
+
+    const JWT_REFRESH_SENTINEL: &str = concat!(
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.",
+        "eyJzdWIiOiJhY2N0XzEyMyIsInR5cCI6InJlZnJlc2gifQ.",
+        "YW5vdGhlci1yYW5kb20tc2lnbmF0dXJl"
+    );
 
     /// A stand-in host broker: it answers `load` and `acquire` with the grant
     /// it currently holds, and records every `commit`.
@@ -1790,6 +1947,17 @@ mod tests {
     impl FakeBroker {
         fn commits(&self) -> Vec<Value> {
             self.state.lock().unwrap().commits.clone()
+        }
+
+        /// Answer `load` and `acquire` with these sentinels.
+        fn set_sentinels(&self, access: &str, refresh: &str) {
+            self.state.lock().unwrap().sentinels = Some((access.into(), refresh.into()));
+        }
+
+        /// Mint these sentinels on the next `commit`, and report them from
+        /// then on, the way a broker that copies the new token's claims does.
+        fn set_commit_sentinels(&self, access: &str, refresh: &str) {
+            self.state.lock().unwrap().commit_sentinels = Some((access.into(), refresh.into()));
         }
     }
 
@@ -1812,6 +1980,8 @@ mod tests {
             refresh: refresh.into(),
             generation: 7,
             commits: Vec::new(),
+            sentinels: None,
+            commit_sentinels: None,
         }));
         let task = tokio::spawn({
             let state = Arc::clone(&state);
@@ -1828,11 +1998,18 @@ mod tests {
                             let reply = {
                                 let mut state = state.lock().unwrap();
                                 match request["action"].as_str().unwrap() {
-                                    "load" | "acquire" => serde_json::json!({
-                                        "access": state.access,
-                                        "refresh": state.refresh,
-                                        "generation": state.generation,
-                                    }),
+                                    "load" | "acquire" => {
+                                        let mut reply = serde_json::json!({
+                                            "access": state.access,
+                                            "refresh": state.refresh,
+                                            "generation": state.generation,
+                                        });
+                                        if let Some((access, refresh)) = state.sentinels.clone() {
+                                            reply["access_sentinel"] = access.into();
+                                            reply["refresh_sentinel"] = refresh.into();
+                                        }
+                                        reply
+                                    }
                                     "commit" => {
                                         assert_eq!(request["generation"], state.generation);
                                         state.access =
@@ -1842,7 +2019,16 @@ mod tests {
                                         state.generation += 1;
                                         let generation = state.generation;
                                         state.commits.push(request);
-                                        serde_json::json!({"ok": true, "generation": generation})
+                                        let mut reply = serde_json::json!({"ok": true, "generation": generation});
+                                        if let Some((access, refresh)) =
+                                            state.commit_sentinels.take()
+                                        {
+                                            state.sentinels =
+                                                Some((access.clone(), refresh.clone()));
+                                            reply["access_sentinel"] = access.into();
+                                            reply["refresh_sentinel"] = refresh.into();
+                                        }
+                                        reply
                                     }
                                     other => panic!("unexpected broker action {other}"),
                                 }
@@ -1905,12 +2091,14 @@ mod tests {
             .as_deref()
             .map(|endpoint| parse_https_endpoint(endpoint).unwrap());
         LoadedGrant {
-            config,
             token,
             device_code,
             poll,
             access: Zeroizing::new("real-access".into()),
             refresh: Zeroizing::new("real-refresh".into()),
+            access_sentinel: config.access_sentinel.clone(),
+            refresh_sentinel: config.refresh_sentinel.clone(),
+            config,
             generation: 4,
             lease: None,
             poll_secrets: Vec::new(),
@@ -3295,5 +3483,334 @@ mod tests {
             error.to_string(),
             "OAuth poll secret sentinel is unknown to this connection"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_response_sentinels_replace_the_ones_the_guest_holds() {
+        let broker = start_broker("old-access", "old-refresh");
+        broker.set_commit_sentinels(JWT_ACCESS_SENTINEL, JWT_REFRESH_SENTINEL);
+        let config = broker_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+
+        // Before the commit the guest holds the configured sentinel.
+        let refresh = form_request(
+            "/oauth/token",
+            "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(refresh.as_bytes(), "auth.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("refresh_token=old-refresh"));
+
+        let granted = json_response(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(guest.contains(JWT_ACCESS_SENTINEL));
+        assert!(guest.contains(JWT_REFRESH_SENTINEL));
+        assert!(!guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(!guest.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(!guest.contains("new-access"));
+        assert!(!guest.contains("new-refresh"));
+        assert_eq!(connection.grants[0].access_sentinel, JWT_ACCESS_SENTINEL);
+        assert_eq!(connection.grants[0].refresh_sentinel, JWT_REFRESH_SENTINEL);
+
+        // The sentinel the commit minted substitutes for the rest of the
+        // connection, and the configured one no longer does.
+        let body = format!("grant_type=refresh_token&refresh_token={JWT_REFRESH_SENTINEL}");
+        let next = format!(
+            "POST /oauth/token HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(next.as_bytes(), "auth.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("Authorization: Bearer new-access"));
+        assert!(upstream.contains("refresh_token=new-refresh"));
+        assert!(!upstream.contains("eyJ"));
+    }
+
+    #[tokio::test]
+    async fn load_response_sentinels_override_the_configured_ones() {
+        let broker = start_broker("real-access", "real-refresh");
+        broker.set_sentinels(JWT_ACCESS_SENTINEL, JWT_REFRESH_SENTINEL);
+        let config = broker_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "api.example.com", 443, None)
+            .await
+            .unwrap();
+
+        assert_eq!(connection.grants[0].access_sentinel, JWT_ACCESS_SENTINEL);
+        assert_eq!(connection.grants[0].refresh_sentinel, JWT_REFRESH_SENTINEL);
+
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\n\r\n"
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(request.as_bytes(), "api.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("Authorization: Bearer real-access"));
+
+        // The configured sentinel is stale once the broker names another one.
+        let stale =
+            b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $MSB_OAUTH_ACCESS_123\r\n\r\n";
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(stale, "api.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(upstream.contains("Bearer $MSB_OAUTH_ACCESS_123"));
+    }
+
+    #[tokio::test]
+    async fn broker_responses_without_sentinels_keep_the_configured_ones() {
+        let broker = start_broker("old-access", "old-refresh");
+        let config = broker_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            connection.grants[0].access_sentinel,
+            "$MSB_OAUTH_ACCESS_123"
+        );
+
+        let refresh = form_request(
+            "/oauth/token",
+            "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+        );
+        connection
+            .transform_requests(refresh.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let granted = json_response(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh"}"#,
+        );
+        let guest = String::from_utf8(
+            connection
+                .transform_responses(granted.as_bytes())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(guest.contains("$MSB_OAUTH_ACCESS_123"));
+        assert!(guest.contains("$MSB_OAUTH_REFRESH_123"));
+        assert!(!guest.contains("new-access"));
+        assert_eq!(
+            connection.grants[0].access_sentinel,
+            "$MSB_OAUTH_ACCESS_123"
+        );
+        assert_eq!(
+            connection.grants[0].refresh_sentinel,
+            "$MSB_OAUTH_REFRESH_123"
+        );
+        assert_eq!(broker.commits().len(), 1);
+    }
+
+    #[test]
+    fn jwt_shaped_sentinel_survives_substitution_byte_for_byte() {
+        let body = format!("grant_type=refresh_token&refresh_token={JWT_REFRESH_SENTINEL}");
+        let request = format!(
+            "POST /oauth/token HTTP/1.1\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let bearer = replace_bearer_header(
+            request.as_bytes(),
+            JWT_ACCESS_SENTINEL.as_bytes(),
+            b"real-access",
+        );
+        let bearer = String::from_utf8(bearer).unwrap();
+        assert!(bearer.contains("Authorization: Bearer real-access\r\n"));
+        assert!(bearer.contains(JWT_REFRESH_SENTINEL));
+
+        let both = replace_all(
+            bearer.as_bytes(),
+            JWT_REFRESH_SENTINEL.as_bytes(),
+            b"real-refresh",
+        );
+        let both = String::from_utf8(both).unwrap();
+        assert!(both.contains("refresh_token=real-refresh"));
+        assert!(!both.contains("eyJ"));
+
+        // base64url is case-sensitive, so a lowercased sentinel is a different
+        // sentinel even though the header name and scheme are not.
+        let lowercased = replace_bearer_header(
+            request.as_bytes(),
+            JWT_ACCESS_SENTINEL.to_ascii_lowercase().as_bytes(),
+            b"real-access",
+        );
+        assert_eq!(lowercased, request.as_bytes());
+    }
+
+    #[test]
+    fn scrubbing_carries_a_split_token_without_touching_a_jwt_sentinel() {
+        let body = format!(r#"{{"token":"real-access","sentinel":"{JWT_ACCESS_SENTINEL}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = response.as_bytes();
+        let mut connection = connection();
+
+        // Split inside the real token and again inside the sentinel, so the
+        // scrubber has to carry a partial match across both writes.
+        let first = response.iter().position(|byte| *byte == b'a').unwrap() + 40;
+        let second = response.len() - 12;
+        let mut output = connection.scrub_response_chunk(&response[..first]).unwrap();
+        output.extend(
+            connection
+                .scrub_response_chunk(&response[first..second])
+                .unwrap(),
+        );
+        output.extend(
+            connection
+                .scrub_response_chunk(&response[second..])
+                .unwrap(),
+        );
+        output.extend(connection.finish_response_scrubbing().unwrap());
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("real-access"));
+        assert!(output.contains("***********"));
+        assert!(output.contains(JWT_ACCESS_SENTINEL));
+        assert_eq!(output.len(), response.len());
+    }
+
+    #[test]
+    fn broker_sentinels_are_checked_before_they_are_adopted() {
+        let mut grant = loaded(config());
+        let seen = vec![
+            Zeroizing::new("real-access".to_string()),
+            Zeroizing::new("real-refresh".to_string()),
+        ];
+
+        let error = grant
+            .adopt_sentinels(Some(String::new()), None, &seen)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinel is empty");
+
+        let error = grant
+            .adopt_sentinels(Some("x".repeat(MAX_OAUTH_SENTINEL_BYTES + 1)), None, &seen)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinel exceeds limit");
+
+        for broken in ["a\0b", "a\rb", "a\nb"] {
+            let error = grant
+                .adopt_sentinels(Some(broken.into()), None, &seen)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "OAuth broker sentinel contains a control character"
+            );
+        }
+
+        // A sentinel that is one of the real tokens would hand that token to
+        // the guest as its own stand-in.
+        let error = grant
+            .adopt_sentinels(Some("real-access".into()), None, &seen)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinel is a live token");
+
+        let error = grant
+            .adopt_sentinels(Some("same".into()), Some("same".into()), &seen)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "OAuth broker sentinels must differ");
+
+        assert_eq!(grant.access_sentinel, "$MSB_OAUTH_ACCESS_123");
+        grant
+            .adopt_sentinels(Some("x".repeat(MAX_OAUTH_SENTINEL_BYTES)), None, &seen)
+            .unwrap();
+        assert_eq!(grant.access_sentinel.len(), MAX_OAUTH_SENTINEL_BYTES);
+        assert_eq!(grant.refresh_sentinel, "$MSB_OAUTH_REFRESH_123");
+    }
+
+    #[tokio::test]
+    async fn acquire_response_sentinels_are_adopted_before_substitution() {
+        let broker = start_broker("real-access", "real-refresh");
+        let config = broker_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+
+        // The load that opened this connection named no sentinel.
+        assert_eq!(
+            connection.grants[0].access_sentinel,
+            "$MSB_OAUTH_ACCESS_123"
+        );
+
+        // The grant was re-minted elsewhere before this connection's first
+        // token request, so `acquire` is where the sentinel is learned.
+        broker.set_sentinels(JWT_ACCESS_SENTINEL, JWT_REFRESH_SENTINEL);
+        let refresh = form_request(
+            "/oauth/token",
+            &format!("grant_type=refresh_token&refresh_token={JWT_REFRESH_SENTINEL}"),
+        );
+        let upstream = String::from_utf8(
+            connection
+                .transform_requests(refresh.as_bytes(), "auth.example.com")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(connection.grants[0].access_sentinel, JWT_ACCESS_SENTINEL);
+        assert_eq!(connection.grants[0].refresh_sentinel, JWT_REFRESH_SENTINEL);
+        assert!(upstream.contains("refresh_token=real-refresh"));
+        assert!(!upstream.contains("eyJ"));
+    }
+
+    #[tokio::test]
+    async fn a_committed_token_is_never_adopted_as_its_own_sentinel() {
+        let broker = start_broker("old-access", "old-refresh");
+        broker.set_commit_sentinels("new-access", JWT_REFRESH_SENTINEL);
+        let config = broker_config(&broker);
+        let mut connection = OAuthConnection::new(&[config], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+
+        let refresh = form_request(
+            "/oauth/token",
+            "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+        );
+        connection
+            .transform_requests(refresh.as_bytes(), "auth.example.com")
+            .await
+            .unwrap();
+        let granted = json_response(
+            200,
+            r#"{"access_token":"new-access","refresh_token":"new-refresh"}"#,
+        );
+        let error = connection
+            .transform_responses(granted.as_bytes())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "OAuth broker sentinel is a live token");
     }
 }
