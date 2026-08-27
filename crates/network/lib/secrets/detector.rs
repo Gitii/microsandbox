@@ -24,9 +24,12 @@
 //! none of them is called `target`, which is where a `tracing` JSON layer
 //! configured with `flatten_event` puts the event's own target.
 //!
-//! `WARN` is chosen for the same reason denials are: the network stack runs in
-//! the sandbox subprocess, whose default filter is `INFO`, and whose stderr is
-//! captured into the runtime log a host-side consumer reads.
+//! `WARN` is chosen for the same reason denials are. The network stack runs in
+//! the sandbox subprocess, whose stderr is captured into the runtime log a
+//! host-side consumer reads, and whose default filter is `off` with one
+//! `=warn` directive per target that has to survive it — this one among them,
+//! in `crates/cli/lib/log_args.rs`. A finding nobody asked for a verbosity
+//! flag to see is the whole point of the module.
 //!
 //! Repeats are suppressed per `(sni, path)` for [`SUPPRESSION_WINDOW`], so a
 //! polling client produces a line rather than a stream of them. Suppression is
@@ -81,6 +84,11 @@ const DEFAULT_CREDENTIAL_FIELDS: [&str; 5] = [
 /// Largest header block followed. Past it the stream is dropped: a header
 /// block this size is not one this detector can say anything useful about.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// Longest request path kept, and so reported. A path is guest-controlled
+/// and unbounded; past this it is truncated, which bounds both the log line
+/// and the memory the pending queue holds.
+const MAX_LOGGED_PATH_BYTES: usize = 256;
 
 /// How many requests may be outstanding before the detector stops pairing
 /// responses with paths. A pipelining client past this loses the path, not
@@ -170,8 +178,10 @@ enum BodyFraming {
 impl CredentialDetector {
     /// Build a detector for one intercepted connection.
     ///
-    /// `active` is whether any grant is relevant to the connection: when one
-    /// is, the detector does nothing at all.
+    /// `active` is whether the connection is one *no* grant is relevant to,
+    /// which is the only place this detector belongs. Pass `false` for a
+    /// connection a grant covers — its responses are already sanitized — and
+    /// every method here is a no-op.
     pub(crate) fn new(oauth: &[OAuthSecret], sni: &str, port: u16, active: bool) -> Self {
         let mut fields: Vec<String> = DEFAULT_CREDENTIAL_FIELDS
             .iter()
@@ -222,7 +232,7 @@ impl CredentialDetector {
                                 self.pending.pop_front();
                             }
                             self.pending.push_back(PendingRequest {
-                                path,
+                                path: truncate_path(&path),
                                 head: method.eq_ignore_ascii_case("HEAD"),
                             });
                             match request_framing(&head) {
@@ -274,8 +284,14 @@ impl CredentialDetector {
                         state = Scan::Stopped;
                         break;
                     };
-                    // An informational response is a prelude: the request it
-                    // belongs to is still waiting for its real answer.
+                    // `101` hands the connection to another protocol, so
+                    // nothing after it is an HTTP message to follow.
+                    if parsed.status == 101 {
+                        state = Scan::Stopped;
+                        break;
+                    }
+                    // Any other informational response is a prelude: the
+                    // request it belongs to still awaits its real answer.
                     if (100..200).contains(&parsed.status) {
                         state = Scan::head();
                         continue;
@@ -463,8 +479,16 @@ fn admit(sni: &str, path: &str) -> bool {
     static REPORTED: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    let now = Instant::now();
-    let mut reported = REPORTED.lock().unwrap();
+    admit_into(&mut REPORTED.lock().unwrap(), Instant::now(), sni, path)
+}
+
+/// The decision itself, over a map the caller owns.
+fn admit_into(
+    reported: &mut HashMap<(String, String), Instant>,
+    now: Instant,
+    sni: &str,
+    path: &str,
+) -> bool {
     reported.retain(|_, seen| now.duration_since(*seen) < SUPPRESSION_WINDOW);
     let key = (sni.to_string(), path.to_string());
     if reported.contains_key(&key) {
@@ -474,6 +498,18 @@ fn admit(sni: &str, path: &str) -> bool {
         reported.insert(key, now);
     }
     true
+}
+
+/// Cut a path to [`MAX_LOGGED_PATH_BYTES`], on a character boundary.
+fn truncate_path(path: &str) -> String {
+    if path.len() <= MAX_LOGGED_PATH_BYTES {
+        return path.to_string();
+    }
+    let mut end = MAX_LOGGED_PATH_BYTES;
+    while end > 0 && !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    path[..end].to_string()
 }
 
 /// Take a complete header block out of `pending`, buffering a partial one.
@@ -795,5 +831,104 @@ mod tests {
         );
         assert!(logged.contains("fields=\"api_key\""), "{logged}");
         assert!(!logged.contains("kkkk"), "{logged}");
+    }
+
+    #[test]
+    fn nothing_after_a_protocol_upgrade_is_read_as_http() {
+        // `101` hands the connection to another protocol; whatever follows is
+        // that protocol's framing, and reading it as HTTP would be guesswork.
+        let logged = exchange(
+            "upgraded.example.com",
+            true,
+            b"GET /v1/socket HTTP/1.1\r\nHost: upgraded.example.com\r\nUpgrade: websocket\r\n\r\n",
+            &[
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+                json_response(r#"{"access_token":"the-real-token"}"#).as_bytes(),
+            ],
+        );
+
+        assert!(logged.is_empty(), "{logged}");
+    }
+
+    #[test]
+    fn a_chunked_body_past_the_size_cap_is_not_parsed() {
+        let padding = "x".repeat(MAX_BODY_BYTES);
+        let body = format!(r#"{{"access_token":"tok","padding":"{padding}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len(),
+        );
+
+        let logged = exchange(
+            "hugechunks.example.com",
+            true,
+            b"GET /v1/session HTTP/1.1\r\nHost: hugechunks.example.com\r\n\r\n",
+            &[response.as_bytes()],
+        );
+
+        assert!(logged.is_empty(), "{logged}");
+    }
+
+    #[test]
+    fn a_long_path_is_cut_to_the_bound_rather_than_logged_whole() {
+        let path = format!("/v1/{}", "p".repeat(MAX_LOGGED_PATH_BYTES));
+        let request = format!("GET {path} HTTP/1.1\r\nHost: long.example.com\r\n\r\n");
+
+        let logged = exchange(
+            "long.example.com",
+            true,
+            request.as_bytes(),
+            &[json_response(r#"{"api_key":"k"}"#).as_bytes()],
+        );
+
+        assert!(
+            logged.contains(&format!("path=\"{}\"", &path[..MAX_LOGGED_PATH_BYTES])),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn a_full_limiter_reports_rather_than_going_quiet() {
+        let mut reported = HashMap::new();
+        let now = Instant::now();
+        for index in 0..MAX_TRACKED_ENDPOINTS {
+            assert!(admit_into(
+                &mut reported,
+                now,
+                "host.example.com",
+                &format!("/path/{index}")
+            ));
+        }
+        assert_eq!(reported.len(), MAX_TRACKED_ENDPOINTS);
+
+        // No room to remember it, so it is reported every time rather than
+        // being dropped.
+        assert!(admit_into(
+            &mut reported,
+            now,
+            "host.example.com",
+            "/one-more"
+        ));
+        assert!(admit_into(
+            &mut reported,
+            now,
+            "host.example.com",
+            "/one-more"
+        ));
+        assert_eq!(reported.len(), MAX_TRACKED_ENDPOINTS);
+
+        // One it did remember stays suppressed until its window closes.
+        assert!(!admit_into(
+            &mut reported,
+            now,
+            "host.example.com",
+            "/path/0"
+        ));
+        assert!(admit_into(
+            &mut reported,
+            now + SUPPRESSION_WINDOW,
+            "host.example.com",
+            "/path/0"
+        ));
     }
 }

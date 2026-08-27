@@ -1953,7 +1953,10 @@ pub struct MintEndpoint {
     /// against the TLS SNI. Bare host only: no scheme, port, path or userinfo.
     pub host: String,
 
-    /// Exact request target, including any query string. Must start with `/`.
+    /// Exact request path, with no query string of its own.
+    ///
+    /// A request is matched on its path alone: whatever query the sandbox
+    /// appends, the endpoint it reached is this one. Must start with `/`.
     pub path: String,
 
     /// Top-level JSON field of the response that carries the minted secret.
@@ -2407,6 +2410,13 @@ fn validate_mint_endpoint(
     }
     if !mint.path.starts_with('/') {
         return Err(invalid("mint endpoint path must start with `/`"));
+    }
+    // The request's query is dropped before the comparison, so a configured
+    // one could never match anything.
+    if mint.path.contains('?') {
+        return Err(invalid(
+            "mint endpoint path must not contain a query string",
+        ));
     }
     if mint.path.contains([' ', '\0', '\r', '\n']) {
         return Err(invalid("mint endpoint path must not contain whitespace"));
@@ -3274,6 +3284,16 @@ mod tests {
             Err(SecretConfigError::InvalidOAuth {
                 grant_index: 0,
                 reason: "mint endpoint path must start with `/`",
+            })
+        );
+
+        let mut oauth = device_flow_oauth();
+        oauth.mint_endpoints = vec![mint("api.github.com", "/api/keys?scope=all", "raw_key")];
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "mint endpoint path must not contain a query string",
             })
         );
 

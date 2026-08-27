@@ -94,7 +94,10 @@ export type MintEndpoint = {
    */
   host: string;
   /**
-   * Exact request target, including any query string. Must start with `/`.
+   * Exact request path, with no query string of its own.
+   *
+   * A request is matched on its path alone: whatever query the sandbox
+   * appends, the endpoint it reached is this one. Must start with `/`.
    */
   path: string;
   /**
