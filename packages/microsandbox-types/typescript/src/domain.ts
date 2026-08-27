@@ -180,8 +180,9 @@ export type OAuthSecret = {
    * have the sentinel substituted back.
    *
    * The host must be one of [`inject_hosts`](Self::inject_hosts) or the
-   * token endpoint's host — anywhere else, the grant is not loaded for the
-   * connection and nothing would inspect the response.
+   * token endpoint's host: a mint endpoint is loaded for its own host and
+   * port, so one naming a host the grant says nothing else about is a
+   * grant reaching somewhere it never declared.
    */
   mint_endpoints: Array<MintEndpoint>;
   /**

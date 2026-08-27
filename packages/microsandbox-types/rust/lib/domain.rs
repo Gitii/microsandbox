@@ -1905,8 +1905,9 @@ pub struct OAuthSecret {
     /// have the sentinel substituted back.
     ///
     /// The host must be one of [`inject_hosts`](Self::inject_hosts) or the
-    /// token endpoint's host — anywhere else, the grant is not loaded for the
-    /// connection and nothing would inspect the response.
+    /// token endpoint's host: a mint endpoint is loaded for its own host and
+    /// port, so one naming a host the grant says nothing else about is a
+    /// grant reaching somewhere it never declared.
     #[serde(default)]
     pub mint_endpoints: Vec<MintEndpoint>,
     /// Hosts where the access sentinel may be substituted.
@@ -2393,11 +2394,12 @@ fn validate_oauth_endpoint(
 /// Check one minting endpoint.
 ///
 /// The host is a bare hostname rather than a URL: it is compared with the TLS
-/// SNI, which carries no scheme, port or path. It has to be a host the grant is
-/// already loaded for — an inject host, or the token endpoint's own host —
-/// because a connection to anywhere else never has this grant's response
-/// inspected, and a mint endpoint that silently does nothing is the failure
-/// this feature exists to prevent.
+/// SNI, which carries no scheme, port or path. It has to be a host the grant
+/// otherwise names — an inject host, or the token endpoint's own host. The
+/// connection loads the grant for the mint endpoint's own host and port, so
+/// this is not what makes the endpoint reachable; it keeps a grant's hosts to
+/// the ones it declares, rather than letting one entry quietly extend the
+/// grant to a host nothing else in it mentions.
 fn validate_mint_endpoint(
     mint: &MintEndpoint,
     oauth: &OAuthSecret,
