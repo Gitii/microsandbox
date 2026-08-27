@@ -1914,10 +1914,11 @@ pub struct OAuthSecret {
     /// supersedes this value for the connection that received it.
     ///
     /// Must be non-empty, at most 8192 bytes (`MAX_OAUTH_SENTINEL_BYTES`),
-    /// and must not contain NUL, CR, or LF. No two grants may share one.
+    /// and must not contain NUL, CR, or LF. No two sentinels, whether on this
+    /// grant or another, may be equal or contain one another.
     pub access_sentinel: String,
-    /// Per-sandbox refresh-token sentinel, under the same rules as
-    /// [`access_sentinel`](Self::access_sentinel).
+    /// Per-sandbox refresh-token sentinel, under the same rules as the access
+    /// sentinel above.
     pub refresh_sentinel: String,
 }
 
@@ -2132,17 +2133,20 @@ impl SecretsConfig {
             oauth.validate(index)?;
             // A sentinel shared by two grants would be substituted with
             // whichever grant the proxy reached first, so one grant's token
-            // would leave under the other's name.
-            let shared = self.oauth[..index].iter().any(|earlier| {
+            // would leave under the other's name. Containment is no safer than
+            // equality, so it is rejected on the same terms.
+            let overlapping = self.oauth[..index].iter().any(|earlier| {
                 [&earlier.access_sentinel, &earlier.refresh_sentinel]
-                    .contains(&&oauth.access_sentinel)
-                    || [&earlier.access_sentinel, &earlier.refresh_sentinel]
-                        .contains(&&oauth.refresh_sentinel)
+                    .into_iter()
+                    .any(|held| {
+                        sentinels_overlap(held, &oauth.access_sentinel)
+                            || sentinels_overlap(held, &oauth.refresh_sentinel)
+                    })
             });
-            if shared {
+            if overlapping {
                 return Err(SecretConfigError::InvalidOAuth {
                     grant_index: index,
-                    reason: "sentinels must not be shared with another grant",
+                    reason: "sentinels must not overlap another grant's sentinels",
                 });
             }
         }
@@ -2214,8 +2218,8 @@ impl OAuthSecret {
         validate_env_var(&self.refresh_env_var, grant_index)?;
         validate_sentinel(&self.access_sentinel, grant_index)?;
         validate_sentinel(&self.refresh_sentinel, grant_index)?;
-        if self.access_sentinel == self.refresh_sentinel {
-            return Err(invalid("access and refresh sentinels must differ"));
+        if sentinels_overlap(&self.access_sentinel, &self.refresh_sentinel) {
+            return Err(invalid("access and refresh sentinels must not overlap"));
         }
         Ok(())
     }
@@ -2341,6 +2345,17 @@ fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), Se
 /// a plain secret placeholder.
 fn validate_sentinel(sentinel: &str, grant_index: usize) -> Result<(), SecretConfigError> {
     validate_placeholder_bytes(sentinel, grant_index, MAX_OAUTH_SENTINEL_BYTES)
+}
+
+/// Whether either of two sentinels occurs inside the other.
+///
+/// Substitution walks one sentinel at a time, so an overlapping pair is not
+/// merely ambiguous: replacing the longer one first leaves nothing of the
+/// shorter, and replacing the shorter one first leaves the rest of the longer
+/// wrapped around a real token. The runtime rejects a broker-reported sentinel
+/// on these terms, and configuration is held to the same rule.
+fn sentinels_overlap(left: &str, right: &str) -> bool {
+    !left.is_empty() && !right.is_empty() && (left.contains(right) || right.contains(left))
 }
 
 fn validate_placeholder_bytes(
@@ -2973,9 +2988,92 @@ mod tests {
             config.validate(),
             Err(SecretConfigError::InvalidOAuth {
                 grant_index: 1,
-                reason: "sentinels must not be shared with another grant",
+                reason: "sentinels must not overlap another grant's sentinels",
             })
         );
+    }
+
+    #[test]
+    fn oauth_sentinels_may_not_overlap_another_grant() {
+        let first = device_flow_oauth();
+        let mut second = device_flow_oauth();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+
+        // The second grant's access sentinel contains the first grant's.
+        second.access_sentinel = format!("{}_2", first.access_sentinel);
+        let mut config = SecretsConfig {
+            oauth: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 1,
+                reason: "sentinels must not overlap another grant's sentinels",
+            })
+        );
+
+        // And the other way round: the first grant's refresh sentinel contains
+        // the second grant's.
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = first.refresh_sentinel[..3].to_string();
+        assert!(!second.refresh_sentinel.is_empty());
+        config.oauth = vec![first, second];
+        assert_eq!(
+            config.validate(),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 1,
+                reason: "sentinels must not overlap another grant's sentinels",
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_sentinels_may_not_overlap_within_a_grant() {
+        let mut oauth = device_flow_oauth();
+        oauth.access_sentinel = "$MSB_ACCESS".into();
+        oauth.refresh_sentinel = "$MSB_ACCESS_2".into();
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "access and refresh sentinels must not overlap",
+            })
+        );
+
+        // Contained-by is rejected on the same terms as contains.
+        oauth.access_sentinel = "$MSB_ACCESS_2".into();
+        oauth.refresh_sentinel = "$MSB_ACCESS".into();
+        assert_eq!(
+            oauth.validate(0),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 0,
+                reason: "access and refresh sentinels must not overlap",
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_sentinels_of_equal_length_still_pass() {
+        // Distinct sentinels of the same length cannot contain one another, so
+        // the overlap rule leaves the ordinary case alone.
+        let mut first = device_flow_oauth();
+        first.access_sentinel = "$MSB_ACCESS_A".into();
+        first.refresh_sentinel = "$MSB_REFRSH_A".into();
+        let mut second = device_flow_oauth();
+        second.access_sentinel = "$MSB_ACCESS_B".into();
+        second.refresh_sentinel = "$MSB_REFRSH_B".into();
+        assert_eq!(
+            first.access_sentinel.len(),
+            second.refresh_sentinel.len(),
+            "the sentinels under test must be the same length"
+        );
+        let config = SecretsConfig {
+            oauth: vec![first, second],
+            ..Default::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

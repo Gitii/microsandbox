@@ -170,12 +170,13 @@ export type OAuthSecret = {
    * supersedes this value for the connection that received it.
    *
    * Must be non-empty, at most 8192 bytes (`MAX_OAUTH_SENTINEL_BYTES`),
-   * and must not contain NUL, CR, or LF. No two grants may share one.
+   * and must not contain NUL, CR, or LF. No two sentinels, whether on this
+   * grant or another, may be equal or contain one another.
    */
   access_sentinel: string;
   /**
-   * Per-sandbox refresh-token sentinel, under the same rules as
-   * [`access_sentinel`](Self::access_sentinel).
+   * Per-sandbox refresh-token sentinel, under the same rules as the access
+   * sentinel above.
    */
   refresh_sentinel: string;
 };
