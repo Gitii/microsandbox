@@ -2130,6 +2130,21 @@ impl SecretsConfig {
         }
         for (index, oauth) in self.oauth.iter().enumerate() {
             oauth.validate(index)?;
+            // A sentinel shared by two grants would be substituted with
+            // whichever grant the proxy reached first, so one grant's token
+            // would leave under the other's name.
+            let shared = self.oauth[..index].iter().any(|earlier| {
+                [&earlier.access_sentinel, &earlier.refresh_sentinel]
+                    .contains(&&oauth.access_sentinel)
+                    || [&earlier.access_sentinel, &earlier.refresh_sentinel]
+                        .contains(&&oauth.refresh_sentinel)
+            });
+            if shared {
+                return Err(SecretConfigError::InvalidOAuth {
+                    grant_index: index,
+                    reason: "sentinels must not be shared with another grant",
+                });
+            }
         }
         Ok(())
     }
@@ -2936,6 +2951,31 @@ mod tests {
     #[test]
     fn oauth_access_and_refresh_token_fields_may_be_the_same() {
         assert_eq!(device_flow_oauth().validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_sentinels_may_not_be_shared_between_grants() {
+        let first = device_flow_oauth();
+        let mut second = device_flow_oauth();
+        second.access_sentinel = "$OTHER_ACCESS".into();
+        second.refresh_sentinel = "$OTHER_REFRESH".into();
+        let mut config = SecretsConfig {
+            oauth: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+
+        // The second grant's refresh sentinel is the first grant's access
+        // sentinel.
+        second.refresh_sentinel = first.access_sentinel.clone();
+        config.oauth = vec![first, second];
+        assert_eq!(
+            config.validate(),
+            Err(SecretConfigError::InvalidOAuth {
+                grant_index: 1,
+                reason: "sentinels must not be shared with another grant",
+            })
+        );
     }
 
     #[test]
