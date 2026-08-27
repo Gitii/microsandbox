@@ -7,7 +7,7 @@
 //! engine-internal query helpers used by the proxy.
 
 pub use microsandbox_types::{
-    HostPattern, MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, OAuthSecret,
+    HostPattern, MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, MintEndpoint, OAuthSecret,
     SecretConfigError, SecretEntry, SecretInjection, SecretSource, SecretsConfig, ViolationAction,
 };
 

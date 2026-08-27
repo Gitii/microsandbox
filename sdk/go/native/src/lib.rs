@@ -925,6 +925,8 @@ struct OAuthSecretOpts {
     poll_endpoint: Option<String>,
     #[serde(default)]
     poll_secret_fields: Vec<String>,
+    #[serde(default)]
+    mint_endpoints: Vec<MintEndpointOpts>,
     inject_hosts: Vec<String>,
     access_token_field: String,
     refresh_token_field: String,
@@ -932,6 +934,13 @@ struct OAuthSecretOpts {
     refresh_env_var: String,
     access_sentinel: String,
     refresh_sentinel: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MintEndpointOpts {
+    host: String,
+    path: String,
+    field: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1731,7 +1740,7 @@ fn apply_oauth_secret(
     oauth: OAuthSecretOpts,
 ) -> microsandbox::sandbox::SandboxBuilder {
     use microsandbox::sandbox::OAuthSecret;
-    use microsandbox_network::secrets::config::HostPattern;
+    use microsandbox_network::secrets::config::{HostPattern, MintEndpoint};
 
     builder.oauth_secret(OAuthSecret {
         broker_endpoint: oauth.broker_endpoint,
@@ -1740,6 +1749,15 @@ fn apply_oauth_secret(
         device_code_endpoint: oauth.device_code_endpoint,
         poll_endpoint: oauth.poll_endpoint,
         poll_secret_fields: oauth.poll_secret_fields,
+        mint_endpoints: oauth
+            .mint_endpoints
+            .into_iter()
+            .map(|mint| MintEndpoint {
+                host: mint.host,
+                path: mint.path,
+                field: mint.field,
+            })
+            .collect(),
         inject_hosts: oauth
             .inject_hosts
             .iter()

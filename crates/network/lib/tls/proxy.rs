@@ -478,7 +478,7 @@ pub(crate) async fn intercept_relay(
                         let data = if oauth.is_token_host() {
                             oauth.transform_responses(&server_buf[..n]).await?
                         } else if !oauth.is_empty() {
-                            oauth.scrub_response_chunk(&server_buf[..n])?
+                            oauth.scrub_response_chunk(&server_buf[..n]).await?
                         } else {
                             server_buf[..n].to_vec()
                         };

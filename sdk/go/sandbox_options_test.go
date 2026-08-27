@@ -654,13 +654,18 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 		DeviceCodeEndpoint: "https://login.example.com/oauth/device/code",
 		PollEndpoint:       "https://login.example.com/oauth/device/token",
 		PollSecretFields:   []string{"authorization_code", "code_verifier"},
-		InjectHosts:        []string{"api.example.com", "*.service.example.com"},
-		AccessTokenField:   "access_token",
-		RefreshTokenField:  "refresh_token",
-		AccessEnvVar:       "OAUTH_ACCESS_TOKEN",
-		RefreshEnvVar:      "OAUTH_REFRESH_TOKEN",
-		AccessSentinel:     "$MSB_OAUTH_ACCESS_abc",
-		RefreshSentinel:    "$MSB_OAUTH_REFRESH_abc",
+		MintEndpoints: []OAuthMintEndpoint{{
+			Host:  "api.example.com",
+			Path:  "/api/oauth/claude_cli/create_api_key",
+			Field: "raw_key",
+		}},
+		InjectHosts:       []string{"api.example.com", "*.service.example.com"},
+		AccessTokenField:  "access_token",
+		RefreshTokenField: "refresh_token",
+		AccessEnvVar:      "OAUTH_ACCESS_TOKEN",
+		RefreshEnvVar:     "OAUTH_REFRESH_TOKEN",
+		AccessSentinel:    "$MSB_OAUTH_ACCESS_abc",
+		RefreshSentinel:   "$MSB_OAUTH_REFRESH_abc",
 	}))
 	grants := mustField(t, got, "oauth_secrets").([]any)
 	if len(grants) != 1 {
@@ -682,6 +687,20 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 	} {
 		if grant[key] != want {
 			t.Fatalf("%s = %v, want %q", key, grant[key], want)
+		}
+	}
+	mints, ok := grant["mint_endpoints"].([]any)
+	if !ok || len(mints) != 1 {
+		t.Fatalf("mint_endpoints = %v", grant["mint_endpoints"])
+	}
+	mint := mints[0].(map[string]any)
+	for key, want := range map[string]string{
+		"host":  "api.example.com",
+		"path":  "/api/oauth/claude_cli/create_api_key",
+		"field": "raw_key",
+	} {
+		if mint[key] != want {
+			t.Fatalf("mint_endpoints[0].%s = %v, want %q", key, mint[key], want)
 		}
 	}
 	fields, ok := grant["poll_secret_fields"].([]any)
