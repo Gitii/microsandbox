@@ -1665,6 +1665,11 @@ fn replace_same_length(data: &[u8], token: &[u8]) -> Vec<u8> {
 /// them, but the sentinel itself is matched byte for byte: a JWT-shaped
 /// sentinel is base64url, where case is significant. Every `Authorization`
 /// header carrying the sentinel is replaced, not just the first.
+///
+/// The name has to start a header line — the request line and every header
+/// before it end in CRLF — so a header whose name merely ends in
+/// `authorization`, such as `X-Retry-Authorization`, is not one of ours and
+/// keeps whatever it carries.
 fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> {
     const MARKER: &[u8] = b"authorization: bearer ";
     if sentinel.is_empty() || data.len() < MARKER.len() {
@@ -1680,10 +1685,15 @@ fn replace_bearer_header(data: &[u8], sentinel: &[u8], token: &[u8]) -> Vec<u8> 
         else {
             break;
         };
-        let value_start = cursor + offset + MARKER.len();
+        let name_start = cursor + offset;
+        let value_start = name_start + MARKER.len();
         let value_end = value_start + sentinel.len();
+        let starts_header_line = name_start >= 2 && &data[name_start - 2..name_start] == b"\r\n";
         output.extend_from_slice(&data[cursor..value_start]);
-        if data.len() >= value_end && &data[value_start..value_end] == sentinel {
+        if starts_header_line
+            && data.len() >= value_end
+            && &data[value_start..value_end] == sentinel
+        {
             output.extend_from_slice(token);
             cursor = value_end;
         } else {
@@ -4170,6 +4180,26 @@ mod tests {
         assert_eq!(output.matches("Bearer real-access").count(), 2);
         assert!(output.contains("Bearer someone-elses"));
         assert!(!output.contains("eyJ"));
+    }
+
+    #[test]
+    fn a_header_whose_name_merely_ends_in_authorization_is_left_alone() {
+        let request = format!(
+            "GET /v1 HTTP/1.1\r\nX-Retry-Authorization: Bearer {JWT_ACCESS_SENTINEL}\r\nAuthorization: Bearer {JWT_ACCESS_SENTINEL}\r\n\r\n"
+        );
+
+        let output = replace_bearer_header(
+            request.as_bytes(),
+            JWT_ACCESS_SENTINEL.as_bytes(),
+            b"real-access",
+        );
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!(
+            "X-Retry-Authorization: Bearer {JWT_ACCESS_SENTINEL}\r\n"
+        )));
+        assert!(output.contains("\r\nAuthorization: Bearer real-access\r\n"));
+        assert_eq!(output.matches("real-access").count(), 1);
     }
 
     #[tokio::test]
