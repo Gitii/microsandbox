@@ -183,6 +183,11 @@ export type OAuthSecret = {
    * token endpoint's host: a mint endpoint is loaded for its own host and
    * port, so one naming a host the grant says nothing else about is a
    * grant reaching somewhere it never declared.
+   *
+   * It is the endpoint's own host *and port* that load the grant, so an
+   * endpoint served anywhere but 443 has to name its port in
+   * [`port`](MintEndpoint::port) or the connection carrying it is never
+   * recognised.
    */
   mint_endpoints: Array<MintEndpoint>;
   /**

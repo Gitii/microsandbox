@@ -2774,11 +2774,13 @@ fn random_sentinel(kind: &str) -> String {
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::net::UnixListener;
 
     use super::*;
     use crate::secrets::config::HostPattern;
+    use crate::shared::ResolvedHostnameFamily;
 
     fn config() -> OAuthSecret {
         OAuthSecret {
@@ -5643,8 +5645,61 @@ mod tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains(RAW_KEY), "guest body: {output}");
+        assert!(
+            output.contains("$MSB_OAUTH_MINT_00"),
+            "guest body: {output}"
+        );
         assert_eq!(broker.mints().len(), 1);
         assert_eq!(broker.mints()[0]["value"], RAW_KEY);
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_still_needs_the_guest_to_have_resolved_its_host() {
+        // The mint endpoint's host is compared with the TLS SNI, and an SNI is
+        // whatever the guest wrote. On an identified connection the grant is
+        // loaded only where the guest resolved that name itself, exactly as
+        // the flow's other endpoints are.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].host = "console.anthropic.com".into();
+        config.mint_endpoints[0].port = Some(8443);
+        let guest: IpAddr = "10.0.2.15".parse().unwrap();
+        let shared = SharedState::new(4);
+
+        let connection = OAuthConnection::new_tls_intercepted(
+            std::slice::from_ref(&config),
+            "console.anthropic.com",
+            8443,
+            guest,
+            &shared,
+        )
+        .await
+        .unwrap();
+        assert!(
+            connection.is_empty(),
+            "an SNI the guest never resolved loads nothing",
+        );
+
+        shared.cache_resolved_hostname(
+            "console.anthropic.com",
+            ResolvedHostnameFamily::Ipv4,
+            [guest],
+            Duration::from_secs(30),
+        );
+        let connection = OAuthConnection::new_tls_intercepted(
+            &[config],
+            "console.anthropic.com",
+            8443,
+            guest,
+            &shared,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !connection.is_empty(),
+            "the resolved host loads the grant for its mint endpoint",
+        );
     }
 
     #[tokio::test]
