@@ -1905,8 +1905,14 @@ pub struct OAuthSecret {
     /// have the sentinel substituted back.
     ///
     /// The host must be one of [`inject_hosts`](Self::inject_hosts) or the
-    /// token endpoint's host — anywhere else, the grant is not loaded for the
-    /// connection and nothing would inspect the response.
+    /// token endpoint's host: a mint endpoint is loaded for its own host and
+    /// port, so one naming a host the grant says nothing else about is a
+    /// grant reaching somewhere it never declared.
+    ///
+    /// It is the endpoint's own host *and port* that load the grant, so an
+    /// endpoint served anywhere but 443 has to name its port in
+    /// [`port`](MintEndpoint::port) or the connection carrying it is never
+    /// recognised.
     #[serde(default)]
     pub mint_endpoints: Vec<MintEndpoint>,
     /// Hosts where the access sentinel may be substituted.
@@ -2393,11 +2399,12 @@ fn validate_oauth_endpoint(
 /// Check one minting endpoint.
 ///
 /// The host is a bare hostname rather than a URL: it is compared with the TLS
-/// SNI, which carries no scheme, port or path. It has to be a host the grant is
-/// already loaded for — an inject host, or the token endpoint's own host —
-/// because a connection to anywhere else never has this grant's response
-/// inspected, and a mint endpoint that silently does nothing is the failure
-/// this feature exists to prevent.
+/// SNI, which carries no scheme, port or path. It has to be a host the grant
+/// otherwise names — an inject host, or the token endpoint's own host. The
+/// connection loads the grant for the mint endpoint's own host and port, so
+/// this is not what makes the endpoint reachable; it keeps a grant's hosts to
+/// the ones it declares, rather than letting one entry quietly extend the
+/// grant to a host nothing else in it mentions.
 fn validate_mint_endpoint(
     mint: &MintEndpoint,
     oauth: &OAuthSecret,
@@ -2437,12 +2444,12 @@ fn validate_mint_endpoint(
         return Err(invalid("mint endpoint port must not be zero"));
     }
     let token_host = oauth_endpoint_host(&oauth.token_endpoint);
-    let reachable = token_host.is_some_and(|host| host.eq_ignore_ascii_case(&mint.host))
+    let declared = token_host.is_some_and(|host| host.eq_ignore_ascii_case(&mint.host))
         || oauth
             .inject_hosts
             .iter()
             .any(|pattern| pattern.matches(&mint.host));
-    if !reachable {
+    if !declared {
         return Err(invalid(
             "mint endpoint host must be an inject host or the token endpoint host",
         ));
@@ -3322,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_mint_endpoint_host_is_refused() {
+    fn a_mint_endpoint_host_the_grant_does_not_name_is_refused() {
         let mut oauth = device_flow_oauth();
         oauth.mint_endpoints = vec![MintEndpoint {
             host: "keys.example.com".into(),
@@ -3338,8 +3345,8 @@ mod tests {
             })
         );
 
-        // The token endpoint's own host is reachable: the grant is loaded for
-        // every connection that carries the flow.
+        // The token endpoint's own host is one the grant already names, so a
+        // mint endpoint may sit on it.
         let mut oauth = device_flow_oauth();
         oauth.mint_endpoints = vec![MintEndpoint {
             host: "github.com".into(),

@@ -399,13 +399,23 @@ impl OAuthConnection {
             let endpoint_relevant = is_relevant(&token)
                 || device_code.as_ref().is_some_and(&is_relevant)
                 || poll.as_ref().is_some_and(&is_relevant);
+            // A mint endpoint is an endpoint of the flow too, and it carries
+            // its own host and port rather than a URL. Its host may be the
+            // token endpoint's without being an inject host, and its port
+            // need not be the token endpoint's, so without this a connection
+            // that reaches only the mint endpoint loads no grant and its
+            // response is forwarded with the minted secret in it.
+            let mint_relevant = config
+                .mint_endpoints
+                .iter()
+                .any(|endpoint| host_allowed(mint_endpoint_here(endpoint, sni, port)));
             let inject_relevant = config.inject_hosts.iter().any(|host| {
                 identity.map_or_else(
                     || host.matches(sni),
                     |(guest_ip, shared)| host_pattern_allowed_for_tls(host, sni, guest_ip, shared),
                 )
             });
-            let relevant = endpoint_relevant || inject_relevant;
+            let relevant = endpoint_relevant || mint_relevant || inject_relevant;
             if !relevant {
                 continue;
             }
@@ -2764,11 +2774,13 @@ fn random_sentinel(kind: &str) -> String {
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::net::UnixListener;
 
     use super::*;
     use crate::secrets::config::HostPattern;
+    use crate::shared::ResolvedHostnameFamily;
 
     fn config() -> OAuthSecret {
         OAuthSecret {
@@ -5594,6 +5606,100 @@ mod tests {
 
         assert!(!String::from_utf8(output).unwrap().contains(RAW_KEY));
         assert_eq!(broker.mints().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_on_a_non_token_port_of_the_token_host_mints() {
+        // The only thing this grant has on the connection is its mint
+        // endpoint: the host is the token endpoint's rather than an inject
+        // host, and the port is not the token endpoint's either. The grant
+        // still has to be loaded, or the minted key is forwarded in the clear.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].host = "console.anthropic.com".into();
+        config.mint_endpoints[0].port = Some(8443);
+        let mut connection = OAuthConnection::new(&[config], "console.anthropic.com", 8443, None)
+            .await
+            .unwrap();
+        assert!(
+            !connection.is_empty(),
+            "the mint endpoint alone loads the grant"
+        );
+
+        connection
+            .transform_requests(
+                json_request("/api/oauth/claude_cli/create_api_key", "{}").as_bytes(),
+                "console.anthropic.com",
+            )
+            .await
+            .unwrap();
+        let response = json_response(200, &format!(r#"{{"raw_key":"{RAW_KEY}"}}"#));
+        assert!(
+            response.contains(RAW_KEY),
+            "the upstream body carries the key"
+        );
+        let output = connection
+            .scrub_response_chunk(response.as_bytes())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains(RAW_KEY), "guest body: {output}");
+        assert!(
+            output.contains("$MSB_OAUTH_MINT_00"),
+            "guest body: {output}"
+        );
+        assert_eq!(broker.mints().len(), 1);
+        assert_eq!(broker.mints()[0]["value"], RAW_KEY);
+    }
+
+    #[tokio::test]
+    async fn a_mint_endpoint_still_needs_the_guest_to_have_resolved_its_host() {
+        // The mint endpoint's host is compared with the TLS SNI, and an SNI is
+        // whatever the guest wrote. On an identified connection the grant is
+        // loaded only where the guest resolved that name itself, exactly as
+        // the flow's other endpoints are.
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = anthropic_config(&broker);
+        config.mint_endpoints[0].host = "console.anthropic.com".into();
+        config.mint_endpoints[0].port = Some(8443);
+        let guest: IpAddr = "10.0.2.15".parse().unwrap();
+        let shared = SharedState::new(4);
+
+        let connection = OAuthConnection::new_tls_intercepted(
+            std::slice::from_ref(&config),
+            "console.anthropic.com",
+            8443,
+            guest,
+            &shared,
+        )
+        .await
+        .unwrap();
+        assert!(
+            connection.is_empty(),
+            "an SNI the guest never resolved loads nothing",
+        );
+
+        shared.cache_resolved_hostname(
+            "console.anthropic.com",
+            ResolvedHostnameFamily::Ipv4,
+            [guest],
+            Duration::from_secs(30),
+        );
+        let connection = OAuthConnection::new_tls_intercepted(
+            &[config],
+            "console.anthropic.com",
+            8443,
+            guest,
+            &shared,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !connection.is_empty(),
+            "the resolved host loads the grant for its mint endpoint",
+        );
     }
 
     #[tokio::test]
