@@ -919,6 +919,12 @@ struct OAuthSecretOpts {
     broker_endpoint: String,
     grant_id: String,
     token_endpoint: String,
+    #[serde(default)]
+    device_code_endpoint: Option<String>,
+    #[serde(default)]
+    poll_endpoint: Option<String>,
+    #[serde(default)]
+    poll_secret_fields: Vec<String>,
     inject_hosts: Vec<String>,
     access_token_field: String,
     refresh_token_field: String,
@@ -1731,6 +1737,9 @@ fn apply_oauth_secret(
         broker_endpoint: oauth.broker_endpoint,
         grant_id: oauth.grant_id,
         token_endpoint: oauth.token_endpoint,
+        device_code_endpoint: oauth.device_code_endpoint,
+        poll_endpoint: oauth.poll_endpoint,
+        poll_secret_fields: oauth.poll_secret_fields,
         inject_hosts: oauth
             .inject_hosts
             .iter()
