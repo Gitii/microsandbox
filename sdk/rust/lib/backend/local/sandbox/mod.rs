@@ -195,6 +195,18 @@ impl LocalBackend {
 
         let all_dead = pids.is_empty() || pids.iter().all(|pid| Self::pid_is_dead_or_reaped(*pid));
         if all_dead {
+            // SIGKILL leaves the runtime's exit observer unrun, so nothing has
+            // unlinked the endpoint files. Remove them here, before the row
+            // goes terminal: a caller waiting on the status may create a
+            // sandbox under this name the moment it flips, and a stale socket
+            // sitting at that path is one the new VM would have to reclaim.
+            // Safe to do only under `all_dead` — the signalled process is gone
+            // and cannot be serving these paths — and safe against another
+            // creator, which cannot claim the name while the row is still
+            // Running or Draining.
+            for sock_path in crate::runtime::sandbox_agent_socket_path_candidates_for(self, name) {
+                microsandbox_runtime::vm::remove_agent_endpoint_files(&sock_path);
+            }
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await
             {

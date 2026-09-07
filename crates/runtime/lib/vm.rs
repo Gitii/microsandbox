@@ -653,10 +653,6 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         &config,
         console_backend,
         move |exit_code: i32| {
-            use microsandbox_db::entity::sandbox as sandbox_entity;
-            use sea_orm::QueryFilter;
-            use sea_orm::sea_query::Expr;
-
             // Map (exit_code, reason tag) → TerminationReason.
             let reason_tag = exit_reason_for_observer.load(std::sync::atomic::Ordering::SeqCst);
             let reason = match reason_tag {
@@ -681,33 +677,18 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     tracing::warn!(%error, "release CPU placement at VM exit");
                 }
 
-                // Mark run as terminated with exit code and reason.
-                let _ = run_entity::Entity::update_many()
-                    .col_expr(
-                        run_entity::Column::Status,
-                        Expr::value(run_entity::RunStatus::Terminated),
-                    )
-                    .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
-                    .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
-                    .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
-                    .filter(run_entity::Column::Id.eq(exit_run_id))
-                    .exec(&exit_db)
-                    .await;
-
-                // Mark sandbox as stopped.
-                let _ = sandbox_entity::Entity::update_many()
-                    .col_expr(
-                        sandbox_entity::Column::Status,
-                        Expr::value(sandbox_entity::SandboxStatus::Stopped),
-                    )
-                    .col_expr(
-                        sandbox_entity::Column::ActiveConfig,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-                    .filter(sandbox_entity::Column::Id.eq(exit_sandbox_id))
-                    .exec(&exit_db)
-                    .await;
+                // Retire the endpoint files and then the rows. The unlink
+                // leads deliberately: see `finish_terminated_run`.
+                finish_terminated_run(
+                    &exit_db,
+                    &exit_sock_path,
+                    exit_sandbox_id,
+                    exit_run_id,
+                    exit_code,
+                    reason,
+                    now,
+                )
+                .await;
 
                 // Self-clean: if this sandbox was created ephemeral, drop its
                 // persisted row + directory now that it is terminal. Reads
@@ -757,10 +738,6 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             if let Some(flush) = exit_policy_flush.get() {
                 flush();
             }
-
-            // Clean up agent.sock — the relay's async cleanup won't run because
-            // _exit() is called immediately after this observer returns.
-            let _ = std::fs::remove_file(&exit_sock_path);
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
@@ -849,13 +826,16 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 shutdown_flush_timeout,
             )
         {
+            // Same ordering as the exit observer: the endpoint files go before
+            // the row that releases a waiter, so a recreate under this name
+            // cannot have its socket unlinked from under it.
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             if let Some(writer) = metrics_writer.clone() {
                 let _ = writer.release(ReleaseMode::Free);
             } else {
                 release_reserved_metrics_slot(config.metrics_slot.as_ref());
             }
-            let _ = std::fs::remove_file(&config.agent_sock_path);
             return Err(e);
         }
     }
@@ -2316,6 +2296,81 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions: Teardown
+//--------------------------------------------------------------------------------------------------
+
+/// Remove the host-side endpoint files that belong to `agent_sock_path`: the
+/// agent socket itself and the control socket derived from it.
+///
+/// Unlinking a bound unix socket only removes the name; connections already
+/// accepted keep working, so this is safe to call while the listeners are
+/// still up. Errors are ignored — a missing file is the desired state, and
+/// the caller is on a teardown path with nothing to report to.
+pub fn remove_agent_endpoint_files(agent_sock_path: &Path) {
+    let _ = std::fs::remove_file(agent_sock_path);
+    let _ = std::fs::remove_file(crate::control::control_socket_path_for(agent_sock_path));
+}
+
+/// Retire a run and its sandbox row, endpoint files first.
+///
+/// The unlink leads the writes on purpose. Guard: a caller that stops a
+/// sandbox and immediately creates one under the same name — Distributed's
+/// soft reset does exactly this — races the unlink otherwise. Callers wait on
+/// the sandbox status (`Stop`, `WaitUntilStopped`, `RemoveSandbox`), so if the
+/// row went terminal first the new sandbox could bind the same socket path and
+/// then lose it to this process's late unlink, leaving a live VM whose agent
+/// endpoint has no name: "has no agent endpoint (is it running?)". Removing
+/// the files first means every waiter the status releases sees paths that are
+/// already gone, and nothing this process does afterwards touches them.
+///
+/// The two writes keep their order — run first, then sandbox. Failures are
+/// swallowed: this runs on the VMM thread just before `_exit()`, and the
+/// maintenance sweep reconciles a row this misses.
+pub(crate) async fn finish_terminated_run(
+    db: &DbWriteConnection,
+    agent_sock_path: &Path,
+    sandbox_id: i32,
+    run_id: i32,
+    exit_code: i32,
+    reason: run_entity::TerminationReason,
+    now: chrono::NaiveDateTime,
+) {
+    use microsandbox_db::entity::sandbox as sandbox_entity;
+    use sea_orm::QueryFilter;
+    use sea_orm::sea_query::Expr;
+
+    remove_agent_endpoint_files(agent_sock_path);
+
+    // Mark run as terminated with exit code and reason.
+    let _ = run_entity::Entity::update_many()
+        .col_expr(
+            run_entity::Column::Status,
+            Expr::value(run_entity::RunStatus::Terminated),
+        )
+        .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
+        .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
+        .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
+        .filter(run_entity::Column::Id.eq(run_id))
+        .exec(db)
+        .await;
+
+    // Mark sandbox as stopped.
+    let _ = sandbox_entity::Entity::update_many()
+        .col_expr(
+            sandbox_entity::Column::Status,
+            Expr::value(sandbox_entity::SandboxStatus::Stopped),
+        )
+        .col_expr(
+            sandbox_entity::Column::ActiveConfig,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
+        .filter(sandbox_entity::Column::Id.eq(sandbox_id))
+        .exec(db)
+        .await;
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -2693,5 +2748,214 @@ mod tests {
         let mut env = vec!["PATH=/.msb/scripts:/usr/bin".to_string()];
         prepend_scripts_path(&mut env);
         assert_eq!(env, vec!["PATH=/.msb/scripts:/usr/bin".to_string()]);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Tests: Teardown Ordering
+    //----------------------------------------------------------------------------------------------
+
+    mod teardown {
+        use std::time::Duration;
+
+        use microsandbox_db::DbWriteConnection;
+        use microsandbox_db::entity::{run as run_entity, sandbox as sandbox_entity};
+        use microsandbox_migration::{Migrator, MigratorTrait};
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+        };
+        use tempfile::TempDir;
+
+        use crate::vm::{finish_terminated_run, remove_agent_endpoint_files};
+
+        /// A sandbox row, its running run, and the two endpoint files a live
+        /// sandbox process owns.
+        struct Fixture {
+            _dir: TempDir,
+            db_path: std::path::PathBuf,
+            db: DbWriteConnection,
+            sandbox_id: i32,
+            run_id: i32,
+            agent_sock: std::path::PathBuf,
+            control_sock: std::path::PathBuf,
+        }
+
+        async fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.db");
+            // A generous busy timeout: one test deliberately freezes the
+            // database under this connection and must not race SQLITE_BUSY.
+            let db =
+                DbWriteConnection::open(&db_path, Duration::from_secs(5), Duration::from_secs(30))
+                    .await
+                    .unwrap();
+            Migrator::up(db.inner(), None).await.unwrap();
+
+            let now = chrono::Utc::now().naive_utc();
+            let sandbox_id = sandbox_entity::ActiveModel {
+                name: Set("soft-reset".to_string()),
+                config: Set("{}".to_string()),
+                status: Set(sandbox_entity::SandboxStatus::Running),
+                ephemeral: Set(false),
+                created_at: Set(Some(now)),
+                updated_at: Set(Some(now)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap()
+            .id;
+            let run_id = run_entity::ActiveModel {
+                sandbox_id: Set(sandbox_id),
+                pid: Set(Some(std::process::id() as i32)),
+                status: Set(run_entity::RunStatus::Running),
+                started_at: Set(Some(now)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap()
+            .id;
+
+            let agent_sock = dir.path().join("soft-reset.sock");
+            let control_sock = crate::control::control_socket_path_for(&agent_sock);
+            std::fs::write(&agent_sock, b"").unwrap();
+            std::fs::write(&control_sock, b"").unwrap();
+
+            Fixture {
+                _dir: dir,
+                db_path,
+                db,
+                sandbox_id,
+                run_id,
+                agent_sock,
+                control_sock,
+            }
+        }
+
+        async fn status_of(db: &DbWriteConnection, id: i32) -> sandbox_entity::SandboxStatus {
+            sandbox_entity::Entity::find_by_id(id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        }
+
+        #[test]
+        fn removes_both_endpoint_files() {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_sock = dir.path().join("name.sock");
+            let control_sock = crate::control::control_socket_path_for(&agent_sock);
+            std::fs::write(&agent_sock, b"").unwrap();
+            std::fs::write(&control_sock, b"").unwrap();
+
+            remove_agent_endpoint_files(&agent_sock);
+
+            assert!(!agent_sock.exists(), "agent socket should be gone");
+            assert!(!control_sock.exists(), "control socket should be gone");
+            // Idempotent: a second teardown pass must not panic or error.
+            remove_agent_endpoint_files(&agent_sock);
+        }
+
+        #[tokio::test]
+        async fn terminal_row_leaves_no_endpoint_files() {
+            let f = fixture().await;
+
+            finish_terminated_run(
+                &f.db,
+                &f.agent_sock,
+                f.sandbox_id,
+                f.run_id,
+                0,
+                run_entity::TerminationReason::ShutdownRequested,
+                chrono::Utc::now().naive_utc(),
+            )
+            .await;
+
+            assert_eq!(
+                status_of(&f.db, f.sandbox_id).await,
+                sandbox_entity::SandboxStatus::Stopped
+            );
+            let run = run_entity::Entity::find_by_id(f.run_id)
+                .one(&f.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.status, run_entity::RunStatus::Terminated);
+            assert_eq!(run.exit_code, Some(0));
+            assert!(!f.agent_sock.exists(), "agent socket should be gone");
+            assert!(!f.control_sock.exists(), "control socket should be gone");
+        }
+
+        /// The guarantee a caller depends on: by the time anything can read a
+        /// terminal row, the endpoint files are already unlinked.
+        ///
+        /// Proven by freezing the database — a second connection holds the
+        /// SQLite write lock — and watching the files disappear while no write
+        /// can possibly have landed. Fails if the unlink is ever moved after
+        /// either terminal write.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn endpoint_files_are_gone_before_any_terminal_write() {
+            let f = fixture().await;
+
+            // Freeze the database: an open write transaction on its own
+            // connection holds the single SQLite write lock.
+            let blocker = DbWriteConnection::open(
+                &f.db_path,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            let txn = blocker.inner().begin().await.unwrap();
+            sandbox_entity::Entity::update_many()
+                .col_expr(
+                    sandbox_entity::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(chrono::Utc::now().naive_utc()),
+                )
+                .filter(sandbox_entity::Column::Id.eq(f.sandbox_id))
+                .exec(&txn)
+                .await
+                .unwrap();
+
+            let db = f.db.clone();
+            let agent_sock = f.agent_sock.clone();
+            let finisher = tokio::spawn(async move {
+                finish_terminated_run(
+                    &db,
+                    &agent_sock,
+                    f.sandbox_id,
+                    f.run_id,
+                    0,
+                    run_entity::TerminationReason::ShutdownRequested,
+                    chrono::Utc::now().naive_utc(),
+                )
+                .await;
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut unlinked_while_frozen = false;
+            while std::time::Instant::now() < deadline {
+                if !f.agent_sock.exists() && !f.control_sock.exists() {
+                    unlinked_while_frozen = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // Nothing terminal can have been written yet: we still hold the
+            // write lock. Thaw, then let the writes land.
+            txn.rollback().await.unwrap();
+            finisher.await.unwrap();
+
+            assert!(
+                unlinked_while_frozen,
+                "endpoint files still present while the terminal writes were blocked"
+            );
+            assert_eq!(
+                status_of(&f.db, f.sandbox_id).await,
+                sandbox_entity::SandboxStatus::Stopped
+            );
+        }
     }
 }
