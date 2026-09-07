@@ -175,6 +175,13 @@ impl LocalBackend {
             return Ok(());
         }
 
+        // Identity of the run we are about to kill. After the wait below it is
+        // what proves the name is still ours: a restart under this name
+        // terminates this run and inserts another one.
+        let killed_run_id = Self::load_active_run(self.db().await?.read(), model.id)
+            .await?
+            .map(|run| run.id);
+
         let mut pids = Vec::new();
         if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
             Self::kill_pid(pid)?;
@@ -199,13 +206,28 @@ impl LocalBackend {
             // unlinked the endpoint files. Remove them here, before the row
             // goes terminal: a caller waiting on the status may create a
             // sandbox under this name the moment it flips, and a stale socket
-            // sitting at that path is one the new VM would have to reclaim.
-            // Safe to do only under `all_dead` — the signalled process is gone
-            // and cannot be serving these paths — and safe against another
-            // creator, which cannot claim the name while the row is still
-            // Running or Draining.
-            for sock_path in crate::runtime::sandbox_agent_socket_path_candidates_for(self, name) {
-                microsandbox_runtime::vm::remove_agent_endpoint_files(&sock_path);
+            // at that path is one the new VM would have to reclaim.
+            //
+            // Guard: only ever unlink the endpoint of the run we killed. The
+            // wait above can span seconds, and the dead PID we just produced
+            // is exactly what lets a reconciler flip the row terminal and a
+            // creator take the name. `killed_run_id` is None when the row
+            // carried no run at all — a sandbox still starting up, whose
+            // runtime has already bound the socket and is alive — and stops
+            // matching once anything has restarted the name; in both cases the
+            // endpoint belongs to a live process and is not ours to remove.
+            let still_ours = match killed_run_id {
+                Some(run_id) => Self::load_active_run(self.db().await?.read(), model.id)
+                    .await?
+                    .is_some_and(|run| run.id == run_id),
+                None => false,
+            };
+            if still_ours {
+                for sock_path in
+                    crate::runtime::sandbox_agent_socket_path_candidates_for(self, name)
+                {
+                    microsandbox_runtime::vm::remove_agent_endpoint_files(&sock_path);
+                }
             }
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await

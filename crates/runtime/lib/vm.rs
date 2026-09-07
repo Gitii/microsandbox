@@ -539,6 +539,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let writeback_disk_paths = match writeback_limited_disk_paths(&config.vm) {
         Ok(disk_paths) => disk_paths,
         Err(error) => {
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -553,6 +554,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     )) {
         Ok(guard) => Arc::new(guard),
         Err(error) => {
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -571,6 +573,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             if let Err(release_error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%release_error, "release CPU placement after writeback admission failure");
             }
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -758,6 +761,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             if let Err(error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM build failure");
             }
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             // Free the slot: build_vm never started the sampler, so no live
             // sample is worth preserving. Prefer the writer (already holds
@@ -826,9 +830,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 shutdown_flush_timeout,
             )
         {
-            // Same ordering as the exit observer: the endpoint files go before
-            // the row that releases a waiter, so a recreate under this name
-            // cannot have its socket unlinked from under it.
+            // The relay bound the endpoint before the run row existed, and
+            // this path returns instead of reaching the exit observer, so the
+            // files are unlinked here or not at all. No waiter is released by
+            // `mark_run_failed` — it writes the run row only — so this is leak
+            // avoidance, not the ordering guard the observer needs.
             remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             if let Some(writer) = metrics_writer.clone() {
@@ -2305,7 +2311,9 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
 /// Unlinking a bound unix socket only removes the name; connections already
 /// accepted keep working, so this is safe to call while the listeners are
 /// still up. Errors are ignored — a missing file is the desired state, and
-/// the caller is on a teardown path with nothing to report to.
+/// the caller is on a teardown path with nothing to report to. On Windows
+/// both endpoints are named pipes, which have no filesystem entry to remove,
+/// so this is a no-op there.
 pub fn remove_agent_endpoint_files(agent_sock_path: &Path) {
     let _ = std::fs::remove_file(agent_sock_path);
     let _ = std::fs::remove_file(crate::control::control_socket_path_for(agent_sock_path));
@@ -2314,14 +2322,18 @@ pub fn remove_agent_endpoint_files(agent_sock_path: &Path) {
 /// Retire a run and its sandbox row, endpoint files first.
 ///
 /// The unlink leads the writes on purpose. Guard: a caller that stops a
-/// sandbox and immediately creates one under the same name — Distributed's
-/// soft reset does exactly this — races the unlink otherwise. Callers wait on
-/// the sandbox status (`Stop`, `WaitUntilStopped`, `RemoveSandbox`), so if the
-/// row went terminal first the new sandbox could bind the same socket path and
-/// then lose it to this process's late unlink, leaving a live VM whose agent
-/// endpoint has no name: "has no agent endpoint (is it running?)". Removing
-/// the files first means every waiter the status releases sees paths that are
-/// already gone, and nothing this process does afterwards touches them.
+/// sandbox and immediately creates one under the same name races the unlink
+/// otherwise. Such callers wait on the sandbox status (`Stop`,
+/// `WaitUntilStopped`, `RemoveSandbox`), so if the row went terminal first the
+/// new sandbox could bind the same socket path and then lose it to this
+/// process's late unlink, leaving a live VM whose agent endpoint has no name:
+/// "has no agent endpoint (is it running?)". Removing the files first means
+/// every waiter the status releases sees paths that are already gone, and
+/// nothing this process does afterwards touches them.
+///
+/// This is also the only unlink the sandbox process gets on the exit path:
+/// the relay's own async cleanup never runs, because `_exit()` follows the
+/// exit observer immediately and bypasses task cleanup.
 ///
 /// The two writes keep their order — run first, then sandbox. Failures are
 /// swallowed: this runs on the VMM thread just before `_exit()`, and the
@@ -2943,11 +2955,39 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
+            // Read the rows on a connection of their own — `f.db` is a
+            // single-connection write pool and the blocked finisher is holding
+            // it — to show the frozen window really does precede both writes.
+            let reader = DbWriteConnection::open(
+                &f.db_path,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            let frozen_status = status_of(&reader, f.sandbox_id).await;
+            let frozen_run_status = run_entity::Entity::find_by_id(f.run_id)
+                .one(&reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+
             // Nothing terminal can have been written yet: we still hold the
             // write lock. Thaw, then let the writes land.
             txn.rollback().await.unwrap();
             finisher.await.unwrap();
 
+            assert_eq!(
+                frozen_status,
+                sandbox_entity::SandboxStatus::Running,
+                "the frozen window must precede the sandbox write"
+            );
+            assert_eq!(
+                frozen_run_status,
+                run_entity::RunStatus::Running,
+                "the frozen window must precede the run write"
+            );
             assert!(
                 unlinked_while_frozen,
                 "endpoint files still present while the terminal writes were blocked"
