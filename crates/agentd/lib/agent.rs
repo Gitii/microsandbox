@@ -26,7 +26,7 @@ use microsandbox_protocol::exec::{
 use microsandbox_protocol::fs::{FsData, FsRequest};
 use microsandbox_protocol::heartbeat::{ActivityCounters, Heartbeat};
 use microsandbox_protocol::message::{Message, MessageType};
-use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpData, TcpEof, TcpFailed};
+use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpCredit, TcpData, TcpEof, TcpFailed};
 
 use crate::config::AgentdConfig;
 use crate::error::{AgentdError, AgentdResult};
@@ -598,15 +598,12 @@ async fn handle_message(
         }
 
         MessageType::TcpData => {
-            let Some(data) = decode_payload_or_core_error::<TcpData>(&msg, out_buf)? else {
+            let Some(data) = decode_tcp_payload::<TcpData>(&msg, state, out_buf)? else {
                 return Ok(());
             };
             let len = data.data.len();
-            if let Some(session) = state.tcp_sessions.get(&msg.id) {
-                if let Err(e) = session.write_data(data.data).await {
-                    state.tcp_sessions.remove(&msg.id);
-                    encode_tcp_failed(msg.id, e, out_buf)?;
-                } else {
+            if let Some(session) = state.tcp_sessions.get_mut(&msg.id) {
+                if session.write_data(data.data).is_ok() {
                     activity.add_tcp_bytes(len);
                 }
             } else {
@@ -615,22 +612,30 @@ async fn handle_message(
         }
 
         MessageType::TcpEof => {
-            let Some(_) = decode_payload_or_core_error::<TcpEof>(&msg, out_buf)? else {
+            let Some(_) = decode_tcp_payload::<TcpEof>(&msg, state, out_buf)? else {
                 return Ok(());
             };
-            if let Some(session) = state.tcp_sessions.get(&msg.id)
-                && let Err(e) = session.close_write().await
-            {
-                state.tcp_sessions.remove(&msg.id);
-                encode_tcp_failed(msg.id, e, out_buf)?;
+            if let Some(session) = state.tcp_sessions.get_mut(&msg.id) {
+                // The supervisor reports rejection after dropping its socket.
+                let _ = session.close_write();
+            }
+        }
+
+        MessageType::TcpCredit => {
+            let Some(credit) = decode_tcp_payload::<TcpCredit>(&msg, state, out_buf)? else {
+                return Ok(());
+            };
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
+                // Invalid credit cancels the socket and produces terminal failure.
+                let _ = session.credit(credit.bytes);
             }
         }
 
         MessageType::TcpClose => {
-            let Some(_) = decode_payload_or_core_error::<TcpClose>(&msg, out_buf)? else {
+            let Some(_) = decode_tcp_payload::<TcpClose>(&msg, state, out_buf)? else {
                 return Ok(());
             };
-            if let Some(session) = state.tcp_sessions.remove(&msg.id) {
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
                 session.close();
             }
         }
@@ -933,6 +938,27 @@ fn encode_tcp_failed(id: u32, error: String, out_buf: &mut Vec<u8>) -> AgentdRes
     codec::encode_to_buf(&reply, out_buf)
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed frame: {e}")))?;
     Ok(())
+}
+
+fn decode_tcp_payload<T: serde::de::DeserializeOwned>(
+    msg: &Message,
+    state: &AgentState,
+    out_buf: &mut Vec<u8>,
+) -> AgentdResult<Option<T>> {
+    match msg.payload() {
+        Ok(payload) => Ok(Some(payload)),
+        Err(error) => {
+            let error = format!("decode {}: {error}", msg.t.as_str());
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
+                // A malformed caller frame must release its socket before the
+                // terminal reply removes the host's correlation route.
+                let _ = session.fail(&error);
+            } else {
+                encode_tcp_failed(msg.id, error, out_buf)?;
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn encode_core_error_if_supported(
@@ -1238,6 +1264,65 @@ fn request_guest_poweroff() -> AgentdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_tcp_payload_releases_socket_before_terminal_reply() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AgentState::default();
+        state.tcp_sessions.insert(
+            7,
+            TcpSession::open(
+                7,
+                TcpConnect {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                },
+                &tx,
+            ),
+        );
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, SessionOutput::Raw(mut connected)) = rx.recv().await.unwrap() else {
+            panic!("expected connected frame");
+        };
+        assert_eq!(
+            codec::try_decode_from_buf(&mut connected.frame)
+                .unwrap()
+                .unwrap()
+                .t,
+            MessageType::TcpConnected
+        );
+        let mut output = Vec::new();
+        let message = Message::new(MessageType::TcpData, 7, vec![0xff]);
+        assert!(
+            decode_tcp_payload::<TcpData>(&message, &state, &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            output.is_empty(),
+            "terminal reply must wait for socket cleanup"
+        );
+        let (_, SessionOutput::Raw(mut terminal)) =
+            time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected terminal frame");
+        };
+        assert_eq!(
+            codec::try_decode_from_buf(&mut terminal.frame)
+                .unwrap()
+                .unwrap()
+                .t,
+            MessageType::TcpFailed
+        );
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
 
     #[test]
     fn record_encoded_guest_messages_counts_only_appended_frames() {

@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum unacknowledged TCP bytes in each direction, per connection.
+/// Both peers start with this credit after `core.tcp.connected`. Credit is
+/// returned only after bytes reach the destination socket or consuming reader.
+pub const TCP_WINDOW_BYTES: usize = 64 * 1024;
+
+/// Maximum payload of one TCP data frame. Empty data frames are invalid.
+pub const TCP_MAX_DATA_BYTES: usize = 16 * 1024;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -28,6 +36,14 @@ pub struct TcpData {
     pub data: Vec<u8>,
 }
 
+/// Return consumed byte credit to the sender, in either direction.
+/// Zero credit, overflow, or credit above the initial window is a protocol error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpCredit {
+    /// Number of bytes consumed since the previous credit message.
+    pub bytes: u32,
+}
+
 /// Notification that one side has closed its write half.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpEof {}
@@ -36,7 +52,9 @@ pub struct TcpEof {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpClose {}
 
-/// Terminal notification that the TCP session is closed.
+/// Terminal acknowledgment emitted only after all guest socket futures are dropped.
+/// Failure to observe this message (including transport loss) means cleanup is
+/// unknown to the caller, not that remote teardown has been confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpClosed {}
 

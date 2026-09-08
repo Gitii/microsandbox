@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -207,6 +207,10 @@ pub enum MessageType {
     #[strum(serialize = "core.tcp.data")]
     TcpData,
 
+    /// Return consumed TCP byte credit (bidirectional).
+    #[strum(serialize = "core.tcp.credit")]
+    TcpCredit,
+
     /// One TCP stream side has closed its write half.
     #[strum(serialize = "core.tcp.eof")]
     TcpEof,
@@ -324,6 +328,7 @@ impl MessageType {
             Self::FsRequest | Self::FsResponse | Self::FsData => 2,
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
+            Self::TcpCredit => 7,
             Self::TcpConnect
             | Self::TcpConnected
             | Self::TcpData

@@ -1,7 +1,7 @@
 import { encode } from "cbor-x";
 
 /** Current microsandbox agent protocol generation. */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 7;
 /** Frame flag marking the final frame for a correlation ID. */
 export const FLAG_TERMINAL = 0b0000_0001;
 /** Frame flag marking the first frame of a new session. */
@@ -36,6 +36,7 @@ export type MessageType =
   | "core.tcp.connect"
   | "core.tcp.connected"
   | "core.tcp.data"
+  | "core.tcp.credit"
   | "core.tcp.eof"
   | "core.tcp.close"
   | "core.tcp.closed"
@@ -186,6 +187,8 @@ export function minProtocolVersion(type: MessageType): number {
       return 4;
     case "core.error":
       return 5;
+    case "core.tcp.credit":
+      return 7;
     default:
       return 1;
   }
