@@ -85,7 +85,7 @@ struct ClientState {
     active_sessions: HashSet<u32>,
     /// Channel for sending frames to this client's writer task.
     /// Using a channel avoids holding the client mutex across async writes.
-    /// Uses `Bytes` for zero-copy frame forwarding from the ring buffer.
+    /// Owns each frame's bytes rather than retaining a shared ring-buffer slab.
     write_tx: microsandbox_protocol::queue::Sender<Bytes>,
     stop: tokio::sync::watch::Sender<bool>,
 }
@@ -891,7 +891,10 @@ async fn ring_reader_task(
             match writer_result {
                 Ok((write_tx, stop)) => {
                     let bytes = frame.data.len();
-                    if write_tx.try_send(frame.data, bytes).is_err() {
+                    // A small slice must not pin a large batch allocation behind
+                    // a paused consumer while being charged only for its length.
+                    let data = Bytes::copy_from_slice(&frame.data);
+                    if write_tx.try_send(data, bytes).is_err() {
                         // Defend other clients and the host's byte budget. A
                         // failed route is disconnected, never silently truncated.
                         tracing::error!(
