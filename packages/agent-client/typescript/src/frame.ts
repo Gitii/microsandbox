@@ -47,7 +47,8 @@ export class InboundFrame {
       frame.flags,
       envelope.v,
       envelope.t,
-      envelope.p,
+      // Do not retain a whole transport slab for a tiny payload in a paused queue.
+      Uint8Array.from(envelope.p),
     );
   }
 }

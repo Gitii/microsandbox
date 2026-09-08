@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use microsandbox_protocol::codec::RawFrame;
+use microsandbox_protocol::queue::Receiver;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::sync::mpsc::Receiver;
 
 use super::{AgentClient, connect_sandbox, connect_sandbox_with_timeout};
 use microsandbox_agent_client::{AgentClientError, AgentClientResult};
@@ -291,14 +291,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
 
+    use microsandbox_protocol::queue;
     use tokio::sync::Notify;
-    use tokio::sync::mpsc;
 
     use super::*;
 
     #[tokio::test]
     async fn close_wakes_in_flight_stream_next() {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
         let bridge = Arc::new(AgentBridge {
             inner: StdMutex::new(None),
             streams: Mutex::new(HashMap::from([(

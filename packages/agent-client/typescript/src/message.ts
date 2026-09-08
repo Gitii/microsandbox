@@ -18,7 +18,12 @@ export type MessageType =
   | "core.init.ack"
   | "core.shutdown"
   | "core.relay.client.disconnected"
+  | "core.relay.client.released"
   | "core.clock.sync"
+  | "core.ping"
+  | "core.pong"
+  | "core.touch"
+  | "core.touched"
   | "core.error"
   | "core.exec.request"
   | "core.exec.started"
@@ -127,7 +132,7 @@ export function encodeEnvelope(
   if (!supports(message.type, negotiatedVersion)) {
     throw new Error(
       `the sandbox runtime is too old for '${message.type}' ` +
-        `(needs protocol generation ${minProtocolVersion(message.type)}, ` +
+        `(needs protocol generation ${requiredProtocolVersion(message.type)}, ` +
         `the sandbox speaks ${negotiatedVersion})`,
     );
   }
@@ -150,6 +155,8 @@ export function encodeEnvelope(
  */
 export function messageFlags(type: MessageType): number {
   switch (type) {
+    case "core.pong":
+    case "core.touched":
     case "core.error":
     case "core.exec.exited":
     case "core.exec.failed":
@@ -187,7 +194,13 @@ export function minProtocolVersion(type: MessageType): number {
       return 4;
     case "core.error":
       return 5;
+    case "core.ping":
+    case "core.pong":
+    case "core.touch":
+    case "core.touched":
+      return 6;
     case "core.tcp.credit":
+    case "core.relay.client.released":
       return 7;
     default:
       return 1;
@@ -198,5 +211,10 @@ export function minProtocolVersion(type: MessageType): number {
  * Return whether a peer generation supports a message type.
  */
 export function supports(type: MessageType, peerGeneration: number): boolean {
-  return minProtocolVersion(type) <= peerGeneration;
+  return requiredProtocolVersion(type) <= peerGeneration;
+}
+
+function requiredProtocolVersion(type: MessageType): number {
+  // TCP has no uncredited compatibility path in this fork.
+  return type.startsWith("core.tcp.") ? minProtocolVersion("core.tcp.credit") : minProtocolVersion(type);
 }

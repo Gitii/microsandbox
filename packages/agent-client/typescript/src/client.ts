@@ -6,6 +6,9 @@ import type { AgentTransport } from "./transport.js";
 import { AgentStream } from "./stream.js";
 import { InboundFrame } from "./frame.js";
 
+const FRAME_QUEUE_BYTES = 32 * 1024 * 1024;
+const FRAME_METADATA_BYTES = 128;
+
 export type ConnectOptions = {
   /**
    * Maximum time to wait for the relay handshake.
@@ -242,6 +245,8 @@ export class AgentClient {
       const err = error instanceof Error ? error : new Error(String(error));
       for (const pending of this.pending.values()) pending.close(err);
       this.pending.clear();
+      this.closed = true;
+      await this.transport.close();
       return;
     }
 
@@ -270,8 +275,9 @@ export class AgentClient {
 }
 
 function createFrameQueue(): FrameQueue {
-  const frames: InboundFrame[] = [];
+  const frames: (InboundFrame | undefined)[] = [];
   let frameHead = 0;
+  let queuedBytes = 0;
   const waiters: Waiter[] = [];
   let waiterHead = 0;
   let closed = false;
@@ -287,6 +293,13 @@ function createFrameQueue(): FrameQueue {
         waiter.resolve(frame);
         return;
       }
+      // Refuse a peer that exceeds the transport's byte budget, not a frame
+      // count. Throwing tears down the owning transport and its guest sessions.
+      const bytes = frame.payload.byteLength + frame.type.length * 2 + FRAME_METADATA_BYTES;
+      if (queuedBytes + bytes > FRAME_QUEUE_BYTES) {
+        throw new Error("agent response queue byte budget exhausted");
+      }
+      queuedBytes += bytes;
       frames.push(frame);
     },
     close(error?: Error) {
@@ -306,9 +319,17 @@ function createFrameQueue(): FrameQueue {
     next(timeoutMs?: number): Promise<InboundFrame | null> {
       if (frameHead < frames.length) {
         const frame = frames[frameHead];
+        if (frame !== undefined) {
+          queuedBytes -= frame.payload.byteLength + frame.type.length * 2 + FRAME_METADATA_BYTES;
+          // Release consumed frame storage even while new frames keep arriving.
+          frames[frameHead] = undefined;
+        }
         frameHead += 1;
         if (frameHead === frames.length) {
           frames.length = 0;
+          frameHead = 0;
+        } else if (frameHead >= frames.length / 2) {
+          frames.splice(0, frameHead);
           frameHead = 0;
         }
         return Promise.resolve(frame ?? null);
@@ -329,7 +350,11 @@ function createFrameQueue(): FrameQueue {
         timeoutMs,
         "agent stream read timed out",
         () => {
-          if (waiter !== undefined) waiter.active = false;
+          if (waiter !== undefined) {
+            waiter.active = false;
+            const index = waiters.indexOf(waiter);
+            if (index >= waiterHead) waiters.splice(index, 1);
+          }
         },
       );
     },
@@ -347,7 +372,12 @@ function nextActiveWaiter(
     head += 1;
     if (waiter === undefined) continue;
     if (waiter.active) {
-      setHead(head);
+      if (head >= waiters.length / 2) {
+        waiters.splice(0, head);
+        setHead(0);
+      } else {
+        setHead(head);
+      }
       return waiter;
     }
   }

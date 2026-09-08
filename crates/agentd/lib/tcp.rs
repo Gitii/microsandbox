@@ -130,6 +130,12 @@ impl TcpSession {
         self.task.is_finished()
     }
 
+    /// Cancel and join the socket supervisor before recycling its owner range.
+    pub async fn finish(mut self) -> Result<(), tokio::task::JoinError> {
+        self.close();
+        (&mut self.task).await
+    }
+
     /// Connect asynchronously and relay independently in each direction.
     pub fn open(
         id: u32,

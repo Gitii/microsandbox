@@ -7,6 +7,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -16,15 +17,20 @@ use microsandbox_protocol::{
         FS_CHUNK_SIZE, FsData, FsEntryInfo, FsOp, FsOpenOptions, FsRequest, FsResponse,
         FsResponseData, FsSetAttrs,
     },
-    message::{Message, MessageType},
-    tcp::{TcpClose, TcpClosed, TcpConnect, TcpConnected, TcpData, TcpEof, TcpFailed},
+    message::MessageType,
+    queue,
+    tcp::{
+        TCP_MAX_DATA_BYTES, TCP_WINDOW_BYTES, TcpClose, TcpConnect, TcpConnected, TcpCredit,
+        TcpData, TcpEof, TcpFailed,
+    },
 };
 use microsandbox_types::EnvVar;
 use russh::client::Msg as ClientMsg;
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyBase64, load_secret_key};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Sig};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::watch;
 
 use super::attach;
 use crate::sandbox::exec::{ExecControl, ExecEvent, ExecOptions, ExecSink, StdinMode};
@@ -154,8 +160,8 @@ struct SshSession {
 impl Drop for SshSession {
     fn drop(&mut self) {
         for state in self.channels.values() {
-            if let ChannelState::Tcp { relay, .. } = state {
-                relay.abort();
+            if let ChannelState::Tcp { stop, .. } = state {
+                stop.send_replace(true);
             }
         }
     }
@@ -172,13 +178,16 @@ enum ChannelState {
         stdin: Option<ExecSink>,
     },
     Tcp {
-        id: u32,
-        client: Arc<AgentClient>,
-        /// Guest-to-SSH relay task. It is aborted on channel/session teardown
-        /// so a dropped SSH connection does not leave a stream reader behind.
-        relay: tokio::task::JoinHandle<()>,
+        input: queue::Sender<SshTcpInput>,
+        stop: watch::Sender<bool>,
+        eof: bool,
     },
     Sftp,
+}
+
+enum SshTcpInput {
+    Data(Vec<u8>),
+    Eof,
 }
 
 #[derive(Clone)]
@@ -366,6 +375,8 @@ impl SandboxSshOps {
             }
         };
         let config = Arc::new(russh::server::Config {
+            window_size: TCP_WINDOW_BYTES as u32,
+            maximum_packet_size: TCP_MAX_DATA_BYTES as u32,
             auth_rejection_time: Duration::from_secs(3),
             auth_rejection_time_initial: Some(Duration::from_millis(0)),
             keys: vec![host_key],
@@ -1096,7 +1107,7 @@ impl SshSession {
         }
 
         let client = self.agent_client().await?;
-        if !client.supports(MessageType::TcpConnect) {
+        if !client.supports(MessageType::TcpCredit) {
             tracing::warn!(
                 negotiated_version = client.negotiated_version(),
                 "ssh direct-tcpip needs a newer sandbox runtime; restart the sandbox to enable forwarding"
@@ -1105,6 +1116,7 @@ impl SshSession {
         }
 
         let channel_id = channel.id();
+        let writer = channel.make_writer();
         drop(channel);
         let req = TcpConnect {
             host: host_to_connect.to_string(),
@@ -1124,15 +1136,27 @@ impl SshSession {
             MessageType::TcpConnected => {
                 let _: TcpConnected = first.payload()?;
                 let session_handle = session.handle();
-                let relay = tokio::spawn(async move {
-                    relay_tcp_to_ssh(channel_id, tcp_rx, session_handle).await;
+                let (input, input_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
+                let (stop, stop_rx) = watch::channel(false);
+                tokio::spawn(async move {
+                    relay_tcp_to_ssh(
+                        channel_id,
+                        tcp_id,
+                        client,
+                        tcp_rx,
+                        session_handle,
+                        writer,
+                        input_rx,
+                        stop_rx,
+                    )
+                    .await;
                 });
                 self.channels.insert(
                     channel_id,
                     ChannelState::Tcp {
-                        id: tcp_id,
-                        client,
-                        relay,
+                        input,
+                        stop,
+                        eof: false,
                     },
                 );
                 Ok(true)
@@ -1161,6 +1185,9 @@ impl SshSession {
 }
 
 impl russh::server::Handler for SshSession {
+    fn manual_receive_window(&self, channel: ChannelId) -> bool {
+        matches!(self.channels.get(&channel), Some(ChannelState::Tcp { .. }))
+    }
     type Error = anyhow::Error;
 
     async fn auth_publickey_offered(
@@ -1355,20 +1382,14 @@ impl russh::server::Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let tcp = match self.channels.get(&channel) {
-            Some(ChannelState::Tcp { id, client, .. }) => Some((*id, Arc::clone(client))),
-            _ => None,
-        };
-        if let Some((id, client)) = tcp {
-            client
-                .send(
-                    id,
-                    MessageType::TcpData,
-                    &TcpData {
-                        data: data.to_vec(),
-                    },
-                )
-                .await?;
+        if let Some(ChannelState::Tcp { input, eof, .. }) = self.channels.get(&channel) {
+            anyhow::ensure!(
+                !eof && !data.is_empty() && data.len() <= TCP_MAX_DATA_BYTES,
+                "invalid SSH TCP data"
+            );
+            input
+                .try_send(SshTcpInput::Data(data.to_vec()), data.len())
+                .map_err(|_| anyhow::anyhow!("SSH TCP input closed or exceeded its byte budget"))?;
             return Ok(());
         }
 
@@ -1386,12 +1407,12 @@ impl russh::server::Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let tcp = match self.channels.get(&channel) {
-            Some(ChannelState::Tcp { id, client, .. }) => Some((*id, Arc::clone(client))),
-            _ => None,
-        };
-        if let Some((id, client)) = tcp {
-            client.send(id, MessageType::TcpEof, &TcpEof {}).await?;
+        if let Some(ChannelState::Tcp { input, eof, .. }) = self.channels.get_mut(&channel) {
+            anyhow::ensure!(!*eof, "duplicate SSH TCP EOF");
+            *eof = true;
+            input
+                .try_send(SshTcpInput::Eof, 0)
+                .map_err(|_| anyhow::anyhow!("SSH TCP input closed"))?;
             return Ok(());
         }
 
@@ -1410,9 +1431,8 @@ impl russh::server::Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         match self.channels.remove(&channel) {
-            Some(ChannelState::Tcp { id, client, relay }) => {
-                relay.abort();
-                let _ = client.send(id, MessageType::TcpClose, &TcpClose {}).await;
+            Some(ChannelState::Tcp { stop, .. }) => {
+                stop.send_replace(true);
             }
             Some(ChannelState::Exec { control, stdin }) => {
                 if let Some(stdin) = stdin {
@@ -1898,59 +1918,145 @@ impl AsyncWrite for SshStdioStream {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+// One supervisor owns every per-channel future, including its bounded close wait.
+#[allow(clippy::too_many_arguments)]
 async fn relay_tcp_to_ssh(
     channel: ChannelId,
-    mut tcp_rx: tokio::sync::mpsc::Receiver<Message>,
+    id: u32,
+    client: Arc<AgentClient>,
+    mut tcp_rx: microsandbox_agent_client::MessageReceiver,
     session: russh::server::Handle,
+    mut writer: impl AsyncWrite + Unpin,
+    mut input: queue::Receiver<SshTcpInput>,
+    mut stop: watch::Receiver<bool>,
 ) {
-    while let Some(msg) = tcp_rx.recv().await {
-        match msg.t {
-            MessageType::TcpData => match msg.payload::<TcpData>() {
-                Ok(data) => {
-                    if session.data(channel, Bytes::from(data.data)).await.is_err() {
-                        return;
+    const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+    let send_credit = AtomicUsize::new(TCP_WINDOW_BYTES);
+    let receive_credit = AtomicUsize::new(TCP_WINDOW_BYTES);
+    let (output_tx, mut output_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
+    let mut terminal_observed = false;
+    let result: anyhow::Result<()> = tokio::select! {
+        biased;
+        _ = stop.wait_for(|closed| *closed) => Ok(()),
+        result = async {
+            let to_guest = async {
+                while let Some(command) = input.recv().await {
+                    match command {
+                        SshTcpInput::Data(data) => {
+                            // SSH only returns receive credit after guest consumption.
+                            send_credit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(data.len()))
+                                .map_err(|_| anyhow::anyhow!("SSH input exceeded TCP credit"))?;
+                            client.send(id, MessageType::TcpData, &TcpData { data }).await?;
+                        }
+                        SshTcpInput::Eof => {
+                            client.send(id, MessageType::TcpEof, &TcpEof {}).await?;
+                            return Ok::<(), anyhow::Error>(());
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("ssh direct-tcpip: failed to decode tcp data: {e}");
-                    let _ = session.close(channel).await;
-                    return;
-                }
-            },
-            MessageType::TcpEof => {
-                if let Err(e) = msg.payload::<TcpEof>() {
-                    tracing::warn!("ssh direct-tcpip: failed to decode tcp eof: {e}");
-                }
-                let _ = session.eof(channel).await;
-            }
-            MessageType::TcpClosed => {
-                if let Err(e) = msg.payload::<TcpClosed>() {
-                    tracing::warn!("ssh direct-tcpip: failed to decode tcp closed: {e}");
-                }
-                let _ = session.eof(channel).await;
-                let _ = session.close(channel).await;
-                return;
-            }
-            MessageType::TcpFailed => {
-                match msg.payload::<TcpFailed>() {
-                    Ok(failed) => {
-                        tracing::debug!(
-                            error = failed.error,
-                            "ssh direct-tcpip: guest TCP stream failed"
-                        );
+                anyhow::bail!("SSH input closed");
+            };
+            let from_guest = async {
+                let mut eof = false;
+                while let Some(message) = tcp_rx.recv().await {
+                    match message.t {
+                        MessageType::TcpCredit => {
+                            let credit: TcpCredit = message.payload()?;
+                            send_credit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                n.checked_add(credit.bytes as usize).filter(|n| credit.bytes > 0 && *n <= TCP_WINDOW_BYTES)
+                            }).map_err(|_| anyhow::anyhow!("invalid guest TCP credit"))?;
+                            session.adjust_receive_window(channel, credit.bytes).await
+                                .map_err(|_| anyhow::anyhow!("SSH connection closed returning credit"))?;
+                        }
+                        MessageType::TcpData => {
+                            let data: TcpData = message.payload()?;
+                            anyhow::ensure!(!eof && !data.data.is_empty() && data.data.len() <= TCP_MAX_DATA_BYTES, "invalid guest TCP data");
+                            let bytes = data.data.len();
+                            receive_credit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
+                                .map_err(|_| anyhow::anyhow!("guest exceeded TCP credit"))?;
+                            output_tx.try_send(SshTcpInput::Data(data.data), bytes)
+                                .map_err(|_| anyhow::anyhow!("SSH output exceeded byte budget"))?;
+                        }
+                        MessageType::TcpEof => {
+                            let _: TcpEof = message.payload()?;
+                            anyhow::ensure!(!eof, "duplicate guest EOF");
+                            eof = true;
+                            output_tx.try_send(SshTcpInput::Eof, 0)
+                                .map_err(|_| anyhow::anyhow!("SSH output closed"))?;
+                        }
+                        MessageType::TcpClosed => {
+                            let _: microsandbox_protocol::tcp::TcpClosed = message.payload()?;
+                            terminal_observed = true;
+                            return Ok(());
+                        }
+                        MessageType::TcpFailed => {
+                            let failed: TcpFailed = message.payload()?;
+                            terminal_observed = true;
+                            anyhow::bail!("guest TCP failed: {}", failed.error);
+                        }
+                        other => anyhow::bail!("unexpected TCP reply: {other:?}"),
                     }
-                    Err(e) => {
-                        tracing::warn!("ssh direct-tcpip: failed to decode tcp failed: {e}");
+                }
+                anyhow::bail!("TCP transport disconnected; remote cleanup unknown");
+            };
+            let to_ssh = async {
+                while let Some(command) = output_rx.recv().await {
+                    match command {
+                        SshTcpInput::Data(data) => {
+                            // ChannelTx reserves the real SSH send window, unlike
+                            // Handle::data, which can queue past a stalled peer.
+                            writer.write_all(&data).await?;
+                            receive_credit.fetch_add(data.len(), Ordering::SeqCst);
+                            client.send(id, MessageType::TcpCredit, &TcpCredit { bytes: data.len() as u32 }).await?;
+                        }
+                        SshTcpInput::Eof => {
+                            writer.shutdown().await?;
+                            return Ok::<(), anyhow::Error>(());
+                        }
                     }
                 }
-                let _ = session.close(channel).await;
-                return;
+                Ok(())
+            };
+            tokio::try_join!(to_guest, from_guest, to_ssh)?;
+            Ok(())
+        } => result,
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "SSH TCP forwarding stopped");
+    }
+    if !terminal_observed {
+        let close = async {
+            client.send(id, MessageType::TcpClose, &TcpClose {}).await?;
+            while let Some(message) = tcp_rx.recv().await {
+                match message.t {
+                    MessageType::TcpClosed => {
+                        let _: microsandbox_protocol::tcp::TcpClosed = message.payload()?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    MessageType::TcpFailed => {
+                        let _: TcpFailed = message.payload()?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
+            anyhow::bail!("transport disconnected");
+        };
+        if !matches!(tokio::time::timeout(CLOSE_TIMEOUT, close).await, Ok(Ok(()))) {
+            tracing::warn!(
+                id,
+                "SSH TCP remote cleanup unknown: terminal acknowledgment not observed"
+            );
         }
     }
-
-    let _ = session.close(channel).await;
+    // The SSH connection may itself be stalled or gone. Never retain the TCP
+    // supervisor indefinitely while trying to report channel closure to it.
+    if !matches!(
+        tokio::time::timeout(CLOSE_TIMEOUT, session.close(channel)).await,
+        Ok(Ok(()))
+    ) {
+        tracing::debug!(id, "SSH channel close could not be delivered");
+    }
 }
 
 fn build_authorized_keys(
@@ -2578,6 +2684,10 @@ mod tests {
         assert!(matches!(error, MicrosandboxError::Unsupported { .. }));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "ssh_tcp_tests.rs"]
+mod tcp_tests;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports

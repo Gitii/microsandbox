@@ -28,6 +28,10 @@
       "wire": "core.relay.client.disconnected"
     },
     {
+      "introduced_in": 7,
+      "wire": "core.relay.client.released"
+    },
+    {
       "introduced_in": 1,
       "wire": "core.clock.sync"
     },

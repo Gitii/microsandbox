@@ -114,6 +114,10 @@ pub enum MessageType {
     #[strum(serialize = "core.relay.client.disconnected")]
     RelayClientDisconnected,
 
+    /// Guest confirms owner cleanup and drainage of its queued output.
+    #[strum(serialize = "core.relay.client.released")]
+    RelayClientReleased,
+
     /// Host asks the guest to synchronize `CLOCK_REALTIME`.
     #[strum(serialize = "core.clock.sync")]
     ClockSync,
@@ -328,7 +332,7 @@ impl MessageType {
             Self::FsRequest | Self::FsResponse | Self::FsData => 2,
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
-            Self::TcpCredit => 7,
+            Self::TcpCredit | Self::RelayClientReleased => 7,
             Self::TcpConnect
             | Self::TcpConnected
             | Self::TcpData
