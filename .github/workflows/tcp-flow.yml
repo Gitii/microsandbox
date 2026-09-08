@@ -35,7 +35,7 @@ jobs:
       - run: cargo test --locked -p microsandbox-runtime --lib relay::tests
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
       - run: cargo check --locked --manifest-path sdk/go/native/Cargo.toml
-      - run: cargo clippy --locked -p microsandbox-agent-client -p microsandbox-runtime -p microsandbox --features microsandbox/ssh,microsandbox-agent-client/uds --all-targets -- -D warnings
+      - run: cargo clippy --keep-going --locked -p microsandbox-agent-client -p microsandbox-runtime -p microsandbox --features microsandbox/ssh,microsandbox-agent-client/uds --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
       - run: rustfmt --edition 2024 --config skip_children=true --check vendor/russh/src/server/mod.rs vendor/russh/src/server/session.rs vendor/russh/src/server/encrypted.rs
   typescript-protocol:
