@@ -342,6 +342,13 @@ impl AgentClient {
         // last Arc reference dies. Senders in `pending` drop with self,
         // resolving outstanding waiters.
     }
+
+    /// Disconnect shared transport ownership and wake every pending receiver.
+    pub async fn disconnect(&self) {
+        self.reader_handle.abort();
+        self.writer_handle.abort();
+        self.pending.lock().await.clear();
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -572,6 +579,17 @@ impl AgentClient {
             .await
             .map_err(|_| AgentClientError::Closed)?;
         written.await.map_err(|_| AgentClientError::Closed)?
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Drop for AgentClient {
+    fn drop(&mut self) {
+        self.reader_handle.abort();
+        self.writer_handle.abort();
     }
 }
 
@@ -1380,16 +1398,5 @@ mod tests {
         assert_eq!(second.t, MessageType::ExecExited);
         let exit: ExecExited = second.payload().unwrap();
         assert_eq!(exit.code, 0);
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl Drop for AgentClient {
-    fn drop(&mut self) {
-        self.reader_handle.abort();
-        self.writer_handle.abort();
     }
 }

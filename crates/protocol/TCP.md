@@ -52,6 +52,8 @@ generation-7 barrier is queued after all of that owner's TCP supervisors have
 ended and after their queued TCP output. It prevents late TCP terminal frames
 from reaching a new client with a recycled ID range. SDK consumers do not send or
 receive this relay-internal barrier.
+Client-originated ownership controls are rejected by the relay, even when their
+frame header uses a correlation ID within the caller's own range.
 
 SSH forwarding uses the same initial 64 KiB window and maximum 16 KiB frame.
 The vendored russh receive-window extension returns SSH receive credit only after
@@ -60,3 +62,6 @@ writer; credit is not returned merely because an unbounded SSH output list
 accepted bytes. Channel cancellation independently stops all forwarding futures
 and waits up to two seconds for a terminal guest acknowledgment. Failure to
 observe it is reported as unknown remote cleanup.
+Pending guest connects run outside SSH callbacks, and channel confirmation is
+queued before forwarding data. The opening write is bounded by two seconds;
+the guest's 30-second connect attempt has a 32-second response deadline at SSH.

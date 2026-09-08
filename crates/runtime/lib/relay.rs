@@ -94,7 +94,8 @@ struct ClientState {
 ///
 /// Reads agent frames from the console backend's ring buffers and listens
 /// for client connections on a Unix domain socket. Frames are routed between
-/// clients and the guest agent without decoding.
+/// clients and the guest agent, preserving their encoding. Client envelopes are
+/// checked so only the relay can issue owner-range cleanup controls.
 pub struct AgentRelay {
     /// Shared ring buffers + wake pipes for console backend communication.
     shared: Arc<ConsoleSharedState>,
@@ -1010,6 +1011,26 @@ async fn client_reader_task(
             break;
         }
 
+        let message = match decode_frame(&frame.data) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, slot, "agent relay: malformed client envelope");
+                break;
+            }
+        };
+        // Defend other owners: only the relay may issue owner-range cleanup or
+        // its release barrier. A caller's own correlation ID is not authority.
+        if matches!(
+            message.t,
+            MessageType::RelayClientDisconnected | MessageType::RelayClientReleased
+        ) {
+            tracing::warn!(
+                slot,
+                "agent relay: client attempted an internal ownership control"
+            );
+            break;
+        }
+
         // Forward shutdown to agentd (via the agent_tx send below) so the
         // guest can sync filesystems and power off cleanly. Also notify the
         // caller so it can start the flush-grace fallback timer — if the
@@ -1030,12 +1051,12 @@ async fn client_reader_task(
         // FLAG_SESSION_START is set on both ExecRequest and FsRequest,
         // so we decode the type to disambiguate.
         let mut is_exec_session_start = false;
-        if is_session_start
-            && let Ok(msg) = decode_frame(frame.data.as_ref())
-            && msg.t == MessageType::ExecRequest
-        {
+        if is_session_start && message.t == MessageType::ExecRequest {
             is_exec_session_start = true;
-            let pty = msg.payload::<ExecRequest>().map(|r| r.tty).unwrap_or(false);
+            let pty = message
+                .payload::<ExecRequest>()
+                .map(|r| r.tty)
+                .unwrap_or(false);
             let session_id = next_session_id.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut registry) = session_registry.lock() {
                 registry.insert(
@@ -1291,8 +1312,24 @@ mod tests {
             assert_eq!(disconnected.t, MessageType::RelayClientDisconnected);
             let owner: RelayClientDisconnected = disconnected.payload().unwrap();
             assert_eq!(owner.id_start, paused_id);
-            let (before_barrier, before_id) = connect(&path).await;
+            let (mut before_barrier, before_id) = connect(&path).await;
             assert_ne!(before_id, paused_id);
+            codec::write_message(
+                &mut before_barrier,
+                &Message::with_payload(MessageType::RelayClientDisconnected, before_id, &owner)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let refused = host_frame(&shared, &wake).await;
+            assert_eq!(refused.t, MessageType::RelayClientDisconnected);
+            assert_eq!(
+                refused
+                    .payload::<RelayClientDisconnected>()
+                    .unwrap()
+                    .id_start,
+                before_id
+            );
             guest_frame(
                 &shared,
                 Message::with_payload(MessageType::RelayClientReleased, 0, &owner).unwrap(),

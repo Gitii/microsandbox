@@ -42,17 +42,6 @@ impl russh::server::Handler for Forwarder {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let (id, mut rx) = self
-            .client
-            .stream(
-                MessageType::TcpConnect,
-                &TcpConnect {
-                    host: host.into(),
-                    port: port.try_into()?,
-                },
-            )
-            .await?;
-        assert_eq!(rx.recv().await.unwrap().t, MessageType::TcpConnected);
         let channel_id = channel.id();
         let writer = channel.make_writer();
         let (input, input_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
@@ -60,15 +49,17 @@ impl russh::server::Handler for Forwarder {
         self.channels.insert(channel_id, (input, stop));
         tokio::spawn(relay_tcp_to_ssh(
             channel_id,
-            id,
+            TcpConnect {
+                host: host.into(),
+                port: port.try_into()?,
+            },
             Arc::clone(&self.client),
-            rx,
+            reply,
             session.handle(),
             writer,
             input_rx,
             stop_rx,
         ));
-        reply.accept().await;
         Ok(())
     }
 
@@ -171,9 +162,13 @@ async fn paused_ssh_output_keeps_input_and_other_channel_close_live() {
         assert!(client.authenticate_none("test").await.unwrap().success());
         let destination = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = destination.local_addr().unwrap().port() as u32;
-        let first = client.channel_open_direct_tcpip("127.0.0.1", port, "127.0.0.1", 0).await.unwrap();
+        let mut first = client.channel_open_direct_tcpip("127.0.0.1", port, "127.0.0.1", 0).await.unwrap();
         let (mut peer, _) = destination.accept().await.unwrap();
         peer.write_all(b"ab").await.unwrap();
+        match first.wait().await.unwrap() {
+            ChannelMsg::Data { data } => assert_eq!(data.as_ref(), b"a"),
+            other => panic!("expected the one-byte SSH window to fill, got {other:?}"),
+        }
         // Input exceeds the initial TCP window and requires returned guest credit,
         // even though output cannot finish writing its two bytes to SSH.
         let receive = tokio::spawn(async move {
