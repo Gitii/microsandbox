@@ -1318,7 +1318,7 @@ mod tests {
             }
         );
 
-        let serialized = serde_json::to_value(&cfg.runtime.block_writeback).unwrap();
+        let serialized = serde_json::to_value(cfg.runtime.block_writeback).unwrap();
         assert_eq!(
             serialized,
             serde_json::json!({

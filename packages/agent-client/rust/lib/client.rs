@@ -48,7 +48,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 #[cfg(all(feature = "named-pipe", windows))]
 use tokio::net::windows::named_pipe::ClientOptions;
-use tokio::sync::{Mutex, oneshot, watch};
+#[cfg(feature = "stream")]
+use tokio::sync::watch;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 #[cfg(feature = "stream")]
 use tokio::time::Instant;
