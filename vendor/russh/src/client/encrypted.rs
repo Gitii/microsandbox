@@ -381,6 +381,10 @@ impl Session {
 
                 if let Some(channel) = self.channels.get(&local_id) {
                     channel
+                        .window_size()
+                        .initialize(msg.initial_window_size)
+                        .await;
+                    channel
                         .send(ChannelMsg::Open {
                             id: local_id,
                             max_packet_size: msg.maximum_packet_size,
@@ -441,7 +445,9 @@ impl Session {
                 }
 
                 if let Some(sender) = self.channels.remove(&channel_num) {
-                    let _ = sender.send(ChannelMsg::OpenFailure(reason_code.clone())).await;
+                    let _ = sender
+                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
+                        .await;
                 }
 
                 let _ = self.sender.send(Reply::ChannelOpenFailure);
@@ -455,7 +461,7 @@ impl Session {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
                 let data = map_err!(Bytes::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
-                let target = self.common.config.window_size;
+                let target = self.target_window_size;
                 if let Some(ref mut enc) = self.common.encrypted {
                     if enc.adjust_window_size(channel_num, &data, target)? {
                         let next_window =
@@ -478,7 +484,7 @@ impl Session {
                 let extended_code = map_err!(u32::decode(&mut r))?;
                 let data = map_err!(Bytes::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
-                let target = self.common.config.window_size;
+                let target = self.target_window_size;
                 if let Some(ref mut enc) = self.common.encrypted {
                     if enc.adjust_window_size(channel_num, &data, target)? {
                         let next_window =
@@ -599,7 +605,10 @@ impl Session {
                 debug!("channel_window_adjust amount: {amount:?}");
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(ref mut channel) = enc.channels.get_mut(&channel_num) {
-                        new_size = channel.recipient_window_size.saturating_add(amount);
+                        new_size = channel
+                            .recipient_window_size
+                            .checked_add(amount)
+                            .ok_or(Error::Inconsistent)?;
                         channel.recipient_window_size = new_size;
                     } else {
                         return Ok(());
@@ -613,10 +622,10 @@ impl Session {
                         as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
+                    chan.window_size().replenish(amount).await?;
                     // Use try_send to avoid blocking the session loop when channel buffer is full.
                     // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // WindowSizeRef and notifying ChannelTx) already happens in replenish().
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 client.window_adjusted(channel_num, new_size, self).await
@@ -721,7 +730,9 @@ impl Session {
 
                 match &msg.typ {
                     ChannelType::Session => {
-                        client.server_channel_open_session(channel, reply, self).await?
+                        client
+                            .server_channel_open_session(channel, reply, self)
+                            .await?
                     }
                     ChannelType::DirectTcpip(d) => {
                         client
@@ -790,7 +801,9 @@ impl Session {
                     }
                     ChannelType::Unknown { typ } => {
                         if client.should_accept_unknown_server_channel(id, typ).await {
-                            client.server_channel_open_unknown(channel, reply, self).await?;
+                            client
+                                .server_channel_open_unknown(channel, reply, self)
+                                .await?;
                         } else {
                             debug!("unknown channel type: {typ}");
                             if let Some(ref mut enc) = self.common.encrypted {

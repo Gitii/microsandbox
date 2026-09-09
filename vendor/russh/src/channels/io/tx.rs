@@ -1,22 +1,21 @@
-use std::convert::TryFrom;
 use std::future::Future;
 use std::io;
-use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use futures::FutureExt;
 use tokio::io::AsyncWrite;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, OwnedPermit};
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 
 use bytes::Bytes;
 
 use super::ChannelMsg;
 use crate::ChannelId;
+use crate::channels::{SendReservation, WindowSizeRef};
 
 type BoxedThreadsafeFuture<T> = Pin<Box<dyn Sync + Send + std::future::Future<Output = T>>>;
 type OwnedPermitFuture<S> =
@@ -46,9 +45,7 @@ pub struct ChannelTx<S> {
     sender: mpsc::Sender<S>,
     send_fut: Option<OwnedPermitFuture<S>>,
     id: ChannelId,
-    window_size_fut: Option<BoxedThreadsafeFuture<OwnedMutexGuard<u32>>>,
-    window_size: Arc<Mutex<u32>>,
-    notify: Arc<Notify>,
+    window: WindowSizeRef,
     window_size_notication: WatchNotification,
     max_packet_size: u32,
     ext: Option<u32>,
@@ -58,11 +55,10 @@ impl<S> ChannelTx<S>
 where
     S: From<(ChannelId, ChannelMsg)> + 'static + Send,
 {
-    pub fn new(
+    pub(crate) fn new(
         sender: mpsc::Sender<S>,
         id: ChannelId,
-        window_size: Arc<Mutex<u32>>,
-        window_size_notification: Arc<Notify>,
+        window: WindowSizeRef,
         max_packet_size: u32,
         ext: Option<u32>,
     ) -> Self {
@@ -70,56 +66,36 @@ where
             sender,
             send_fut: None,
             id,
-            notify: Arc::clone(&window_size_notification),
-            window_size_notication: WatchNotification::new(window_size_notification),
-            window_size,
-            window_size_fut: None,
+            window_size_notication: WatchNotification::new(window.subscribe()),
+            window,
             max_packet_size,
             ext,
         }
     }
 
-    fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<NonZeroUsize> {
-        let window_size = self.window_size.clone();
-        let window_size_fut = self
-            .window_size_fut
-            .get_or_insert_with(|| Box::pin(window_size.lock_owned()));
-        let mut window_size = ready!(window_size_fut.poll_unpin(cx));
-        self.window_size_fut.take();
-
-        let writable = (self.max_packet_size).min(*window_size).min(buf_len as u32) as usize;
-
-        match NonZeroUsize::try_from(writable) {
-            Ok(w) => {
-                *window_size -= writable as u32;
-                if *window_size > 0 {
-                    self.notify.notify_one();
-                }
-                Poll::Ready(w)
-            }
-            Err(_) => {
-                drop(window_size);
-                ready!(self.window_size_notication.poll_unpin(cx));
-                self.window_size_notication = WatchNotification::new(Arc::clone(&self.notify));
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+    fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<SendReservation> {
+        if let Some(reservation) = self.window.reserve(
+            self.max_packet_size
+                .min(buf_len.min(u32::MAX as usize) as u32),
+        ) {
+            return Poll::Ready(reservation);
         }
+        ready!(self.window_size_notication.poll_unpin(cx));
+        self.window_size_notication = WatchNotification::new(self.window.subscribe());
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
-    fn poll_mk_msg(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<(ChannelMsg, NonZeroUsize)> {
-        let writable = ready!(self.poll_writable(cx, buf.len()));
+    fn poll_mk_msg(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<(ChannelMsg, usize)> {
+        let reservation = ready!(self.poll_writable(cx, buf.len()));
+        let writable = reservation.len();
 
         #[allow(clippy::indexing_slicing)] // Clamped to maximum `buf.len()` with `.poll_writable`
-        let data = Bytes::copy_from_slice(&buf[..writable.into()]);
-
-        let msg = match self.ext {
-            None => ChannelMsg::Data { data },
-            Some(ext) => ChannelMsg::ExtendedData { data, ext },
+        let data = Bytes::copy_from_slice(&buf[..writable]);
+        let msg = ChannelMsg::ReservedData {
+            data,
+            ext: self.ext,
+            reservation,
         };
 
         Poll::Ready((msg, writable))
@@ -160,6 +136,13 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        // Refuse an invalid peer packet limit rather than spin waiting for credit.
+        if self.max_packet_size == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH peer advertised zero maximum packet size",
+            )));
+        }
         if buf.is_empty() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -170,7 +153,7 @@ where
             x
         } else {
             let (msg, writable) = ready!(self.poll_mk_msg(cx, buf));
-            self.activate(msg, writable.into())
+            self.activate(msg, writable)
         };
         let r = ready!(send_fut.as_mut().poll_unpin(cx));
         Poll::Ready(self.handle_write_result(r))
@@ -197,6 +180,6 @@ where
 impl<S> Drop for ChannelTx<S> {
     fn drop(&mut self) {
         // Allow other writers to make progress
-        self.notify.notify_one();
+        self.window.notifier.notify_one();
     }
 }

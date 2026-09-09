@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -160,8 +160,8 @@ struct SshSession {
 impl Drop for SshSession {
     fn drop(&mut self) {
         for state in self.channels.values() {
-            if let ChannelState::Tcp { stop, .. } = state {
-                stop.send_replace(true);
+            if let ChannelState::Tcp(channel) = state {
+                channel.close();
             }
         }
     }
@@ -177,17 +177,91 @@ enum ChannelState {
         control: ExecControl,
         stdin: Option<ExecSink>,
     },
-    Tcp {
-        input: queue::Sender<SshTcpInput>,
-        stop: watch::Sender<bool>,
-        eof: bool,
-    },
+    Tcp(SshTcpChannel),
     Sftp,
 }
 
 enum SshTcpInput {
     Data(Vec<u8>),
     Eof,
+}
+
+struct SshTcpChannel {
+    input: queue::Sender<SshTcpInput>,
+    stop: watch::Sender<bool>,
+    closing: Arc<AtomicBool>,
+    eof: bool,
+}
+
+struct SshTcpWorker {
+    input: queue::Receiver<SshTcpInput>,
+    stop: watch::Receiver<bool>,
+    closing: Arc<AtomicBool>,
+}
+
+impl SshTcpChannel {
+    fn new() -> (Self, SshTcpWorker) {
+        let (input, input_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
+        let (stop, stop_rx) = watch::channel(false);
+        let closing = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                input,
+                stop,
+                closing: Arc::clone(&closing),
+                eof: false,
+            },
+            SshTcpWorker {
+                input: input_rx,
+                stop: stop_rx,
+                closing,
+            },
+        )
+    }
+
+    fn data(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        // In-flight packets for a closing channel are not a connection failure.
+        if self.closing.load(Ordering::SeqCst) || self.input.is_closed() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.eof && !data.is_empty() && data.len() <= TCP_MAX_DATA_BYTES,
+            "invalid SSH TCP data"
+        );
+        self.send(SshTcpInput::Data(data.to_vec()), data.len())
+    }
+
+    fn eof(&mut self) -> anyhow::Result<()> {
+        if self.closing.load(Ordering::SeqCst) || self.input.is_closed() {
+            return Ok(());
+        }
+        anyhow::ensure!(!self.eof, "duplicate SSH TCP EOF");
+        self.eof = true;
+        self.send(SshTcpInput::Eof, 0)
+    }
+
+    fn send(&self, message: SshTcpInput, bytes: usize) -> anyhow::Result<()> {
+        if self.input.try_send(message, bytes).is_err() {
+            // The worker can finish between the state check and enqueue.
+            if self.input.is_closed() || self.closing.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            anyhow::bail!("SSH TCP input exceeded its byte budget");
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.stop.send_replace(true);
+    }
+}
+
+impl Drop for SshTcpWorker {
+    fn drop(&mut self) {
+        // Publish before its input receiver is dropped, including early returns.
+        self.closing.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -1089,7 +1163,7 @@ impl SshSession {
 
 impl russh::server::Handler for SshSession {
     fn manual_receive_window(&self, channel: ChannelId) -> bool {
-        matches!(self.channels.get(&channel), Some(ChannelState::Tcp { .. }))
+        matches!(self.channels.get(&channel), Some(ChannelState::Tcp(_)))
     }
     type Error = anyhow::Error;
 
@@ -1122,7 +1196,7 @@ impl russh::server::Handler for SshSession {
         &mut self,
         channel: Channel<Msg>,
         reply: ChannelOpenHandle,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.channels.insert(
             channel.id(),
@@ -1132,7 +1206,11 @@ impl russh::server::Handler for SshSession {
                 env: Vec::new(),
             },
         );
-        reply.accept().await;
+        let session = session.handle();
+        tokio::spawn(async move {
+            let mut reply = reply;
+            finish_ssh_open(&mut reply, true, &session).await;
+        });
         Ok(())
     }
 
@@ -1148,7 +1226,7 @@ impl russh::server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         // A rejected asynchronous open has no later channel-close callback.
         self.channels.retain(
-            |_, state| !matches!(state, ChannelState::Tcp { stop, .. } if stop.is_closed()),
+            |_, state| !matches!(state, ChannelState::Tcp(channel) if channel.stop.is_closed()),
         );
         let client = self.agent_client().await?;
         // Refuse a caller destination or peer without the credited TCP contract.
@@ -1156,23 +1234,17 @@ impl russh::server::Handler for SshSession {
             || port_to_connect > u16::MAX as u32
             || !client.supports(MessageType::TcpCredit)
         {
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
+            let session = session.handle();
+            tokio::spawn(async move {
+                let mut reply = reply;
+                finish_ssh_open(&mut reply, false, &session).await;
+            });
             return Ok(());
         }
         let id = channel.id();
         let writer = channel.make_writer();
-        let (input, input_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
-        let (stop, stop_rx) = watch::channel(false);
-        self.channels.insert(
-            id,
-            ChannelState::Tcp {
-                input,
-                stop,
-                eof: false,
-            },
-        );
+        let (state, worker) = SshTcpChannel::new();
+        self.channels.insert(id, ChannelState::Tcp(state));
         // Even a pending guest connect must not hold the SSH control callback.
         tokio::spawn(relay_tcp_to_ssh(
             id,
@@ -1184,8 +1256,7 @@ impl russh::server::Handler for SshSession {
             reply,
             session.handle(),
             writer,
-            input_rx,
-            stop_rx,
+            worker,
         ));
         Ok(())
     }
@@ -1309,15 +1380,8 @@ impl russh::server::Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(ChannelState::Tcp { input, eof, .. }) = self.channels.get(&channel) {
-            anyhow::ensure!(
-                !eof && !data.is_empty() && data.len() <= TCP_MAX_DATA_BYTES,
-                "invalid SSH TCP data"
-            );
-            input
-                .try_send(SshTcpInput::Data(data.to_vec()), data.len())
-                .map_err(|_| anyhow::anyhow!("SSH TCP input closed or exceeded its byte budget"))?;
-            return Ok(());
+        if let Some(ChannelState::Tcp(state)) = self.channels.get_mut(&channel) {
+            return state.data(data);
         }
 
         if let Some(ChannelState::Exec {
@@ -1334,13 +1398,8 @@ impl russh::server::Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(ChannelState::Tcp { input, eof, .. }) = self.channels.get_mut(&channel) {
-            anyhow::ensure!(!*eof, "duplicate SSH TCP EOF");
-            *eof = true;
-            input
-                .try_send(SshTcpInput::Eof, 0)
-                .map_err(|_| anyhow::anyhow!("SSH TCP input closed"))?;
-            return Ok(());
+        if let Some(ChannelState::Tcp(state)) = self.channels.get_mut(&channel) {
+            return state.eof();
         }
 
         if let Some(ChannelState::Exec {
@@ -1358,8 +1417,8 @@ impl russh::server::Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         match self.channels.remove(&channel) {
-            Some(ChannelState::Tcp { stop, .. }) => {
-                stop.send_replace(true);
+            Some(ChannelState::Tcp(state)) => {
+                state.close();
             }
             Some(ChannelState::Exec { control, stdin }) => {
                 if let Some(stdin) = stdin {
@@ -1845,17 +1904,41 @@ impl AsyncWrite for SshStdioStream {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+// Never wait for application queue space in an SSH callback. A missing definitive
+// reply aborts the transport through a separate signal, even if that queue is full.
+async fn finish_ssh_open(
+    reply: &mut ChannelOpenHandle,
+    accepted: bool,
+    session: &russh::server::Handle,
+) -> bool {
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+    let result = if accepted {
+        Ok(())
+    } else {
+        Err(ChannelOpenFailure::AdministrativelyProhibited)
+    };
+    match tokio::time::timeout(REPLY_TIMEOUT, reply.respond(result)).await {
+        Ok(Ok(())) => true,
+        failure => {
+            tracing::warn!(
+                ?failure,
+                "SSH open reply could not be delivered; terminating connection"
+            );
+            session.abort();
+            false
+        }
+    }
+}
+
 // One supervisor owns every per-channel future, including its bounded close wait.
-#[allow(clippy::too_many_arguments)]
 async fn relay_tcp_to_ssh(
     channel: ChannelId,
     request: TcpConnect,
     client: Arc<AgentClient>,
-    reply: ChannelOpenHandle,
+    mut reply: ChannelOpenHandle,
     session: russh::server::Handle,
     mut writer: impl AsyncWrite + Unpin,
-    mut input: queue::Receiver<SshTcpInput>,
-    mut stop: watch::Receiver<bool>,
+    mut worker: SshTcpWorker,
 ) {
     const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
     const CONNECT_REPLY_TIMEOUT: Duration = Duration::from_secs(32);
@@ -1873,12 +1956,13 @@ async fn relay_tcp_to_ssh(
             // A timed-out opening write may already have allocated a guest ID.
             // Disconnect ownership rather than abandon an unobservable socket.
             client.disconnect().await;
+            finish_ssh_open(&mut reply, false, &session).await;
             return;
         }
     };
     let first = tokio::select! {
         biased;
-        _ = stop.wait_for(|closed| *closed) => None,
+        _ = worker.stop.wait_for(|closed| *closed) => None,
         first = tokio::time::timeout(CONNECT_REPLY_TIMEOUT, tcp_rx.recv()) => first.ok().flatten(),
     };
     let connected = first.as_ref().is_some_and(|message| {
@@ -1888,14 +1972,7 @@ async fn relay_tcp_to_ssh(
         message.t == MessageType::TcpFailed && message.payload::<TcpFailed>().is_ok()
     });
     // Queue confirmation before any data from the new channel can be queued.
-    let confirmed = if connected {
-        tokio::time::timeout(CLOSE_TIMEOUT, reply.accept())
-            .await
-            .is_ok()
-    } else {
-        drop(reply);
-        false
-    };
+    let confirmed = finish_ssh_open(&mut reply, connected, &session).await && connected;
     let send_credit = AtomicUsize::new(TCP_WINDOW_BYTES);
     let receive_credit = AtomicUsize::new(TCP_WINDOW_BYTES);
     let (output_tx, mut output_rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
@@ -1904,10 +1981,10 @@ async fn relay_tcp_to_ssh(
     } else {
         tokio::select! {
             biased;
-            _ = stop.wait_for(|closed| *closed) => Ok(()),
+            _ = worker.stop.wait_for(|closed| *closed) => Ok(()),
             result = async {
                 let to_guest = async {
-                    while let Some(command) = input.recv().await {
+                    while let Some(command) = worker.input.recv().await {
                         match command {
                             SshTcpInput::Data(data) => {
                                 // SSH only returns receive credit after guest consumption.
@@ -1992,6 +2069,7 @@ async fn relay_tcp_to_ssh(
     if let Err(error) = result {
         tracing::warn!(%error, "SSH TCP forwarding stopped");
     }
+    worker.closing.store(true, Ordering::SeqCst);
     if !terminal_observed {
         let close = async {
             client.send(id, MessageType::TcpClose, &TcpClose {}).await?;

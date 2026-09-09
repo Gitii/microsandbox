@@ -592,10 +592,8 @@ impl<H: Handler> Handle<H> {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
-                    window_size,
+                    window_size: _,
                 }) => {
-                    window_size_ref.update(window_size).await;
-
                     return Ok(Channel {
                         write_half: ChannelWriteHalf {
                             id,
@@ -1198,8 +1196,7 @@ impl Session {
             // Keep reading the network for window adjustments, but leave
             // application output in its bounded receivers while a channel is
             // window-blocked.
-            let can_receive_outbound =
-                !self.kex.active() && !self.common.has_any_pending_data();
+            let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
             tokio::select! {
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
@@ -1404,6 +1401,17 @@ impl Session {
                 description,
                 language_tag,
             } => self.disconnect(reason, &description, &language_tag)?,
+            Msg::Channel(
+                id,
+                ChannelMsg::ReservedData {
+                    data,
+                    ext,
+                    reservation,
+                },
+            ) => {
+                reservation.commit();
+                self.data_admitted(id, data, ext)?;
+            }
             Msg::Channel(id, ChannelMsg::Data { data }) => self.data(id, data)?,
             Msg::Channel(id, ChannelMsg::Eof) => {
                 self.eof(id)?;

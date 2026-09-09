@@ -111,9 +111,15 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
 pub struct Handle {
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+    pub(crate) abort: tokio::sync::watch::Sender<bool>,
 }
 
 impl Handle {
+    /// Terminate the transport independently of the application message queue.
+    /// Used when a definitive channel-open reply cannot be delivered.
+    pub fn abort(&self) {
+        self.abort.send_replace(true);
+    }
     /// Return bytes consumed on a manual receive-window channel.
     pub async fn adjust_receive_window(&self, id: ChannelId, bytes: u32) -> Result<(), ()> {
         self.sender
@@ -408,10 +414,8 @@ impl Handle {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
-                    window_size,
+                    window_size: _,
                 }) => {
-                    window_size_ref.update(window_size).await;
-
                     return Ok(Channel {
                         write_half: ChannelWriteHalf {
                             id,
@@ -502,6 +506,17 @@ impl Session {
     /// pre-`select!` backlog drain so the two can't drift apart.
     fn dispatch_msg(&mut self, msg: Msg) -> Result<(), Error> {
         match msg {
+            Msg::Channel(
+                id,
+                ChannelMsg::ReservedData {
+                    data,
+                    ext,
+                    reservation,
+                },
+            ) => {
+                reservation.commit();
+                self.data_admitted(id, data, ext)?;
+            }
             Msg::Channel(id, ChannelMsg::Data { data }) => {
                 self.data(id, data)?;
             }
@@ -1097,10 +1112,32 @@ impl Session {
     /// The number of bytes added to the "sending pipeline" (to be
     /// processed by the event loop) is returned.
     pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
+        let data = data.into();
+        if let Some(channel_ref) = self.channels.get(&channel) {
+            channel_ref.window_size().debit(data.len())?;
+        }
+        self.data_admitted(channel, data, None)
+    }
+
+    pub(crate) fn data_admitted(
+        &mut self,
+        channel: ChannelId,
+        data: bytes::Bytes,
+        ext: Option<u32>,
+    ) -> Result<(), Error> {
         let is_rekeying = self.kex.active();
         let common = &mut self.common;
         if let Some(enc) = common.encrypted.as_mut() {
-            enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying)
+            match ext {
+                Some(ext) => enc.extended_data_with_writer(
+                    &mut common.packet_writer,
+                    channel,
+                    ext,
+                    data,
+                    is_rekeying,
+                ),
+                None => enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying),
+            }
         } else {
             unreachable!()
         }
@@ -1118,19 +1155,11 @@ impl Session {
         extended: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
-        let is_rekeying = self.kex.active();
-        let common = &mut self.common;
-        if let Some(enc) = common.encrypted.as_mut() {
-            enc.extended_data_with_writer(
-                &mut common.packet_writer,
-                channel,
-                extended,
-                data,
-                is_rekeying,
-            )
-        } else {
-            unreachable!()
+        let data = data.into();
+        if let Some(channel_ref) = self.channels.get(&channel) {
+            channel_ref.window_size().debit(data.len())?;
         }
+        self.data_admitted(channel, data, Some(extended))
     }
 
     /// Inform the client of whether they may perform
@@ -1526,6 +1555,7 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            abort: tokio::sync::watch::channel(false).0,
         };
 
         Session {

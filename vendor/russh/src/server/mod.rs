@@ -1073,6 +1073,7 @@ where
     let handle = server::session::Handle {
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        abort: tokio::sync::watch::channel(false).0,
     };
 
     let common = read_ssh_id(config, &mut stream).await?;
@@ -1090,7 +1091,14 @@ where
 
     session.begin_rekey()?;
 
-    let join = russh_util::runtime::spawn(session.run(stream, handler));
+    let mut abort = handle.abort.subscribe();
+    let join = russh_util::runtime::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = abort.wait_for(|aborted| *aborted) => Err(crate::Error::Disconnect.into()),
+            result = session.run(stream, handler) => result,
+        }
+    });
 
     Ok(RunningSession { handle, join })
 }

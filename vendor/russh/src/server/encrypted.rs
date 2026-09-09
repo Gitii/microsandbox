@@ -430,6 +430,65 @@ mod tests {
         window_adjusted_called: bool,
     }
 
+    #[tokio::test]
+    async fn queued_reservations_survive_repeated_window_adjust_packets() {
+        use tokio::io::AsyncWriteExt;
+
+        const CHUNK: usize = 16 * 1024;
+        const WINDOW: u32 = 4 * CHUNK as u32;
+        let mut session = test_authenticated_session();
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        session.receiver = receiver;
+        session.sender.sender = sender.clone();
+        let enc = session.common.encrypted.as_mut().unwrap();
+        let id = enc.new_channel(WINDOW, CHUNK as u32);
+        let params = enc.channels.get_mut(&id).unwrap();
+        params.confirmed = true;
+        params.recipient_window_size = WINDOW;
+        params.recipient_maximum_packet_size = CHUNK as u32;
+        let (channel, channel_ref) = Channel::new(id, sender, CHUNK as u32, WINDOW, 8);
+        session.channels.insert(id, channel_ref);
+        let mut writer = channel.make_writer();
+        writer.write_all(&vec![1; WINDOW as usize]).await.unwrap();
+        let mut handler = ChannelCallbackProbe::default();
+        for _ in 0..8 {
+            let Msg::Channel(
+                _,
+                ChannelMsg::ReservedData {
+                    data,
+                    ext,
+                    reservation,
+                },
+            ) = session.receiver.recv().await.unwrap()
+            else {
+                panic!("expected reserved data");
+            };
+            reservation.commit();
+            session.data_admitted(id, data, ext).unwrap();
+            assert_eq!(channel.writable_packet_size().await, 0);
+            let mut packet = vec![msg::CHANNEL_WINDOW_ADJUST];
+            id.encode(&mut packet).unwrap();
+            (CHUNK as u32).encode(&mut packet).unwrap();
+            session.process_packet(&mut handler, &packet).await.unwrap();
+            assert_eq!(channel.writable_packet_size().await, CHUNK);
+            writer.write_all(&vec![2; CHUNK]).await.unwrap();
+            assert_eq!(
+                channel.writable_packet_size().await,
+                0,
+                "queued reservations were erased by wire-window replacement"
+            );
+            assert!(!session.has_pending_data(id));
+        }
+        // Non-reserving writes debit the same ledger. Their returned credit
+        // repays that admission rather than granting a second reservation.
+        session.data(id, Bytes::from(vec![3; CHUNK])).unwrap();
+        let mut packet = vec![msg::CHANNEL_WINDOW_ADJUST];
+        id.encode(&mut packet).unwrap();
+        (CHUNK as u32).encode(&mut packet).unwrap();
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        assert_eq!(channel.writable_packet_size().await, 0);
+    }
+
     impl Handler for ChannelCallbackProbe {
         type Error = Error;
 
@@ -528,6 +587,7 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            abort: tokio::sync::watch::channel(false).0,
         };
 
         Session {
@@ -1193,7 +1253,10 @@ impl Session {
                         .channels
                         .get_mut(&channel_num)
                         .ok_or(Error::Inconsistent)?;
-                    new_size = channel.recipient_window_size.saturating_add(amount);
+                    new_size = channel
+                        .recipient_window_size
+                        .checked_add(amount)
+                        .ok_or(Error::Inconsistent)?;
                     channel.recipient_window_size = new_size;
                 }
                 let common = &mut self.common;
@@ -1203,10 +1266,10 @@ impl Session {
                         as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
+                    chan.window_size().replenish(amount).await?;
                     // Use try_send to avoid blocking the session loop when channel buffer is full.
                     // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // WindowSizeRef and notifying ChannelTx) already happens in replenish().
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 debug!("handler.window_adjusted {channel_num:?}");
@@ -1231,6 +1294,12 @@ impl Session {
                 };
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    // Initialize before publishing confirmation. A following
+                    // adjustment may arrive before the waiting caller is polled.
+                    channel
+                        .window_size()
+                        .initialize(msg.initial_window_size)
+                        .await;
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -1732,7 +1801,8 @@ impl Session {
         let reply =
             ChannelOpenHandle::new(self.sender.sender.clone(), pending, |pending, result| {
                 Msg::ChannelOpenReply { pending, result }
-            });
+            })
+            .with_abort(self.sender.abort.clone());
 
         match &msg.typ {
             ChannelType::Session => handler.channel_open_session(channel, reply, self).await,

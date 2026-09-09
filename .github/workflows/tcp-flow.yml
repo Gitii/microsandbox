@@ -31,13 +31,18 @@ jobs:
         with:
           cache-bin: false
           cache-on-failure: true
+          workspaces: |
+            . -> target
+            vendor/russh -> target
       - run: cargo test --locked -p microsandbox-agent-client --features uds --lib
       - run: cargo test --locked -p microsandbox-runtime --lib relay::tests
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
+      - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
+      - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib channels::tests
       - run: cargo check --locked --manifest-path sdk/go/native/Cargo.toml
       - run: cargo clippy --keep-going --locked -p microsandbox-agent-client -p microsandbox-runtime -p microsandbox --features microsandbox/ssh,microsandbox-agent-client/uds --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
-      - run: rustfmt --edition 2024 --config skip_children=true --check vendor/russh/src/server/mod.rs vendor/russh/src/server/session.rs vendor/russh/src/server/encrypted.rs
+      - run: rustfmt --edition 2024 --config skip_children=true --check vendor/russh/src/server/mod.rs vendor/russh/src/server/session.rs vendor/russh/src/server/encrypted.rs vendor/russh/src/client/mod.rs vendor/russh/src/client/session.rs vendor/russh/src/client/encrypted.rs vendor/russh/src/channels/mod.rs vendor/russh/src/channels/io/tx.rs vendor/russh/src/lib_inner.rs
   typescript-protocol:
     runs-on: ubuntu-latest
     defaults:

@@ -554,11 +554,14 @@ pub struct PendingChannelOpen {
 ///
 /// Dropping the handle without calling [`accept`](ChannelOpenHandle::accept) or
 /// [`reject`](ChannelOpenHandle::reject) automatically sends an
-/// `AdministrativelyProhibited` rejection.
+/// `AdministrativelyProhibited` rejection. A server connection is aborted if
+/// that fallback cannot be queued. For cancellation-safe asynchronous replies,
+/// retain the handle and use [`respond`](Self::respond).
 pub struct ChannelOpenHandleInner<M: Send> {
     sender: tokio::sync::mpsc::Sender<M>,
     inner: Option<PendingChannelOpen>,
     make_msg: fn(PendingChannelOpen, Result<(), ChannelOpenFailure>) -> M,
+    abort: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl<M: Send> ChannelOpenHandleInner<M> {
@@ -571,30 +574,46 @@ impl<M: Send> ChannelOpenHandleInner<M> {
             sender,
             inner: Some(pending),
             make_msg,
+            abort: None,
         }
+    }
+
+    pub(crate) fn with_abort(mut self, abort: tokio::sync::watch::Sender<bool>) -> Self {
+        self.abort = Some(abort);
+        self
     }
 
     fn try_send_reply(&mut self, result: Result<(), ChannelOpenFailure>) {
         if let Some(pending) = self.inner.take() {
-            let _ = self.sender.try_send((self.make_msg)(pending, result));
+            if self
+                .sender
+                .try_send((self.make_msg)(pending, result))
+                .is_err()
+                && let Some(abort) = &self.abort
+            {
+                // A server must reject or disconnect, never lose an open reply.
+                abort.send_replace(true);
+            }
         }
+    }
+
+    /// Enqueue a definitive reply, retaining pending ownership while waiting.
+    /// Cancelling this future leaves the handle reusable for an explicit rejection.
+    pub async fn respond(&mut self, result: Result<(), ChannelOpenFailure>) -> Result<(), Error> {
+        let permit = self.sender.reserve().await.map_err(|_| Error::SendError)?;
+        let pending = self.inner.take().ok_or(Error::Inconsistent)?;
+        permit.send((self.make_msg)(pending, result));
+        Ok(())
     }
 
     /// Accept the channel open request.
     pub async fn accept(mut self) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, Ok(()))).await;
-        }
+        let _ = self.respond(Ok(())).await;
     }
 
     /// Reject the channel open request with a reason.
     pub async fn reject(mut self, reason: ChannelOpenFailure) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self
-                .sender
-                .send((self.make_msg)(pending, Err(reason)))
-                .await;
-        }
+        let _ = self.respond(Err(reason)).await;
     }
 }
 

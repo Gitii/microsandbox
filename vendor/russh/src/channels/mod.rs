@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Notify};
 
 use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
 
@@ -26,6 +27,13 @@ pub enum ChannelMsg {
     },
     Data {
         data: Bytes,
+    },
+    /// Internal outbound data carrying credit reserved before queueing.
+    #[doc(hidden)]
+    ReservedData {
+        data: Bytes,
+        ext: Option<u32>,
+        reservation: SendReservation,
     },
     ExtendedData {
         data: Bytes,
@@ -115,7 +123,9 @@ pub enum ChannelMsg {
 
 #[derive(Clone, Debug)]
 pub(crate) struct WindowSizeRef {
-    value: Arc<Mutex<u32>>,
+    // May be negative while legacy, non-reserving sends have a queued backlog.
+    // All admitted bytes count, not just ChannelTx writes.
+    value: Arc<AtomicI64>,
     notifier: Arc<Notify>,
 }
 
@@ -123,18 +133,92 @@ impl WindowSizeRef {
     pub(crate) fn new(initial: u32) -> Self {
         let notifier = Arc::new(Notify::new());
         Self {
-            value: Arc::new(Mutex::new(initial)),
+            value: Arc::new(AtomicI64::new(i64::from(initial))),
             notifier,
         }
     }
 
-    pub(crate) async fn update(&self, value: u32) {
-        *self.value.lock().await = value;
+    pub(crate) async fn initialize(&self, value: u32) {
+        self.value.store(i64::from(value), Ordering::SeqCst);
         self.notifier.notify_one();
+    }
+
+    /// Replenish unreserved credit without erasing reservations held by queued
+    /// ChannelTx writes. Absolute updates are only valid at open confirmation.
+    pub(crate) async fn replenish(&self, amount: u32) -> Result<(), Error> {
+        self.value
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_add(i64::from(amount))
+                    .filter(|n| *n <= i64::from(u32::MAX))
+            })
+            .map_err(|_| Error::Inconsistent)?;
+        self.notifier.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn available(&self) -> u32 {
+        self.value.load(Ordering::SeqCst).max(0) as u32
+    }
+
+    pub(crate) fn debit(&self, bytes: usize) -> Result<(), Error> {
+        let bytes = i64::try_from(bytes).map_err(|_| Error::Inconsistent)?;
+        self.value
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
+            .map_err(|_| Error::Inconsistent)?;
+        Ok(())
+    }
+
+    pub(crate) fn reserve(&self, maximum: u32) -> Option<SendReservation> {
+        if maximum == 0 {
+            return None;
+        }
+        let previous = self
+            .value
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - n.min(i64::from(maximum)))
+            })
+            .ok()?;
+        let bytes = previous.min(i64::from(maximum)) as u32;
+        if previous > i64::from(bytes) {
+            self.notifier.notify_one();
+        }
+        (bytes > 0).then(|| SendReservation {
+            window: self.clone(),
+            bytes,
+        })
     }
 
     pub(crate) fn subscribe(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
+    }
+}
+
+/// Internal cancellation-safe reservation for bytes not yet admitted by a session.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct SendReservation {
+    window: WindowSizeRef,
+    bytes: u32,
+}
+
+impl SendReservation {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes as usize
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for SendReservation {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.window
+                .value
+                .fetch_add(i64::from(self.bytes), Ordering::SeqCst);
+            self.window.notifier.notify_one();
+        }
     }
 }
 
@@ -192,8 +276,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
     /// Returns the min between the maximum packet size and the
     /// remaining window size in the channel.
     pub async fn writable_packet_size(&self) -> usize {
-        self.max_packet_size
-            .min(*self.window_size.value.lock().await) as usize
+        self.max_packet_size.min(self.window_size.available()) as usize
     }
 
     pub fn id(&self) -> ChannelId {
@@ -339,11 +422,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
     }
 
     /// Send owned extended data to a channel without copying it into the `AsyncWrite` path.
-    pub async fn extended_data_bytes(
-        &self,
-        ext: u32,
-        data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    pub async fn extended_data_bytes(&self, ext: u32, data: impl Into<Bytes>) -> Result<(), Error> {
         self.send_bytes(Some(ext), data.into()).await
     }
 
@@ -359,24 +438,18 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         Ok(())
     }
 
-    async fn reserve_writable_chunk(&self, remaining: usize) -> Result<usize, Error> {
+    async fn reserve_writable_chunk(&self, remaining: usize) -> Result<SendReservation, Error> {
         if self.max_packet_size == 0 {
             return Err(Error::Inconsistent);
         }
         loop {
-            let mut window_size = self.window_size.value.lock().await;
-            let writable = (self.max_packet_size as usize)
-                .min(*window_size as usize)
-                .min(remaining);
-            if writable > 0 {
-                *window_size -= writable as u32;
-                if *window_size > 0 {
-                    self.window_size.notifier.notify_one();
-                }
-                return Ok(writable);
+            if let Some(reservation) = self.window_size.reserve(
+                self.max_packet_size
+                    .min(remaining.min(u32::MAX as usize) as u32),
+            ) {
+                return Ok(reservation);
             }
             let notified = self.window_size.notifier.notified();
-            drop(window_size);
             notified.await;
         }
     }
@@ -388,12 +461,14 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
 
         let mut offset = 0;
         while offset < data.len() {
-            let writable = self.reserve_writable_chunk(data.len() - offset).await?;
+            let reservation = self.reserve_writable_chunk(data.len() - offset).await?;
+            let writable = reservation.len();
             let end = offset + writable;
             let chunk = data.slice(offset..end);
-            let msg = match ext {
-                None => ChannelMsg::Data { data: chunk },
-                Some(ext) => ChannelMsg::ExtendedData { data: chunk, ext },
+            let msg = ChannelMsg::ReservedData {
+                data: chunk,
+                ext,
+                reservation,
             };
             self.send_msg(msg).await?;
             offset = end;
@@ -434,8 +509,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         io::ChannelTx::new(
             self.sender.clone(),
             self.id,
-            self.window_size.value.clone(),
-            self.window_size.subscribe(),
+            self.window_size.clone(),
             self.max_packet_size,
             ext,
         )
@@ -630,11 +704,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     }
 
     /// Send owned extended data to a channel without copying it into the `AsyncWrite` path.
-    pub async fn extended_data_bytes(
-        &self,
-        ext: u32,
-        data: impl Into<Bytes>,
-    ) -> Result<(), Error> {
+    pub async fn extended_data_bytes(&self, ext: u32, data: impl Into<Bytes>) -> Result<(), Error> {
         self.write_half.extended_data_bytes(ext, data).await
     }
 
@@ -663,8 +733,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             io::ChannelTx::new(
                 self.write_half.sender.clone(),
                 self.write_half.id,
-                self.write_half.window_size.value.clone(),
-                self.write_half.window_size.subscribe(),
+                self.write_half.window_size.clone(),
                 self.write_half.max_packet_size,
                 None,
             ),
@@ -703,6 +772,54 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn send_ledger_accounts_unreserved_backlog_and_large_cumulative_credit() {
+        const WINDOW: u32 = 64 * 1024;
+        let window = WindowSizeRef::new(WINDOW);
+        window.debit(2 * WINDOW as usize).unwrap();
+        window.replenish(WINDOW).await.unwrap();
+        assert_eq!(window.available(), 0);
+        assert!(window.reserve(1).is_none());
+        window.replenish(WINDOW).await.unwrap();
+        for _ in 0..=u32::MAX / WINDOW {
+            window.debit(WINDOW as usize).unwrap();
+            window.replenish(WINDOW).await.unwrap();
+            assert_eq!(window.available(), WINDOW);
+        }
+        assert!(window.replenish(u32::MAX).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_writes_refund_their_uncommitted_reservations() {
+        use tokio::io::AsyncWriteExt;
+        const WINDOW: u32 = 64 * 1024;
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.send((ChannelId(7), ChannelMsg::Eof)).await.unwrap();
+        let window = WindowSizeRef::new(WINDOW);
+        let half = ChannelWriteHalf {
+            id: ChannelId(7),
+            sender,
+            max_packet_size: WINDOW,
+            window_size: window.clone(),
+        };
+        {
+            let send = half.data_bytes(Bytes::from_static(b"owned"));
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            assert_eq!(window.available(), WINDOW - 5);
+        }
+        assert_eq!(window.available(), WINDOW);
+        let mut writer = half.make_writer();
+        {
+            let send = writer.write_all(b"buffered");
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            assert_eq!(window.available(), WINDOW - 8);
+        }
+        drop(writer);
+        assert_eq!(window.available(), WINDOW);
+    }
+
     fn test_write_half(
         window_size: WindowSizeRef,
         max_packet_size: u32,
@@ -730,7 +847,12 @@ mod tests {
         write_half.data_bytes(payload.clone()).await.unwrap();
 
         match receiver.recv().await.unwrap() {
-            (ChannelId(7), ChannelMsg::Data { data }) => {
+            (
+                ChannelId(7),
+                ChannelMsg::ReservedData {
+                    data, ext: None, ..
+                },
+            ) => {
                 assert_eq!(data, payload);
                 assert_eq!(data.as_ptr(), payload.as_ptr());
             }
@@ -751,7 +873,12 @@ mod tests {
             (8..10, &b"ij"[..]),
         ] {
             match receiver.recv().await.unwrap() {
-                (ChannelId(7), ChannelMsg::Data { data }) => {
+                (
+                    ChannelId(7),
+                    ChannelMsg::ReservedData {
+                        data, ext: None, ..
+                    },
+                ) => {
                     assert_eq!(data.as_ref(), expected);
                     assert_eq!(data.as_ptr(), payload.slice(range).as_ptr());
                 }
@@ -772,8 +899,8 @@ mod tests {
             .unwrap();
 
         match receiver.recv().await.unwrap() {
-            (ChannelId(7), ChannelMsg::ExtendedData { data, ext }) => {
-                assert_eq!(ext, 1);
+            (ChannelId(7), ChannelMsg::ReservedData { data, ext, .. }) => {
+                assert_eq!(ext, Some(1));
                 assert_eq!(data, payload);
                 assert_eq!(data.as_ptr(), payload.as_ptr());
             }
@@ -804,11 +931,16 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!send.is_finished());
 
-        window_size.update(1024).await;
+        window_size.replenish(1024).await.unwrap();
         send.await.unwrap();
 
         match receiver.recv().await.unwrap() {
-            (ChannelId(7), ChannelMsg::Data { data }) => {
+            (
+                ChannelId(7),
+                ChannelMsg::ReservedData {
+                    data, ext: None, ..
+                },
+            ) => {
                 assert_eq!(data.as_ref(), b"after-window");
             }
             msg => panic!("unexpected message: {msg:?}"),
@@ -817,11 +949,17 @@ mod tests {
 
     #[tokio::test]
     async fn data_bytes_rejects_zero_max_packet_size() {
+        use tokio::io::AsyncWriteExt;
         let (write_half, mut receiver) = test_write_half(WindowSizeRef::new(1024), 0);
 
         let result = write_half.data_bytes(Bytes::from_static(b"owned")).await;
 
         assert!(matches!(result, Err(Error::Inconsistent)));
+        let mut writer = write_half.make_writer();
+        assert_eq!(
+            writer.write_all(b"owned").await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -831,10 +969,18 @@ mod tests {
         let (channel, _reference) =
             Channel::<(ChannelId, ChannelMsg)>::new(ChannelId(9), sender, 1024, 1024, 8);
 
-        channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
+        channel
+            .data_bytes(Bytes::from_static(b"channel"))
+            .await
+            .unwrap();
 
         match receiver.recv().await.unwrap() {
-            (ChannelId(9), ChannelMsg::Data { data }) => {
+            (
+                ChannelId(9),
+                ChannelMsg::ReservedData {
+                    data, ext: None, ..
+                },
+            ) => {
                 assert_eq!(data.as_ref(), b"channel");
             }
             msg => panic!("unexpected message: {msg:?}"),

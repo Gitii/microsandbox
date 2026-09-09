@@ -65,3 +65,20 @@ observe it is reported as unknown remote cleanup.
 Pending guest connects run outside SSH callbacks, and channel confirmation is
 queued before forwarding data. The opening write is bounded by two seconds;
 the guest's 30-second connect attempt has a 32-second response deadline at SSH.
+
+SSH window adjustments add newly advertised credit to the unreserved counter;
+they do not replace it with the session's wire-window total. Pending writes retain
+their reservations. Non-reserving SSH sends debit that same ledger when admitted;
+cancelled writes refund reservations that were never admitted. Channel-open
+confirmation initializes credit before exposing the channel, so a later waiter
+cannot overwrite an early window adjustment.
+
+A TCP worker publishes its closing state before dropping its input receiver.
+Already-in-flight data and EOF on that closing channel do not fail the SSH
+connection; exceeding a live queue's byte budget remains an error.
+
+Both successful and failed asynchronous opens explicitly enqueue a definitive
+reply outside the SSH callback. The reply handle retains ownership while waiting
+for queue capacity, including across cancellation. If a definitive reply cannot
+be queued within two seconds, the SSH transport is aborted through a separate
+signal rather than leaving the peer's open request pending.

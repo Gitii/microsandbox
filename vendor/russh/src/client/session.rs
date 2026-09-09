@@ -4,7 +4,7 @@ use tokio::sync::oneshot;
 
 use crate::client::Session;
 use crate::session::EncryptedState;
-use crate::{map_err, msg, ChannelId, Disconnect, Pty, Sig};
+use crate::{ChannelId, Disconnect, Pty, Sig, map_err, msg};
 
 impl Session {
     fn channel_open_generic<F>(
@@ -442,11 +442,37 @@ impl Session {
         Ok(())
     }
 
-    pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+    pub fn data(
+        &mut self,
+        channel: ChannelId,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), crate::Error> {
+        let data = data.into();
+        if let Some(channel_ref) = self.channels.get(&channel) {
+            channel_ref.window_size().debit(data.len())?;
+        }
+        self.data_admitted(channel, data, None)
+    }
+
+    pub(crate) fn data_admitted(
+        &mut self,
+        channel: ChannelId,
+        data: bytes::Bytes,
+        ext: Option<u32>,
+    ) -> Result<(), crate::Error> {
         let is_rekeying = self.kex.active();
         let common = &mut self.common;
         if let Some(enc) = common.encrypted.as_mut() {
-            enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying)
+            match ext {
+                Some(ext) => enc.extended_data_with_writer(
+                    &mut common.packet_writer,
+                    channel,
+                    ext,
+                    data,
+                    is_rekeying,
+                ),
+                None => enc.data_with_writer(&mut common.packet_writer, channel, data, is_rekeying),
+            }
         } else {
             unreachable!()
         }
@@ -474,13 +500,11 @@ impl Session {
         ext: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::Error> {
-        let is_rekeying = self.kex.active();
-        let common = &mut self.common;
-        if let Some(enc) = common.encrypted.as_mut() {
-            enc.extended_data_with_writer(&mut common.packet_writer, channel, ext, data, is_rekeying)
-        } else {
-            unreachable!()
+        let data = data.into();
+        if let Some(channel_ref) = self.channels.get(&channel) {
+            channel_ref.window_size().debit(data.len())?;
         }
+        self.data_admitted(channel, data, Some(ext))
     }
 
     pub fn agent_forward(
