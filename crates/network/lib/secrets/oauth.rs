@@ -240,6 +240,10 @@ enum BrokerRequest<'a> {
         refresh: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         expires_at: Option<u64>,
+        /// The `scope` the token response carried, verbatim. Omitted when the
+        /// response had none, so the wire is unchanged for such a response.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<&'a str>,
     },
 }
 
@@ -1471,7 +1475,12 @@ impl OAuthConnection {
                     .as_millis() as u64
                     + seconds.saturating_mul(1000)
             });
-        let committed = broker_commit(grant, &access, &refresh, expires_at).await?;
+        let scope = object
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let committed =
+            broker_commit(grant, &access, &refresh, expires_at, scope.as_deref()).await?;
         remember_token(&mut self.seen_tokens, &access)?;
         remember_token(&mut self.seen_tokens, &refresh)?;
         // A JWT-shaped sentinel mirrors the claims of the token it stands for,
@@ -2021,6 +2030,7 @@ async fn broker_commit(
     access: &str,
     refresh: &str,
     expires_at: Option<u64>,
+    scope: Option<&str>,
 ) -> io::Result<Committed> {
     let stream = grant.lease.as_mut().ok_or_else(|| {
         io::Error::new(
@@ -2036,6 +2046,7 @@ async fn broker_commit(
             access,
             refresh,
             expires_at,
+            scope,
         },
     )
     .await?;
@@ -3489,6 +3500,7 @@ mod tests {
             assert_eq!(commit["generation"], 7);
             assert_eq!(commit["access"], "new-access");
             assert_eq!(commit["refresh"], "new-refresh");
+            assert_eq!(commit["scope"], "read");
             stream
                 .get_mut()
                 .write_all(b"{\"ok\":true,\"generation\":8}\n")
@@ -3650,6 +3662,11 @@ mod tests {
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0]["access"], "new-access");
         assert_eq!(commits[0]["refresh"], "new-refresh");
+        assert!(
+            commits[0].get("scope").is_none(),
+            "a response without a scope commits without one: {}",
+            commits[0]
+        );
     }
 
     #[tokio::test]
@@ -3687,7 +3704,9 @@ mod tests {
         let json: Value = serde_json::from_slice(&message.body).unwrap();
         assert_eq!(json["scope"], "read");
         assert_eq!(json["access_token"], "$MSB_OAUTH_ACCESS_123");
-        assert_eq!(broker.commits().len(), 1);
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["scope"], "read");
     }
 
     #[tokio::test]
@@ -4006,6 +4025,7 @@ mod tests {
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0]["access"], "sk-ant-oat01-new-access");
         assert_eq!(commits[0]["refresh"], "sk-ant-ort01-new-refresh");
+        assert_eq!(commits[0]["scope"], "user:inference user:profile");
     }
 
     #[tokio::test]
