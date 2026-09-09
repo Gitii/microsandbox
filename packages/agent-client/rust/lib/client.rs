@@ -33,6 +33,7 @@ use std::time::Duration;
 
 #[cfg(feature = "stream")]
 use microsandbox_protocol::message::FLAG_TERMINAL;
+use microsandbox_protocol::queue::{self, TRANSPORT_QUEUE_BYTES};
 #[cfg(feature = "stream")]
 use microsandbox_protocol::{codec::MAX_FRAME_SIZE, message::FRAME_HEADER_SIZE};
 use microsandbox_protocol::{
@@ -47,7 +48,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 #[cfg(all(feature = "named-pipe", windows))]
 use tokio::net::windows::named_pipe::ClientOptions;
-use tokio::sync::{Mutex, mpsc, oneshot};
+#[cfg(feature = "stream")]
+use tokio::sync::watch;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 #[cfg(feature = "stream")]
 use tokio::time::Instant;
@@ -64,11 +67,6 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(all(feature = "named-pipe", windows))]
 const WINDOWS_PIPE_CONNECT_RETRY: Duration = Duration::from_millis(10);
-
-#[cfg(feature = "stream")]
-const WRITER_QUEUE_CAPACITY: usize = 1024;
-const REQUEST_QUEUE_CAPACITY: usize = 1;
-const STREAM_QUEUE_CAPACITY: usize = 1024;
 
 const LEGACY_PROTOCOL_VERSION: u8 = 1;
 // TODO(upgrade-0.6): Remove in 0.6.x or later once live-sandbox
@@ -98,7 +96,7 @@ pub enum AgentProtocol {
 /// See the module-level docs for an overview of the two API tiers.
 pub struct AgentClient {
     /// Channel to the transport writer task.
-    writer: mpsc::Sender<WriterCommand>,
+    writer: queue::Sender<WriterCommand>,
     /// Next correlation ID to allocate (starts at `id_min`).
     next_id: AtomicU32,
     /// Lower bound (inclusive) of the assigned ID range, used for wrap-around.
@@ -113,7 +111,7 @@ pub struct AgentClient {
     /// which selects the wire codec; see `VERSIONING.md`.
     negotiated_version: u8,
     /// Pending response channels keyed by correlation ID.
-    pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>,
+    pending: Arc<Mutex<HashMap<u32, queue::Sender<RawFrame>>>>,
     /// Background reader task handle.
     reader_handle: JoinHandle<()>,
     /// Background writer task handle.
@@ -138,6 +136,39 @@ struct AgentHandshake {
 struct WriterCommand {
     frame: RawFrame,
     ack: oneshot::Sender<AgentClientResult<()>>,
+}
+
+/// Raw response stream bounded by encoded bytes, not frame count.
+pub type RawReceiver = queue::Receiver<RawFrame>;
+
+/// Typed view of a byte-budgeted raw stream. Decoding on consumption avoids a
+/// second queue and a detached decoder task for every stream.
+pub struct MessageReceiver {
+    raw: RawReceiver,
+}
+
+impl MessageReceiver {
+    /// Receive an immediately available decoded message.
+    pub fn try_recv(&mut self) -> Result<Message, tokio::sync::mpsc::error::TryRecvError> {
+        let frame = self.raw.try_recv()?;
+        codec::raw_frame_to_message(frame).map_err(|error| {
+            tracing::error!(%error, "agent client: malformed stream envelope");
+            self.raw.close();
+            tokio::sync::mpsc::error::TryRecvError::Disconnected
+        })
+    }
+    /// Receive the next message. Closure or a malformed envelope ends the stream.
+    pub async fn recv(&mut self) -> Option<Message> {
+        let frame = self.raw.recv().await?;
+        match codec::raw_frame_to_message(frame) {
+            Ok(message) => Some(message),
+            Err(error) => {
+                tracing::error!(%error, "agent client: malformed stream envelope");
+                self.raw.close();
+                None
+            }
+        }
+    }
 }
 
 #[cfg(feature = "stream")]
@@ -263,12 +294,33 @@ impl AgentClient {
             );
         }
 
-        let pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>> =
+        let pending: Arc<Mutex<HashMap<u32, queue::Sender<RawFrame>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
-        let reader_handle = tokio::spawn(reader_loop(reader, Arc::clone(&pending)));
-        let writer_handle = tokio::spawn(stream_writer_loop(writer, writer_rx));
+        let (writer_tx, writer_rx) = queue::channel(TRANSPORT_QUEUE_BYTES);
+        let (stop, _) = watch::channel(false);
+        let reader_stop = stop.clone();
+        let writer_stop = stop.clone();
+        let reader_pending = Arc::clone(&pending);
+        let reader_handle = tokio::spawn(async move {
+            let mut cancelled = reader_stop.subscribe();
+            tokio::select! {
+                biased;
+                _ = cancelled.wait_for(|closed| *closed) => {},
+                _ = reader_loop(reader, Arc::clone(&reader_pending)) => {},
+            }
+            reader_stop.send_replace(true);
+            reader_pending.lock().await.clear();
+        });
+        let writer_handle = tokio::spawn(async move {
+            let mut cancelled = writer_stop.subscribe();
+            tokio::select! {
+                biased;
+                _ = cancelled.wait_for(|closed| *closed) => {},
+                _ = stream_writer_loop(writer, writer_rx) => {},
+            }
+            writer_stop.send_replace(true);
+        });
 
         Ok(Self {
             writer: writer_tx,
@@ -292,6 +344,13 @@ impl AgentClient {
         // last Arc reference dies. Senders in `pending` drop with self,
         // resolving outstanding waiters.
     }
+
+    /// Disconnect shared transport ownership and wake every pending receiver.
+    pub async fn disconnect(&self) {
+        self.reader_handle.abort();
+        self.writer_handle.abort();
+        self.pending.lock().await.clear();
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -305,7 +364,7 @@ impl AgentClient {
     /// Use this for protocol RPCs that produce exactly one terminal response
     /// (e.g. `FsRequest` → `FsResponse`).
     pub async fn request_raw(&self, flags: u8, body: Vec<u8>) -> AgentClientResult<RawFrame> {
-        let (tx, mut rx) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
+        let (tx, mut rx) = queue::channel(TRANSPORT_QUEUE_BYTES);
         let id = self.reserve_id(tx).await?;
 
         if let Err(e) = self.write_frame_owned(id, flags, body).await {
@@ -329,8 +388,8 @@ impl AgentClient {
         &self,
         flags: u8,
         body: Vec<u8>,
-    ) -> AgentClientResult<(u32, mpsc::Receiver<RawFrame>)> {
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+    ) -> AgentClientResult<(u32, RawReceiver)> {
+        let (tx, rx) = queue::channel(TRANSPORT_QUEUE_BYTES);
         let id = self.reserve_id(tx).await?;
 
         if let Err(e) = self.write_frame_owned(id, flags, body).await {
@@ -386,7 +445,7 @@ impl AgentClient {
     /// gate by sending (e.g. the SSH/SFTP layer) consult this instead of
     /// inspecting the protocol generation directly.
     pub fn supports(&self, t: MessageType) -> bool {
-        t.min_protocol_version() <= self.negotiated_version
+        Self::ensure_version_compat_for(t, self.negotiated_version).is_ok()
     }
 
     /// Reject a message type the connected sandbox is too old to handle, against
@@ -401,12 +460,18 @@ impl AgentClient {
     /// The single place the rule lives. Exposed for callers that hold the
     /// negotiated generation but not the live client (e.g. the SSH/SFTP layer).
     pub fn ensure_version_compat_for(t: MessageType, negotiated: u8) -> AgentClientResult<()> {
-        if t.is_available_at(negotiated) {
+        // TCP deliberately has no uncredited compatibility path in this fork.
+        let needs = if t.as_str().starts_with("core.tcp.") {
+            MessageType::TcpCredit.min_protocol_version()
+        } else {
+            t.min_protocol_version()
+        };
+        if needs <= negotiated {
             return Ok(());
         }
         Err(AgentClientError::UnsupportedOperation {
             msg_type: t.as_str(),
-            needs: t.min_protocol_version(),
+            needs,
             peer: negotiated,
         })
     }
@@ -436,15 +501,13 @@ impl AgentClient {
         &self,
         t: MessageType,
         payload: &T,
-    ) -> AgentClientResult<(u32, mpsc::Receiver<Message>)> {
+    ) -> AgentClientResult<(u32, MessageReceiver)> {
         self.ensure_version_compat(t)?;
         let flags = t.flags();
         let body = encode_message_body(self.protocol.version(), t, payload)?;
         let (id, raw_rx) = self.stream_raw(flags, body).await?;
 
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-        tokio::spawn(decode_stream_task(raw_rx, tx));
-        Ok((id, rx))
+        Ok((id, MessageReceiver { raw: raw_rx }))
     }
 
     /// Send a follow-up typed message on an existing correlation id.
@@ -475,7 +538,7 @@ impl AgentClient {
     ///
     /// Wraps around within the assigned range and skips IDs that still have an
     /// active pending request or stream.
-    async fn reserve_id(&self, tx: mpsc::Sender<RawFrame>) -> AgentClientResult<u32> {
+    async fn reserve_id(&self, tx: queue::Sender<RawFrame>) -> AgentClientResult<u32> {
         let mut pending = self.pending.lock().await;
         let attempts = usable_id_count(self.id_min, self.id_max);
         for _ in 0..attempts {
@@ -506,14 +569,29 @@ impl AgentClient {
     /// Write a single framed message to the socket, taking ownership of the body.
     async fn write_frame_owned(&self, id: u32, flags: u8, body: Vec<u8>) -> AgentClientResult<()> {
         let (ack, written) = oneshot::channel();
+        let bytes = body.len();
         self.writer
-            .send(WriterCommand {
-                frame: RawFrame { id, flags, body },
-                ack,
-            })
+            .send(
+                WriterCommand {
+                    frame: RawFrame { id, flags, body },
+                    ack,
+                },
+                bytes,
+            )
             .await
             .map_err(|_| AgentClientError::Closed)?;
         written.await.map_err(|_| AgentClientError::Closed)?
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Drop for AgentClient {
+    fn drop(&mut self) {
+        self.reader_handle.abort();
+        self.writer_handle.abort();
     }
 }
 
@@ -753,7 +831,7 @@ where
 }
 
 #[cfg(feature = "stream")]
-async fn stream_writer_loop<W>(mut writer: W, mut rx: mpsc::Receiver<WriterCommand>)
+async fn stream_writer_loop<W>(mut writer: W, mut rx: queue::Receiver<WriterCommand>)
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -770,7 +848,7 @@ where
 /// Background task that reads frames from the relay and dispatches them to
 /// pending channels by correlation ID. Operates on raw frames — no CBOR.
 #[cfg(feature = "stream")]
-async fn reader_loop<R>(mut reader: R, pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>)
+async fn reader_loop<R>(mut reader: R, pending: Arc<Mutex<HashMap<u32, queue::Sender<RawFrame>>>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -783,7 +861,9 @@ where
             }
         };
 
-        dispatch_frame(frame, &pending).await;
+        if !dispatch_frame(frame, &pending).await {
+            break;
+        }
     }
 
     // Reader exited — drop all senders so outstanding receivers wake up.
@@ -794,8 +874,8 @@ where
 #[cfg(feature = "stream")]
 async fn dispatch_frame(
     frame: RawFrame,
-    pending: &Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>,
-) {
+    pending: &Arc<Mutex<HashMap<u32, queue::Sender<RawFrame>>>>,
+) -> bool {
     let id = frame.id;
     let is_terminal = (frame.flags & FLAG_TERMINAL) != 0;
 
@@ -803,7 +883,7 @@ async fn dispatch_frame(
         let mut map = pending.lock().await;
         let Some(tx) = map.get(&id).cloned() else {
             tracing::trace!("agent client: no pending handler for id={id}");
-            return;
+            return true;
         };
         if is_terminal {
             map.remove(&id);
@@ -811,26 +891,19 @@ async fn dispatch_frame(
         tx
     };
 
-    if tx.send(frame).await.is_err() {
+    let bytes = frame.body.len();
+    if tx.try_send(frame, bytes).is_err() {
         pending.lock().await.remove(&id);
-    }
-}
-
-/// Translate a stream of raw frames into typed messages.
-async fn decode_stream_task(mut raw_rx: mpsc::Receiver<RawFrame>, tx: mpsc::Sender<Message>) {
-    while let Some(frame) = raw_rx.recv().await {
-        match codec::raw_frame_to_message(frame) {
-            Ok(msg) => {
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("agent client: failed to decode frame in stream: {e}");
-                // Continue — single malformed frame shouldn't kill the stream.
-            }
+        // A caller dropping its subscription is not transport exhaustion.
+        if tx.is_closed() {
+            return true;
         }
+        // Defend the caller's memory budget. Close the transport, which also
+        // cancels guest ownership, rather than silently discard session bytes.
+        tracing::error!(id, "agent client: response queue byte budget exhausted");
+        return false;
     }
+    true
 }
 
 /// Encode a typed payload to a CBOR `Message` body.
@@ -866,6 +939,79 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn paused_tcp_stream_does_not_block_other_control_replies() {
+        use microsandbox_protocol::core::{Ping, Pong};
+        use microsandbox_protocol::tcp::{TCP_WINDOW_BYTES, TcpConnect, TcpData};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(&1u32.to_be_bytes()).await.unwrap();
+            socket.write_all(&100u32.to_be_bytes()).await.unwrap();
+            codec::write_message(
+                &mut socket,
+                &Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let start = codec::read_message(&mut socket).await.unwrap();
+            let data =
+                Message::with_payload(MessageType::TcpData, start.id, &TcpData { data: vec![1] })
+                    .unwrap();
+            for _ in 0..TCP_WINDOW_BYTES {
+                codec::write_message(&mut socket, &data).await.unwrap();
+            }
+            let ping = codec::read_message(&mut socket).await.unwrap();
+            assert_eq!(ping.t, MessageType::Ping);
+            codec::write_message(
+                &mut socket,
+                &Message::with_payload(MessageType::Pong, ping.id, &Pong {}).unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = AgentClient::connect_stream(TcpStream::connect(address).await.unwrap())
+            .await
+            .unwrap();
+        let (_, mut paused) = client
+            .stream(
+                MessageType::TcpConnect,
+                &TcpConnect {
+                    host: "127.0.0.1".into(),
+                    port: 80,
+                },
+            )
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(MessageType::Ping, &Ping {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pong.t, MessageType::Pong);
+        // One-byte fragmentation is valid. Every byte remains available afterward.
+        for _ in 0..TCP_WINDOW_BYTES {
+            assert_eq!(
+                paused
+                    .recv()
+                    .await
+                    .unwrap()
+                    .payload::<TcpData>()
+                    .unwrap()
+                    .data,
+                vec![1]
+            );
+        }
+        peer.await.unwrap();
+    }
 
     #[cfg(all(feature = "uds", unix))]
     #[tokio::test]
@@ -1057,6 +1203,8 @@ mod tests {
 
     #[test]
     fn version_compat_across_generations() {
+        assert!(AgentClient::ensure_version_compat_for(MessageType::TcpConnect, 6).is_err());
+        assert!(AgentClient::ensure_version_compat_for(MessageType::TcpConnect, 7).is_ok());
         use MessageType::{ExecRequest, FsRequest};
         // (message type, peer generation, expected allowed). Generation 1 is the
         // pre-0.5 legacy runtime (no filesystem); generation 2 introduced the
@@ -1252,16 +1400,5 @@ mod tests {
         assert_eq!(second.t, MessageType::ExecExited);
         let exit: ExecExited = second.payload().unwrap();
         assert_eq!(exit.code, 0);
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl Drop for AgentClient {
-    fn drop(&mut self) {
-        self.reader_handle.abort();
-        self.writer_handle.abort();
     }
 }

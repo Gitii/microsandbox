@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -114,6 +114,10 @@ pub enum MessageType {
     #[strum(serialize = "core.relay.client.disconnected")]
     RelayClientDisconnected,
 
+    /// Guest confirms owner cleanup and drainage of its queued output.
+    #[strum(serialize = "core.relay.client.released")]
+    RelayClientReleased,
+
     /// Host asks the guest to synchronize `CLOCK_REALTIME`.
     #[strum(serialize = "core.clock.sync")]
     ClockSync,
@@ -206,6 +210,10 @@ pub enum MessageType {
     /// TCP stream data chunk (bidirectional).
     #[strum(serialize = "core.tcp.data")]
     TcpData,
+
+    /// Return consumed TCP byte credit (bidirectional).
+    #[strum(serialize = "core.tcp.credit")]
+    TcpCredit,
 
     /// One TCP stream side has closed its write half.
     #[strum(serialize = "core.tcp.eof")]
@@ -324,6 +332,7 @@ impl MessageType {
             Self::FsRequest | Self::FsResponse | Self::FsData => 2,
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
+            Self::TcpCredit | Self::RelayClientReleased => 7,
             Self::TcpConnect
             | Self::TcpConnected
             | Self::TcpData

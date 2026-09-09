@@ -468,15 +468,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    type WatchedDirs = Arc<Mutex<HashMap<PathBuf, DirEntry>>>;
+
     /// Build a `dirs` map with the given directories, each with a fresh
     /// signal and refcount 1, plus a retained receiver per dir so the
     /// senders observe changes.
-    fn map_with(
-        dirs: &[&std::path::Path],
-    ) -> (
-        Arc<Mutex<HashMap<PathBuf, DirEntry>>>,
-        Vec<watch::Receiver<u64>>,
-    ) {
+    fn map_with(dirs: &[&std::path::Path]) -> (WatchedDirs, Vec<watch::Receiver<u64>>) {
         let map = Arc::new(Mutex::new(HashMap::new()));
         let mut receivers = Vec::new();
         {

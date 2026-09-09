@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["sdk/rust/fuzz"]
+exclude = ["sdk/rust/fuzz", "vendor/russh"]
 members = [
     "crates/agentd",
     "crates/cli",
@@ -170,5 +170,5 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 lru = "0.18.0"
 parking_lot = "0.12"
 rpassword = "7"
-russh = "0.62.4"
+russh = { version = "0.62.5", path = "vendor/russh" }
 russh-sftp = "2.3.0"

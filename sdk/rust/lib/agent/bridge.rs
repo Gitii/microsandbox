@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use microsandbox_protocol::codec::RawFrame;
+use microsandbox_protocol::queue::Receiver;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::sync::mpsc::Receiver;
 
 use super::{AgentClient, connect_sandbox, connect_sandbox_with_timeout};
 use microsandbox_agent_client::{AgentClientError, AgentClientResult};
@@ -283,6 +283,27 @@ impl AgentBridge {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl std::fmt::Debug for AgentBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentBridge")
+            .field("next_handle", &self.next_handle.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+// Suppress unused import lints in builds where AgentClientError is only used
+// transitively through `?`.
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<AgentBridge>();
+    assert::<AgentClientError>();
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -291,14 +312,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
 
+    use microsandbox_protocol::queue;
     use tokio::sync::Notify;
-    use tokio::sync::mpsc;
 
     use super::*;
 
     #[tokio::test]
     async fn close_wakes_in_flight_stream_next() {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
         let bridge = Arc::new(AgentBridge {
             inner: StdMutex::new(None),
             streams: Mutex::new(HashMap::from([(
@@ -328,25 +349,4 @@ mod tests {
         assert!(matches!(result, Err(AgentClientError::Closed)));
         drop(tx);
     }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl std::fmt::Debug for AgentBridge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentBridge")
-            .field("next_handle", &self.next_handle.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-// Suppress unused import lints in builds where AgentClientError is only used
-// transitively through `?`.
-#[allow(dead_code)]
-fn _assert_send_sync() {
-    fn assert<T: Send + Sync>() {}
-    assert::<AgentBridge>();
-    assert::<AgentClientError>();
 }

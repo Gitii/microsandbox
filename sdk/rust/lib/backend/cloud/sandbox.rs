@@ -734,7 +734,8 @@ mod tests {
 
     #[test]
     fn cloud_create_request_rejects_fields_missing_from_the_wire() {
-        let cases: [(&str, fn(&mut SandboxConfig)); 8] = [
+        type ConfigMutation = fn(&mut SandboxConfig);
+        let cases: [(&str, ConfigMutation); 8] = [
             ("max_cpus", |config| config.spec.resources.max_cpus = 2),
             ("max_memory", |config| {
                 config.spec.resources.max_memory_mib = 1024

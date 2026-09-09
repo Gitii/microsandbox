@@ -51,8 +51,8 @@ impl HostHttp {
                 }
                 if trimmed.to_ascii_lowercase().starts_with("authorization:") {
                     auth = trimmed
-                        .splitn(2, ':')
-                        .nth(1)
+                        .split_once(':')
+                        .map(|(_, value)| value)
                         .unwrap_or_default()
                         .trim()
                         .to_string();

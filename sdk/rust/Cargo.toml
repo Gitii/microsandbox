@@ -92,6 +92,9 @@ test-utils.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-rustls.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+microsandbox-agentd = { path = "../../crates/agentd" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"], optional = true }
 

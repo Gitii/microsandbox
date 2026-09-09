@@ -1,5 +1,10 @@
 # Agent Protocol Versioning
 
+The fork's TCP flow-control change is an intentional exception to the compatibility
+policy below: TCP peers upgrade together for generation 7, with no uncredited path.
+See [TCP Byte Windows](TCP.md) for its byte accounting and terminal acknowledgment
+contract. Historical message introduction generations remain unchanged.
+
 This explains how microsandbox keeps the program inside a sandbox and the program on your
 machine talking to each other, even when they were built at different times. You don't need to
 know the codebase to read this. The precise, implementer-facing details are in the last section.

@@ -26,7 +26,7 @@ use microsandbox_protocol::exec::{
 use microsandbox_protocol::fs::{FsData, FsRequest};
 use microsandbox_protocol::heartbeat::{ActivityCounters, Heartbeat};
 use microsandbox_protocol::message::{Message, MessageType};
-use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpData, TcpEof, TcpFailed};
+use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpCredit, TcpData, TcpEof, TcpFailed};
 
 use crate::config::AgentdConfig;
 use crate::error::{AgentdError, AgentdResult};
@@ -34,7 +34,8 @@ use crate::fs::{FsReadSession, FsState, FsStreamSession, FsWriteSession};
 use crate::process::ProcessManager;
 use crate::serial::AGENT_PORT_NAME;
 use crate::session::{
-    ExecSession, RawActivity, RawSessionCompletion, SessionOutput, resolve_default_user,
+    ExecSession, RawActivity, RawSessionCompletion, RawSessionOutput, SessionOutput,
+    resolve_default_user,
 };
 use crate::tcp::TcpSession;
 use crate::{clock, fs, handoff, heartbeat, serial};
@@ -588,6 +589,11 @@ async fn handle_message(
         }
 
         MessageType::TcpConnect => {
+            // Refuse caller ID reuse until the old socket's terminal has passed.
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
+                let _ = session.fail("duplicate TCP connection ID");
+                return Ok(());
+            }
             let Some(req) = decode_payload_or_core_error::<TcpConnect>(&msg, out_buf)? else {
                 return Ok(());
             };
@@ -598,15 +604,12 @@ async fn handle_message(
         }
 
         MessageType::TcpData => {
-            let Some(data) = decode_payload_or_core_error::<TcpData>(&msg, out_buf)? else {
+            let Some(data) = decode_tcp_payload::<TcpData>(&msg, state, out_buf)? else {
                 return Ok(());
             };
             let len = data.data.len();
-            if let Some(session) = state.tcp_sessions.get(&msg.id) {
-                if let Err(e) = session.write_data(data.data).await {
-                    state.tcp_sessions.remove(&msg.id);
-                    encode_tcp_failed(msg.id, e, out_buf)?;
-                } else {
+            if let Some(session) = state.tcp_sessions.get_mut(&msg.id) {
+                if session.write_data(data.data).is_ok() {
                     activity.add_tcp_bytes(len);
                 }
             } else {
@@ -615,22 +618,30 @@ async fn handle_message(
         }
 
         MessageType::TcpEof => {
-            let Some(_) = decode_payload_or_core_error::<TcpEof>(&msg, out_buf)? else {
+            let Some(_) = decode_tcp_payload::<TcpEof>(&msg, state, out_buf)? else {
                 return Ok(());
             };
-            if let Some(session) = state.tcp_sessions.get(&msg.id)
-                && let Err(e) = session.close_write().await
-            {
-                state.tcp_sessions.remove(&msg.id);
-                encode_tcp_failed(msg.id, e, out_buf)?;
+            if let Some(session) = state.tcp_sessions.get_mut(&msg.id) {
+                // The supervisor reports rejection after dropping its socket.
+                let _ = session.close_write();
+            }
+        }
+
+        MessageType::TcpCredit => {
+            let Some(credit) = decode_tcp_payload::<TcpCredit>(&msg, state, out_buf)? else {
+                return Ok(());
+            };
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
+                // Invalid credit cancels the socket and produces terminal failure.
+                let _ = session.credit(credit.bytes);
             }
         }
 
         MessageType::TcpClose => {
-            let Some(_) = decode_payload_or_core_error::<TcpClose>(&msg, out_buf)? else {
+            let Some(_) = decode_tcp_payload::<TcpClose>(&msg, state, out_buf)? else {
                 return Ok(());
             };
-            if let Some(session) = state.tcp_sessions.remove(&msg.id) {
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
                 session.close();
             }
         }
@@ -657,7 +668,27 @@ async fn handle_message(
                 &mut state.tcp_sessions,
                 disconnected.id_start,
                 disconnected.id_end_exclusive,
-            );
+            )
+            .await?;
+            // Queue the release barrier behind all old socket output, not into
+            // out_buf (which would overtake the task output channel).
+            let released =
+                Message::with_payload(MessageType::RelayClientReleased, 0, &disconnected)
+                    .map_err(|e| AgentdError::ExecSession(format!("encode owner release: {e}")))?;
+            let mut frame = Vec::new();
+            codec::encode_to_buf(&released, &mut frame).map_err(|e| {
+                AgentdError::ExecSession(format!("encode owner release frame: {e}"))
+            })?;
+            session_tx
+                .send((
+                    0,
+                    SessionOutput::Raw(RawSessionOutput::new(
+                        frame,
+                        RawActivity::guest_message(),
+                        None,
+                    )),
+                ))
+                .map_err(|_| AgentdError::ExecSession("owner release output closed".into()))?;
         }
 
         MessageType::ClockSync => {
@@ -910,21 +941,30 @@ fn abort_read_sessions_in_owner_range(
     *read_sessions = retained;
 }
 
-fn close_tcp_sessions_in_owner_range(
+async fn close_tcp_sessions_in_owner_range(
     tcp_sessions: &mut HashMap<u32, TcpSession>,
     id_start: u32,
     id_end_exclusive: u32,
-) {
+) -> AgentdResult<()> {
     let mut retained = HashMap::new();
+    let mut closing = Vec::new();
     for (id, session) in tcp_sessions.drain() {
         let owner_id = session.owner_id();
         if owner_id >= id_start && owner_id < id_end_exclusive {
             session.close();
+            closing.push(session);
         } else {
             retained.insert(id, session);
         }
     }
     *tcp_sessions = retained;
+    for session in closing {
+        session
+            .finish()
+            .await
+            .map_err(|e| AgentdError::ExecSession(format!("join TCP owner cleanup: {e}")))?;
+    }
+    Ok(())
 }
 
 fn encode_tcp_failed(id: u32, error: String, out_buf: &mut Vec<u8>) -> AgentdResult<()> {
@@ -933,6 +973,27 @@ fn encode_tcp_failed(id: u32, error: String, out_buf: &mut Vec<u8>) -> AgentdRes
     codec::encode_to_buf(&reply, out_buf)
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed frame: {e}")))?;
     Ok(())
+}
+
+fn decode_tcp_payload<T: serde::de::DeserializeOwned>(
+    msg: &Message,
+    state: &AgentState,
+    out_buf: &mut Vec<u8>,
+) -> AgentdResult<Option<T>> {
+    match msg.payload() {
+        Ok(payload) => Ok(Some(payload)),
+        Err(error) => {
+            let error = format!("decode {}: {error}", msg.t.as_str());
+            if let Some(session) = state.tcp_sessions.get(&msg.id) {
+                // A malformed caller frame must release its socket before the
+                // terminal reply removes the host's correlation route.
+                let _ = session.fail(&error);
+            } else {
+                encode_tcp_failed(msg.id, error, out_buf)?;
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn encode_core_error_if_supported(
@@ -1238,6 +1299,169 @@ fn request_guest_poweroff() -> AgentdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tcp_full_window_keeps_ping_and_owner_release_live() {
+        use microsandbox_protocol::tcp::TCP_WINDOW_BYTES;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        async fn output(rx: &mut mpsc::UnboundedReceiver<(u32, SessionOutput)>) -> Message {
+            let (_, SessionOutput::Raw(mut raw)) = time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected raw TCP output");
+            };
+            codec::try_decode_from_buf(&mut raw.frame).unwrap().unwrap()
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AgentState::default();
+        let request = TcpConnect {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        state
+            .tcp_sessions
+            .insert(7, TcpSession::open(7, request.clone(), &tx));
+        let (mut first, _) = listener.accept().await.unwrap();
+        assert_eq!(output(&mut rx).await.t, MessageType::TcpConnected);
+        state
+            .tcp_sessions
+            .insert(17, TcpSession::open(17, request.clone(), &tx));
+        let (mut second, _) = listener.accept().await.unwrap();
+        assert_eq!(output(&mut rx).await.t, MessageType::TcpConnected);
+        for _ in 0..TCP_WINDOW_BYTES {
+            state
+                .tcp_sessions
+                .get_mut(&7)
+                .unwrap()
+                .write_data(vec![1])
+                .unwrap();
+        }
+        let config = AgentdConfig {
+            user: None,
+            security_profile: Default::default(),
+        };
+        let mut activity = ActivityTracker::new();
+        let mut out = Vec::new();
+        handle_message(
+            Message::with_payload(MessageType::Ping, 99, &Ping {}).unwrap(),
+            &mut state,
+            &mut activity,
+            &tx,
+            &mut out,
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codec::try_decode_from_buf(&mut out).unwrap().unwrap().t,
+            MessageType::Pong
+        );
+        let owner = RelayClientDisconnected {
+            id_start: 1,
+            id_end_exclusive: 10,
+        };
+        handle_message(
+            Message::with_payload(MessageType::RelayClientDisconnected, 0, &owner).unwrap(),
+            &mut state,
+            &mut activity,
+            &tx,
+            &mut out,
+            &config,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_empty(),
+            "release cannot overtake the socket output queue"
+        );
+        let closed = output(&mut rx).await;
+        assert_eq!(closed.id, 7);
+        assert_eq!(closed.t, MessageType::TcpClosed);
+        assert_eq!(output(&mut rx).await.t, MessageType::RelayClientReleased);
+        assert_eq!(first.read(&mut [0]).await.unwrap(), 0);
+        assert!(!state.tcp_sessions.contains_key(&7));
+        assert!(state.tcp_sessions.contains_key(&17));
+        // Reusing an active ID rejects the caller instead of letting its late
+        // terminal remove a newly connected socket under the same ID.
+        handle_message(
+            Message::with_payload(MessageType::TcpConnect, 17, &request).unwrap(),
+            &mut state,
+            &mut activity,
+            &tx,
+            &mut out,
+            &config,
+        )
+        .await
+        .unwrap();
+        let failed = output(&mut rx).await;
+        assert_eq!(failed.id, 17);
+        assert_eq!(failed.t, MessageType::TcpFailed);
+        assert_eq!(second.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_tcp_payload_releases_socket_before_terminal_reply() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AgentState::default();
+        state.tcp_sessions.insert(
+            7,
+            TcpSession::open(
+                7,
+                TcpConnect {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                },
+                &tx,
+            ),
+        );
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, SessionOutput::Raw(mut connected)) = rx.recv().await.unwrap() else {
+            panic!("expected connected frame");
+        };
+        assert_eq!(
+            codec::try_decode_from_buf(&mut connected.frame)
+                .unwrap()
+                .unwrap()
+                .t,
+            MessageType::TcpConnected
+        );
+        let mut output = Vec::new();
+        let message = Message::new(MessageType::TcpData, 7, vec![0xff]);
+        assert!(
+            decode_tcp_payload::<TcpData>(&message, &state, &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            output.is_empty(),
+            "terminal reply must wait for socket cleanup"
+        );
+        let (_, SessionOutput::Raw(mut terminal)) =
+            time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected terminal frame");
+        };
+        assert_eq!(
+            codec::try_decode_from_buf(&mut terminal.frame)
+                .unwrap()
+                .unwrap()
+                .t,
+            MessageType::TcpFailed
+        );
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
 
     #[test]
     fn record_encoded_guest_messages_counts_only_appended_frames() {

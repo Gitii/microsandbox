@@ -14,7 +14,6 @@ use microsandbox_protocol::{
     fs::{FsData, FsEntryInfo, FsResponse},
     message::{Message, MessageType},
 };
-use tokio::sync::mpsc;
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -120,7 +119,7 @@ pub struct FsMetadata {
 
 /// A streaming reader for file data from the sandbox.
 pub struct FsReadStream {
-    rx: mpsc::Receiver<Message>,
+    rx: microsandbox_agent_client::MessageReceiver,
     // Holds the per-call agent client alive for the duration of the stream.
     // Without this the AgentClient's reader task would be dropped after
     // `fs_read_stream` returns and `rx` would receive nothing.
@@ -132,7 +131,7 @@ pub struct FsReadStream {
 pub struct FsWriteSink {
     id: u32,
     client: Arc<AgentClient>,
-    rx: mpsc::Receiver<Message>,
+    rx: microsandbox_agent_client::MessageReceiver,
     close_handle: Option<FsHandle>,
 }
 
@@ -527,7 +526,7 @@ impl<'a> SandboxFsOps<'a> {
 impl FsReadStream {
     /// Construct a read stream that closes an owned handle at EOF.
     pub(crate) fn with_client_and_close(
-        rx: mpsc::Receiver<Message>,
+        rx: microsandbox_agent_client::MessageReceiver,
         client: Arc<AgentClient>,
         close_handle: Option<FsHandle>,
     ) -> Self {
@@ -595,7 +594,7 @@ impl FsWriteSink {
     pub(crate) fn new(
         id: u32,
         client: Arc<AgentClient>,
-        rx: mpsc::Receiver<Message>,
+        rx: microsandbox_agent_client::MessageReceiver,
         close_handle: Option<FsHandle>,
     ) -> Self {
         Self {
@@ -698,7 +697,9 @@ fn check_response(msg: Message) -> MicrosandboxResult<()> {
 }
 
 /// Wait for and check a terminal `FsResponse` from a subscription channel.
-async fn wait_for_ok_response(rx: &mut mpsc::Receiver<Message>) -> MicrosandboxResult<()> {
+async fn wait_for_ok_response(
+    rx: &mut microsandbox_agent_client::MessageReceiver,
+) -> MicrosandboxResult<()> {
     while let Some(msg) = rx.recv().await {
         if msg.t == MessageType::FsResponse {
             return check_response(msg);

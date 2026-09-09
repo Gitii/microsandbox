@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 mod error;
+pub mod queue;
 
 //--------------------------------------------------------------------------------------------------
 // Constants: Host↔Guest Shutdown Timings
