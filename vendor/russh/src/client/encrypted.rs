@@ -370,6 +370,10 @@ impl Session {
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
+                        // Duplicate peer confirmation must not reset live credit.
+                        if parameters.confirmed {
+                            return Err(Error::Inconsistent.into());
+                        }
                         parameters.confirm(&msg);
                     } else {
                         // We've not requested this channel, close connection.

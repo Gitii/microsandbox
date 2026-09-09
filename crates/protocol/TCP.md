@@ -72,6 +72,7 @@ their reservations. Non-reserving SSH sends debit that same ledger when admitted
 cancelled writes refund reservations that were never admitted. Channel-open
 confirmation initializes credit before exposing the channel, so a later waiter
 cannot overwrite an early window adjustment.
+Duplicate SSH open confirmations are rejected instead of resetting live credit.
 
 A TCP worker publishes its closing state before dropping its input receiver.
 Already-in-flight data and EOF on that closing channel do not fail the SSH

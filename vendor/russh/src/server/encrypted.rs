@@ -487,6 +487,16 @@ mod tests {
         (CHUNK as u32).encode(&mut packet).unwrap();
         session.process_packet(&mut handler, &packet).await.unwrap();
         assert_eq!(channel.writable_packet_size().await, 0);
+        let mut duplicate = vec![msg::CHANNEL_OPEN_CONFIRMATION];
+        id.encode(&mut duplicate).unwrap();
+        7u32.encode(&mut duplicate).unwrap();
+        WINDOW.encode(&mut duplicate).unwrap();
+        (CHUNK as u32).encode(&mut duplicate).unwrap();
+        assert!(matches!(
+            session.process_packet(&mut handler, &duplicate).await,
+            Err(Error::Inconsistent)
+        ));
+        assert_eq!(channel.writable_packet_size().await, 0);
     }
 
     impl Handler for ChannelCallbackProbe {
@@ -1284,6 +1294,11 @@ impl Session {
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
+                        // Credit initialization is one-shot; a duplicate must
+                        // not overwrite reservations from an established channel.
+                        if parameters.confirmed {
+                            return Err(Error::Inconsistent.into());
+                        }
                         parameters.confirm(&msg);
                     } else {
                         // We've not requested this channel, close connection.

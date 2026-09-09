@@ -24,8 +24,8 @@ is terminated independently of application queue congestion.
   it on cancellation; refuse an invalid zero packet limit without spinning.
 - `src/server/encrypted.rs` and `src/client/encrypted.rs`: add advertised credit
   instead of replacing reservations with the wire-window total; initialize credit
-  before publishing open confirmation. The server has manual receive windows;
-  the client honors its handler's receive-window target.
+  once before publishing open confirmation and reject duplicates. The server has
+  manual receive windows; the client honors its handler's receive-window target.
 - `src/server/session.rs`: consumption-driven receive credit and an out-of-band
   transport abort handle; distinguish reserved admission from `Handle::data`
   admission; remove delayed initialization by the open waiter.
