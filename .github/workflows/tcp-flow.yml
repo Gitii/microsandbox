@@ -36,6 +36,7 @@ jobs:
             vendor/russh -> target
       - run: cargo test --locked -p microsandbox-agent-client --features uds --lib
       - run: cargo test --locked -p microsandbox-runtime --lib relay::tests
+      - run: cargo test --locked -p microsandbox-network --lib secrets::oauth::tests
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib channels::tests
