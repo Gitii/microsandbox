@@ -70,6 +70,8 @@ const HTTP2_FLAG_PRIORITY: u8 = 0x20;
 /// Created from [`SecretsConfig`] and the destination SNI. Determines which
 /// secrets are eligible for this connection based on host matching.
 pub struct SecretsHandler {
+    /// Plaintext protocol classification is connection-scoped, not per write.
+    protocol: StreamProtocol,
     /// Secrets eligible for substitution on this connection.
     eligible_for_substitution: Vec<EligibleSecret>,
     /// Secret placeholders that should trigger an effective blocking action.
@@ -126,6 +128,15 @@ enum HttpState {
     /// Buffering a fixed-length body so body substitution can update
     /// `Content-Length` against the complete rewritten request.
     BufferingBody { remaining: usize },
+}
+
+/// TLS interception already identifies HTTP; raw TCP must classify its first
+/// flight once so later ciphertext cannot be mistaken for fresh HTTP headers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamProtocol {
+    Detect,
+    Http,
+    Opaque,
 }
 
 /// Stateful chunked transfer parser for request bodies.
@@ -628,6 +639,11 @@ impl SecretsHandler {
             .retain(|secret| !eligible_placeholders.contains(secret.placeholder.as_str()));
 
         Self {
+            protocol: if tls_intercepted {
+                StreamProtocol::Http
+            } else {
+                StreamProtocol::Detect
+            },
             eligible_for_substitution,
             ineligible_for_substitution,
             tls_intercepted,
@@ -671,12 +687,17 @@ impl SecretsHandler {
             return Err(ViolationAction::Block);
         }
 
+        if self.protocol == StreamProtocol::Opaque {
+            return self.inspect_opaque(data);
+        }
+
         if self.http2_state.is_some() {
             return self.substitute_http2(data);
         }
 
         if self.http_pending.is_empty() {
             if has_complete_http2_preface(data) {
+                self.protocol = StreamProtocol::Http;
                 self.http2_state = Some(Http2State::default());
                 return self.substitute_http2(data);
             }
@@ -689,6 +710,7 @@ impl SecretsHandler {
             pending_prefix.extend_from_slice(&self.http_pending);
             pending_prefix.extend_from_slice(data);
             if has_complete_http2_preface(&pending_prefix) {
+                self.protocol = StreamProtocol::Http;
                 self.http_pending.clear();
                 self.http2_state = Some(Http2State::default());
                 return self.substitute_http2(&pending_prefix);
@@ -725,6 +747,12 @@ impl SecretsHandler {
                     || !looks_like_http_request_prefix(&self.http_pending)
                 {
                     let pending = std::mem::take(&mut self.http_pending);
+                    self.classify_plaintext(&pending);
+                    if self.protocol == StreamProtocol::Opaque {
+                        return self
+                            .inspect_opaque(&pending)
+                            .map(|output| Cow::Owned(output.into_owned()));
+                    }
                     let output = self.substitute_ready(&pending)?.into_owned();
                     return Ok(Cow::Owned(output));
                 }
@@ -732,6 +760,12 @@ impl SecretsHandler {
             }
 
             let pending = std::mem::take(&mut self.http_pending);
+            self.classify_plaintext(&pending);
+            if self.protocol == StreamProtocol::Opaque {
+                return self
+                    .inspect_opaque(&pending)
+                    .map(|output| Cow::Owned(output.into_owned()));
+            }
             let output = self.substitute_ready(&pending)?.into_owned();
             return Ok(Cow::Owned(output));
         }
@@ -747,7 +781,34 @@ impl SecretsHandler {
             return Ok(Cow::Owned(Vec::new()));
         }
 
+        self.classify_plaintext(data);
+        if self.protocol == StreamProtocol::Opaque {
+            return self.inspect_opaque(data);
+        }
         self.substitute_ready(data)
+    }
+
+    fn classify_plaintext(&mut self, data: &[u8]) {
+        if self.protocol != StreamProtocol::Detect || data.is_empty() {
+            return;
+        }
+        if !looks_like_http_request_prefix(data) || first_line_is_not_http_request(data) {
+            self.protocol = StreamProtocol::Opaque;
+        } else if find_header_boundary(data).is_some() {
+            self.protocol = StreamProtocol::Http;
+        }
+    }
+
+    fn inspect_opaque<'a>(&mut self, data: &'a [u8]) -> Result<Cow<'a, [u8]>, ViolationAction> {
+        // Keep cross-write placeholder enforcement, but never buffer binary
+        // transport data as HTTP or inject secret values into an opaque stream.
+        self.apply_blocking_action(self.detect_blocking_action(
+            data,
+            String::from_utf8_lossy(data).as_ref(),
+            RequestLocation::Unknown,
+        ))?;
+        self.update_tail(data);
+        Ok(Cow::Borrowed(data))
     }
 
     fn substitute_http2<'a>(&mut self, data: &[u8]) -> Result<Cow<'a, [u8]>, ViolationAction> {
@@ -2196,7 +2257,8 @@ pub(crate) fn looks_like_http_request_prefix(data: &[u8]) -> bool {
     }
 
     let data = skip_leading_empty_http_lines(data);
-    if data.is_empty() {
+    // A CR split from its LF is still an ambiguous leading HTTP empty line.
+    if data.is_empty() || data == b"\r" {
         return true;
     }
 
@@ -3065,13 +3127,92 @@ impl SecretViolationReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::secrets::config::*;
-    use crate::shared::{ResolvedHostnameFamily, SharedState};
-
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
+    use crate::secrets::config::*;
+    use crate::shared::{ResolvedHostnameFamily, SharedState};
+
+    use super::*;
+
+    #[test]
+    fn opaque_stream_never_reclassifies_later_ciphertext_as_http() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.example.com")]);
+        let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+        let banner = b"SSH-2.0-OpenSSH_10.0\r\n";
+        assert_eq!(handler.substitute(banner).unwrap().as_ref(), banner);
+
+        // A random encrypted SSH packet can start with a valid HTTP token and
+        // space. Waiting for HTTP's header terminator deadlocks request/reply.
+        let mut packet = vec![0xa5; 44];
+        packet[..2].copy_from_slice(b"X ");
+        assert!(looks_like_http_request_prefix(&packet));
+        assert_eq!(handler.substitute(&packet).unwrap().as_ref(), packet);
+        assert_eq!(
+            handler.substitute(HTTP2_PREFACE).unwrap().as_ref(),
+            HTTP2_PREFACE
+        );
+        assert!(handler.http_pending.is_empty());
+        assert!(handler.http2_state.is_none());
+    }
+
+    #[test]
+    fn opaque_classification_survives_a_split_banner() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.example.com")]);
+        let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+        assert!(handler.substitute(b"SSH-2.").unwrap().is_empty());
+        assert_eq!(
+            handler.substitute(b"0-test\r\n").unwrap().as_ref(),
+            b"SSH-2.0-test\r\n"
+        );
+        assert_eq!(
+            handler.substitute(b"X \xff\x80").unwrap().as_ref(),
+            b"X \xff\x80"
+        );
+    }
+
+    #[test]
+    fn opaque_stream_retains_split_placeholder_enforcement() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.example.com")]);
+        let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+        handler.substitute(b"SSH-2.0-test\r\n").unwrap();
+        assert_eq!(handler.substitute(b"\xff$K").unwrap().as_ref(), b"\xff$K");
+        assert_eq!(
+            handler.substitute(b"EY\x80").unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn opaque_stream_never_injects_even_host_agnostic_secrets() {
+        let mut secret = make_secret("$KEY", "real-secret", "api.example.com");
+        secret.allowed_hosts = vec![HostPattern::Any];
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+        handler.substitute(b"SSH-2.0-test\r\n").unwrap();
+        let payload = b"GET / HTTP/1.1\r\nAuthorization: $KEY\r\n\r\n";
+        assert_eq!(handler.substitute(payload).unwrap().as_ref(), payload);
+    }
+
+    #[test]
+    fn plaintext_classification_preserves_split_leading_empty_lines() {
+        let mut secret = make_secret("$KEY", "real-secret", "api.example.com");
+        secret.allowed_hosts = vec![HostPattern::Any];
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let request =
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: $KEY\r\n\r\n";
+        let mut whole = SecretsHandler::new_plain_http_invalid_host(&config);
+        let expected = whole.substitute(request).unwrap().into_owned();
+        assert!(String::from_utf8_lossy(&expected).contains("Authorization: real-secret"));
+        for split in [1, 3] {
+            let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+            let mut actual = handler.substitute(&request[..split]).unwrap().into_owned();
+            actual.extend_from_slice(handler.substitute(&request[split..]).unwrap().as_ref());
+            assert_eq!(actual, expected, "leading CRLF split at {split}");
+        }
+    }
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
             secrets,
