@@ -1172,6 +1172,87 @@ mod tests {
         );
     }
 
+    /// A terminal run row is written from inside the runtime's exit observer,
+    /// while it still holds every disk image it attached. The wait must not
+    /// call that a clean stop until the images are provably released.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_stop_waits_for_the_runtime_to_release_its_disk_images() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempdir().unwrap();
+        let image = temp.path().join("root.raw");
+        fs::write(&image, b"disk").unwrap();
+        let backend = std::sync::Arc::new(
+            LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let config = test_config_with_rootfs(
+            "stop-disk",
+            RootfsSource::DiskImage {
+                path: image.clone(),
+                format: crate::sandbox::DiskImageFormat::Raw,
+                fstype: None,
+            },
+        );
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &config)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Stopped)
+            .await
+            .unwrap();
+        // A clean terminal run whose process is already gone: the image lock
+        // is the only evidence left to gather.
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(dead_pid())),
+            status: Set(run_entity::RunStatus::Terminated),
+            exit_code: Set(Some(0)),
+            termination_reason: Set(Some(run_entity::TerminationReason::ShutdownRequested)),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        let model = sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = crate::sandbox::SandboxHandle::from_local_model(backend.clone(), model, None);
+
+        // A second open file description on the image, exactly as the exiting
+        // runtime still has.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test could not take the image lock"
+        );
+
+        let error = handle
+            .wait_for_clean_stop_within(std::time::Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("still holds disk image"), "{message}");
+        assert!(message.contains("root.raw"), "{message}");
+
+        drop(held);
+        handle
+            .wait_for_clean_stop_within(std::time::Duration::from_millis(300))
+            .await
+            .expect("released image completes the wait");
+    }
+
     #[tokio::test]
     async fn list_pages_after_filtering_by_labels() {
         let temp = tempdir().unwrap();

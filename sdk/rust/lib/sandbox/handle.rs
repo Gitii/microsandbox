@@ -525,6 +525,13 @@ impl SandboxHandle {
     /// `bound` — the caller's whole stop deadline, since the guest's shutdown
     /// window lives inside it. The wait for the runtime process to exit after
     /// the row goes terminal is bounded more tightly, by [`RUNTIME_EXIT_WAIT`].
+    ///
+    /// Two conditions must hold, not one. The runtime writes the terminal run
+    /// row from inside its exit observer, while it is still running and still
+    /// holding the flock on every disk image it attached, so the row alone
+    /// says nothing about the images. The PID is checked, and then each image
+    /// is probed by taking its lock the way the next boot would: only once
+    /// that succeeds is the sandbox provably detached from its disks.
     pub(crate) async fn wait_for_clean_stop_within(
         &self,
         bound: std::time::Duration,
@@ -544,8 +551,10 @@ impl SandboxHandle {
             .backend
             .as_local()
             .ok_or_else(|| MicrosandboxError::Runtime("missing local backend".into()))?;
+        let disk_images = self.attached_disk_images(backend).await;
         let deadline = tokio::time::Instant::now() + bound;
         let mut runtime_exit_deadline = None;
+        let mut locked_image = None;
         loop {
             let run = run_entity::Entity::find()
                 .filter(run_entity::Column::SandboxId.eq(local.db_id))
@@ -570,18 +579,32 @@ impl SandboxHandle {
             if run.status == run_entity::RunStatus::Terminated {
                 ensure_clean_run(&run)?;
                 if !self.runtime_process_is_live(&run).await? {
-                    return Ok(());
-                }
-                let runtime_exit_deadline = *runtime_exit_deadline
-                    .get_or_insert_with(|| tokio::time::Instant::now() + RUNTIME_EXIT_WAIT);
-                if tokio::time::Instant::now() >= runtime_exit_deadline {
-                    return Err(MicrosandboxError::Runtime(format!(
-                        "sandbox '{}' reached a terminal run but its VM process is still alive",
-                        self.name
-                    )));
+                    locked_image = first_locked_disk_image(&disk_images);
+                    if locked_image.is_none() {
+                        return Ok(());
+                    }
+                } else {
+                    // The PID keeps its own, tighter bound: past it the
+                    // process is either wedged or — on Unix, where the SDK
+                    // cannot prove a PID's identity — recycled.
+                    let runtime_exit_deadline = *runtime_exit_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + RUNTIME_EXIT_WAIT);
+                    if tokio::time::Instant::now() >= runtime_exit_deadline {
+                        return Err(MicrosandboxError::Runtime(format!(
+                            "sandbox '{}' reached a terminal run but its VM process is still alive",
+                            self.name
+                        )));
+                    }
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                if let Some(image) = locked_image {
+                    return Err(MicrosandboxError::Runtime(format!(
+                        "sandbox '{}' still holds disk image '{}'; its runtime has not released it",
+                        self.name,
+                        image.display()
+                    )));
+                }
                 return Err(MicrosandboxError::Runtime(format!(
                     "sandbox '{}' did not confirm a clean stop within {:?}",
                     self.name, bound
@@ -614,6 +637,25 @@ impl SandboxHandle {
             Ok(run
                 .pid
                 .is_some_and(microsandbox_utils::process::pid_is_alive))
+        }
+    }
+
+    /// The disk images this sandbox attaches, as the spawn path resolves them.
+    /// Empty when the handle is not local or its stored spec cannot be read —
+    /// there is then nothing the probe can prove either way.
+    async fn attached_disk_images(
+        &self,
+        backend: &crate::backend::LocalBackend,
+    ) -> Vec<(std::path::PathBuf, bool)> {
+        let SandboxHandleInner::Local(state) = &self.inner else {
+            return Vec::new();
+        };
+        match serde_json::from_str::<SandboxConfig>(&state.config_json) {
+            Ok(config) => crate::runtime::spawn::attached_disk_images(backend, &config).await,
+            Err(error) => {
+                tracing::debug!(%error, sandbox = %self.name, "reading the stored spec for the disk release probe");
+                Vec::new()
+            }
         }
     }
 
@@ -801,6 +843,29 @@ fn is_local_ephemeral_handle(inner: &SandboxHandleInner) -> bool {
     serde_json::from_str::<SandboxConfig>(&state.config_json)
         .map(|config| config.spec.lifecycle.ephemeral)
         .unwrap_or(false)
+}
+
+/// The first disk image the stopped runtime has not released yet, if any.
+///
+/// Windows keeps its disk locks in a sidecar file opened by the *parent*, which
+/// holds that handle for as long as this process lives, so probing there would
+/// always conflict with ourselves. The Windows equivalent is the identity-checked
+/// reap in [`SandboxHandle::runtime_process_is_live`].
+fn first_locked_disk_image(images: &[(std::path::PathBuf, bool)]) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = images;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        images
+            .iter()
+            .find(|(path, readonly)| {
+                !crate::runtime::spawn::disk_image_is_released(path, *readonly)
+            })
+            .map(|(path, _)| path.clone())
+    }
 }
 
 fn sandbox_status_is_terminal(status: SandboxStatus) -> bool {
