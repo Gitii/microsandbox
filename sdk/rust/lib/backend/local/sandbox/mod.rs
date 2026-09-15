@@ -1052,7 +1052,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graceful_stop_rejects_failed_run_and_live_runtime() {
+    async fn graceful_stop_is_idempotent_on_already_terminal_sandbox() {
+        let temp = tempdir().unwrap();
+        let backend = std::sync::Arc::new(
+            LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config("stop-terminal"))
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Stopped)
+            .await
+            .unwrap();
+        // An unclean run from some earlier life. Nothing was requested here, so
+        // stop() must not judge it.
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(std::process::id() as i32)),
+            status: Set(run_entity::RunStatus::Terminated),
+            exit_code: Set(Some(1)),
+            termination_reason: Set(Some(run_entity::TerminationReason::Failed)),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        let model = sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = crate::sandbox::SandboxHandle::from_local_model(backend.clone(), model, None);
+
+        handle.stop().await.unwrap();
+        assert_eq!(
+            handle.dispatch_stop().await.unwrap(),
+            crate::sandbox::StopRequest::AlreadyTerminal
+        );
+    }
+
+    /// The evidence check a requested stop is held to: an unclean run is a
+    /// failure, and a clean run whose VM process is still alive is not yet a
+    /// confirmed stop.
+    #[tokio::test]
+    async fn requested_stop_rejects_failed_run_and_live_runtime() {
         let temp = tempdir().unwrap();
         let backend = std::sync::Arc::new(
             LocalBackend::builder()
@@ -1065,7 +1112,7 @@ mod tests {
         let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config("stop-evidence"))
             .await
             .unwrap();
-        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Stopped)
+        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Draining)
             .await
             .unwrap();
         let run_id = run_entity::Entity::insert(run_entity::ActiveModel {
@@ -1086,7 +1133,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let handle = crate::sandbox::SandboxHandle::from_local_model(backend.clone(), model, None);
-        let error = handle.stop().await.unwrap_err();
+
+        let error = handle
+            .wait_for_clean_stop_within(std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("did not confirm clean shutdown"));
 
         run_entity::Entity::update(run_entity::ActiveModel {
@@ -1098,11 +1149,19 @@ mod tests {
         .exec(pools.write())
         .await
         .unwrap();
-        let error = handle
-            .stop_with_timeout(std::time::Duration::from_millis(20))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("deadline expired"));
+
+        // Clean run, but this process is still holding the recorded PID: the
+        // loop must give up on its own bound rather than spin forever. Unix
+        // only — on Windows the identity-checked reap proves the PID is not
+        // the runtime and the wait rightly succeeds.
+        #[cfg(unix)]
+        {
+            let error = handle
+                .wait_for_clean_stop_within(std::time::Duration::from_millis(200))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("did not confirm a clean stop"));
+        }
         assert!(LocalBackend::pid_is_alive(std::process::id() as i32));
         assert!(
             sandbox_entity::Entity::find_by_id(id)

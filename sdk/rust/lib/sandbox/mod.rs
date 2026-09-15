@@ -81,6 +81,9 @@ pub(crate) fn reserved_label_prefix(key: &str) -> Option<&'static str> {
 
 // `mod patch` and `mod types` are private; re-export the entry points the
 // local backend's lifecycle and create methods under `backend/local/` call.
+// Used by the local backend's stop tests.
+#[cfg(test)]
+pub(crate) use handle::StopRequest;
 pub(crate) use patch::{apply_patches, build_upper_tree};
 #[cfg(windows)]
 pub(crate) use reap::reap_leaked_runtime_process;
@@ -821,7 +824,7 @@ impl Sandbox {
                         .sandboxes()
                         .get(self.backend.clone(), &self.name)
                         .await?;
-                    handle.wait_for_clean_stop().await?;
+                    handle.wait_for_clean_stop_within(timeout).await?;
                 }
                 Ok(())
             } else {
@@ -830,8 +833,12 @@ impl Sandbox {
                     .sandboxes()
                     .get(self.backend.clone(), &self.name)
                     .await?;
-                handle.request_stop().await?;
-                handle.wait_for_clean_stop().await
+                if handle.dispatch_stop().await? == handle::StopRequest::AlreadyTerminal {
+                    // Already terminal before we asked: nothing was requested
+                    // here, so there is no shutdown of ours to confirm.
+                    return Ok(());
+                }
+                handle.wait_for_clean_stop_within(timeout).await
             }
         })
         .await

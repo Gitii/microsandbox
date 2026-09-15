@@ -15,21 +15,26 @@ type DiskInfo struct {
 	NeedsRecovery  bool    `json:"needs_recovery"`
 }
 
-// CreateDisk synchronously publishes a sparse ext4 image at an exclusive path.
+// Disk is the factory namespace for offline, local-host disk image operations.
+var Disk diskFactory
+
+type diskFactory struct{}
+
+// Create synchronously publishes a sparse ext4 image at an exclusive path.
 // Sizes are bytes. Hold an exclusive lifecycle lock through manifest adoption.
-func CreateDisk(path string, sizeBytes uint64) (*DiskInfo, error) {
+func (diskFactory) Create(path string, sizeBytes uint64) (*DiskInfo, error) {
 	return diskOperation("create", "", path, sizeBytes)
 }
 
-// InspectDisk reads metadata without modifying a stopped, detached image.
-func InspectDisk(path string) (*DiskInfo, error) {
+// Inspect reads metadata without modifying a stopped, detached image.
+func (diskFactory) Inspect(path string) (*DiskInfo, error) {
 	return diskOperation("inspect", path, "", 0)
 }
 
-// GrowDiskCopy publishes a verified larger copy without changing source.
+// GrowCopy publishes a verified larger copy without changing source.
 // Stop/detach all users and hold a lifecycle lock through manifest adoption.
 // The caller removes the retained source only after adopting the replacement.
-func GrowDiskCopy(source, destination string, sizeBytes uint64) (*DiskInfo, error) {
+func (diskFactory) GrowCopy(source, destination string, sizeBytes uint64) (*DiskInfo, error) {
 	return diskOperation("grow_copy", source, destination, sizeBytes)
 }
 

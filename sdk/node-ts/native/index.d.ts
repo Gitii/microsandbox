@@ -1698,9 +1698,9 @@ export declare function defaultBackendInfo(): JsBackendInfo
 /** Return the active default backend kind (`"local"` or `"cloud"`). */
 export declare function defaultBackendKind(): string
 
-export declare function diskCreate(path: string, sizeBytes: bigint): DiskInfo
+export declare function diskCreate(path: string, sizeBytes: bigint): Promise<DiskInfo>
 
-export declare function diskGrowCopy(source: string, destination: string, sizeBytes: bigint): DiskInfo
+export declare function diskGrowCopy(source: string, destination: string, sizeBytes: bigint): Promise<DiskInfo>
 
 export interface DiskInfo {
   uuid: string
@@ -1710,7 +1710,7 @@ export interface DiskInfo {
   needsRecovery: boolean
 }
 
-export declare function diskInspect(path: string): DiskInfo
+export declare function diskInspect(path: string): Promise<DiskInfo>
 
 /** DNS interception configuration produced by `DnsBuilder.build()`. */
 export interface DnsConfig {

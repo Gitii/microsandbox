@@ -23,7 +23,7 @@ env MSB_PATH="$PWD/build/msb" \
 
 The test is ignored during ordinary workspace tests; the runner explicitly
 executes it with `--ignored`, and missing prerequisites fail. The runner
-creates isolated `docker-runtime-*` state under `TMPDIR` (default `/tmp/opencode`), preserves diagnostics, and prints its
+creates isolated `docker-runtime-*` state under `TMPDIR` (default `/tmp`), preserves diagnostics, and prints its
 location. Fixture image names are unique; no host Docker daemon configuration is
 changed. The guest imports its bundled native BusyBox image without a registry.
 HTTPS regression coverage uses `https://example.com`.

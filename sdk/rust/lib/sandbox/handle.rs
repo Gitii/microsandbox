@@ -36,9 +36,33 @@ pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Default timeout for observing stopped state after force termination.
 pub const DEFAULT_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long [`SandboxHandle::wait_for_clean_stop_within`] waits for the runtime
+/// process to disappear *after* its run row has gone terminal.
+///
+/// Up to that point the wait is the guest's shutdown window and belongs to the
+/// caller's stop deadline. Once the exit observer has written the terminal row
+/// the process is already leaving, so a PID that lingers is either wedged or —
+/// on Unix, where the SDK cannot prove a PID's identity — recycled. Either way
+/// there is nothing more to observe.
+const RUNTIME_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the observation loop re-reads the run row.
+const CLEAN_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// What a graceful-stop request actually did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopRequest {
+    /// The sandbox was already `Stopped` or `Crashed` before we asked. No
+    /// shutdown was requested, so this call has nothing to judge clean.
+    AlreadyTerminal,
+
+    /// A graceful shutdown was requested of a running or draining sandbox.
+    Dispatched,
+}
 
 /// A lightweight handle to a sandbox.
 ///
@@ -476,10 +500,16 @@ impl SandboxHandle {
 
     /// Stop gracefully within a deadline. Timeout or unclean exit is an error;
     /// force termination requires an explicit call to [`kill`](Self::kill).
+    /// A sandbox that was already terminal before the call returns `Ok`: stop
+    /// stays idempotent, and this call cannot vouch for a shutdown it never
+    /// requested. Only a shutdown this call dispatched is held to the clean-exit
+    /// evidence below.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
         match tokio::time::timeout(timeout, async {
-            self.request_stop().await?;
-            self.wait_for_clean_stop().await
+            if self.dispatch_stop().await? == StopRequest::AlreadyTerminal {
+                return Ok(());
+            }
+            self.wait_for_clean_stop_within(timeout).await
         })
         .await
         {
@@ -491,7 +521,14 @@ impl SandboxHandle {
         }
     }
 
-    pub(crate) async fn wait_for_clean_stop(&self) -> MicrosandboxResult<()> {
+    /// Wait for positive evidence that the sandbox shut down cleanly, within
+    /// `bound` — the caller's whole stop deadline, since the guest's shutdown
+    /// window lives inside it. The wait for the runtime process to exit after
+    /// the row goes terminal is bounded more tightly, by [`RUNTIME_EXIT_WAIT`].
+    pub(crate) async fn wait_for_clean_stop_within(
+        &self,
+        bound: std::time::Duration,
+    ) -> MicrosandboxResult<()> {
         let Some(local) = self.local() else {
             let result = self.wait_until_stopped().await?;
             return if result.status == SandboxStatus::Stopped {
@@ -507,43 +544,111 @@ impl SandboxHandle {
             .backend
             .as_local()
             .ok_or_else(|| MicrosandboxError::Runtime("missing local backend".into()))?;
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut runtime_exit_deadline = None;
         loop {
             let run = run_entity::Entity::find()
                 .filter(run_entity::Column::SandboxId.eq(local.db_id))
                 .order_by_desc(run_entity::Column::Id)
                 .one(backend.db().await?.read())
-                .await?
-                .ok_or_else(|| {
-                    MicrosandboxError::Runtime(format!(
-                        "no run evidence for sandbox '{}'",
-                        self.name
-                    ))
-                })?;
-            if run.status == run_entity::RunStatus::Terminated {
-                ensure_clean_run(&run)?;
-                if !run
-                    .pid
-                    .is_some_and(microsandbox_utils::process::pid_is_alive)
-                {
+                .await?;
+            let Some(run) = run else {
+                // An ephemeral sandbox is self-cleaned by the runtime's exit
+                // observer, which deletes the sandbox row and its runs. The
+                // missing evidence *is* the evidence that it reached a
+                // terminal state — the same exemption that
+                // `Sandbox::stop_with_timeout` applies before it ever asks
+                // for a handle.
+                if self.is_local_ephemeral() {
                     return Ok(());
                 }
+                return Err(MicrosandboxError::Runtime(format!(
+                    "no run evidence for sandbox '{}'",
+                    self.name
+                )));
+            };
+            if run.status == run_entity::RunStatus::Terminated {
+                ensure_clean_run(&run)?;
+                if !self.runtime_process_is_live(&run).await? {
+                    return Ok(());
+                }
+                let runtime_exit_deadline = *runtime_exit_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + RUNTIME_EXIT_WAIT);
+                if tokio::time::Instant::now() >= runtime_exit_deadline {
+                    return Err(MicrosandboxError::Runtime(format!(
+                        "sandbox '{}' reached a terminal run but its VM process is still alive",
+                        self.name
+                    )));
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(MicrosandboxError::Runtime(format!(
+                    "sandbox '{}' did not confirm a clean stop within {:?}",
+                    self.name, bound
+                )));
+            }
+            tokio::time::sleep(CLEAN_STOP_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Whether the VM process recorded on `run` is still running.
+    ///
+    /// On Windows a terminal row can still be backed by a VM process that
+    /// never finished exiting, so the identity-checked reap terminates it —
+    /// and leaves a recycled PID alone, which for this loop's purposes means
+    /// the runtime is gone. On Unix the SDK has no process-identity probe, so
+    /// the recorded PID is taken at face value and [`RUNTIME_EXIT_WAIT`] is
+    /// what keeps a recycled PID from holding the loop open.
+    async fn runtime_process_is_live(&self, run: &run_entity::Model) -> MicrosandboxResult<bool> {
+        #[cfg(windows)]
+        {
+            let _ = run;
+            let (Some(local), Some(local_backend)) = (self.local(), self.backend.as_local()) else {
+                return Ok(false);
+            };
+            super::reap_leaked_runtime_process(local_backend, local.db_id, &self.name).await?;
+            Ok(false)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(run
+                .pid
+                .is_some_and(microsandbox_utils::process::pid_is_alive))
         }
     }
 
     /// Request graceful shutdown without waiting for observed stopped state.
     pub async fn request_stop(&self) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
+        self.dispatch_stop().await.map(|_| ())
+    }
+
+    /// Request graceful shutdown, reporting whether the sandbox was already
+    /// terminal before the request.
+    pub(crate) async fn dispatch_stop(&self) -> MicrosandboxResult<StopRequest> {
+        let current = match self.refresh().await {
+            Ok(current) => current,
+            // An ephemeral sandbox whose row the runtime already deleted is
+            // terminal by definition; the same exemption `wait_until_stopped`
+            // applies.
+            Err(error)
+                if self.is_local_ephemeral()
+                    && super::sandbox_not_found_for_name(&error, &self.name) =>
+            {
+                return Ok(StopRequest::AlreadyTerminal);
+            }
+            Err(error) => return Err(error),
+        };
         if sandbox_status_is_terminal(current.status_snapshot()) {
-            return Ok(());
+            return Ok(StopRequest::AlreadyTerminal);
         }
 
         current
             .backend
             .sandboxes()
             .stop(current.backend.clone(), &current.name)
-            .await
+            .await?;
+
+        Ok(StopRequest::Dispatched)
     }
 
     /// Kill the sandbox immediately and wait until it is observed stopped.

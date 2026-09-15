@@ -9,22 +9,23 @@ export interface DiskInfo {
   needsRecovery: boolean;
 }
 
-/** Synchronous local operations. Stop/detach all users and hold a lifecycle lock
- * through maintenance and manifest adoption. Root snapshots exclude extra disks.
+/** Local operations, run off the JS thread. Stop/detach all users and hold a
+ * lifecycle lock through maintenance and manifest adoption. Root snapshots
+ * exclude extra disks.
  */
 export class Disk {
   /** Create a sparse ext4 image without replacing an existing destination. */
-  static create(path: string, sizeBytes: bigint): DiskInfo {
+  static create(path: string, sizeBytes: bigint): Promise<DiskInfo> {
     return napi.diskCreate(path, sizeBytes);
   }
 
   /** Inspect without modifying the image. */
-  static inspect(path: string): DiskInfo {
+  static inspect(path: string): Promise<DiskInfo> {
     return napi.diskInspect(path);
   }
 
   /** Publish a verified larger copy; source remains unchanged even on failure. */
-  static growCopy(source: string, destination: string, sizeBytes: bigint): DiskInfo {
+  static growCopy(source: string, destination: string, sizeBytes: bigint): Promise<DiskInfo> {
     return napi.diskGrowCopy(source, destination, sizeBytes);
   }
 }

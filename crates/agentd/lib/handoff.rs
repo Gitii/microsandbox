@@ -50,6 +50,11 @@ use crate::error::{AgentdError, AgentdResult};
 /// created in `init::init` (see `create_run_dir`).
 const POST_HANDOFF_STDERR: &str = "/run/microsandbox/agentd.log";
 
+/// Directories searched for `systemctl` when `PATH` does not resolve it.
+/// agentd runs with whatever environment the VMM handed it, which on a
+/// handoff boot may carry no `PATH` at all.
+const SYSTEMCTL_FALLBACK_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -323,6 +328,23 @@ pub fn is_pid_1() -> bool {
     nix::unistd::getpid().as_raw() == 1
 }
 
+/// Locate the image's `systemctl`, searching `PATH` first and then the
+/// directories a distribution is most likely to install it in.
+///
+/// The path is the image's to choose: a merged-`/usr` distribution puts it in
+/// `/usr/bin`, others in `/bin`, and a minimal image may ship none at all.
+fn find_systemctl() -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    path_dirs
+        .into_iter()
+        .chain(SYSTEMCTL_FALLBACK_DIRS.iter().map(PathBuf::from))
+        .map(|dir| dir.join("systemctl"))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Ask the image's init to power off without forcing running services down.
 ///
 /// systemd's control client belongs to the image: it knows its manager's
@@ -332,16 +354,31 @@ pub fn is_pid_1() -> bool {
 pub fn signal_init_shutdown() -> AgentdResult<()> {
     let init_name = std::fs::read_to_string("/proc/1/comm")?;
     if init_name.trim() == "systemd" {
-        let status = process::Command::new("/usr/bin/systemctl")
-            .args(["--no-block", "poweroff"])
-            .status()
-            .map_err(|e| AgentdError::Init(format!("request systemd poweroff: {e}")))?;
-        if !status.success() {
-            return Err(AgentdError::Init(format!(
-                "systemd rejected poweroff request: {status}"
-            )));
+        match find_systemctl() {
+            Some(systemctl) => {
+                let status = process::Command::new(&systemctl)
+                    .args(["--no-block", "poweroff"])
+                    .status()
+                    .map_err(|e| AgentdError::Init(format!("request systemd poweroff: {e}")))?;
+                if !status.success() {
+                    return Err(AgentdError::Init(format!(
+                        "systemd rejected poweroff request: {status}"
+                    )));
+                }
+                return Ok(());
+            }
+            None => {
+                // The image says systemd is PID 1 but ships no control
+                // client we can find. The realtime signal is the weaker
+                // contract (musl's SIGRTMIN+4 is glibc systemd's reboot,
+                // not its poweroff) but it is the only route left.
+                eprintln!(
+                    "agentd: systemd is PID 1 but no systemctl was found on PATH or in {}; \
+                     falling back to the realtime-signal shutdown",
+                    SYSTEMCTL_FALLBACK_DIRS.join(", ")
+                );
+            }
         }
-        return Ok(());
     }
     let sig = libc::SIGRTMIN() + 4;
     // SAFETY: kill(2) is signal-safe and pid=1 is always valid.

@@ -860,7 +860,7 @@ char *call_msb_volume_list(uint64_t cancel_id, uint8_t *buf, size_t buf_len) {
 }
 
 char *call_msb_disk_operation(const char *op, const char *src, const char *dst, uint64_t size, uint8_t *buf, size_t len) {
-    return ptr_msb_disk_operation(op, src, dst, size, buf, len);
+	return ptr_msb_disk_operation ? ptr_msb_disk_operation(op, src, dst, size, buf, len) : NULL;
 }
 char *call_msb_volume_get(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_volume_get ? ptr_msb_volume_get(cancel_id, name, buf, buf_len) : NULL;

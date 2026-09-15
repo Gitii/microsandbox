@@ -99,8 +99,9 @@ store**, independently of the root disk. Root snapshots do
 not snapshot extra disks. Retain and adopt those artifacts separately; restoring
 a root snapshot does not roll their contents back.
 
-All four SDKs provide synchronous, **local-host** operations for caller-owned
-images. They do not create named-volume records or update sandbox mounts.
+All four SDKs provide **local-host** operations for caller-owned images. Rust,
+Python, and Go are synchronous; TypeScript returns promises and runs the copy
+off the JS thread. They do not create named-volume records or update sandbox mounts.
 Before inspecting or growing an image, stop and detach every VM or host mount
 using it. Hold an exclusive application lifecycle lock across maintenance,
 manifest adoption, and attachment so another worker cannot reopen the old image.
@@ -119,9 +120,9 @@ assert_eq!(current.uuid, replacement.uuid);
 ```typescript TypeScript
 import { Disk } from "microsandbox";
 
-const created = Disk.create("working.ext4", 1024n * 1024n * 1024n);
-const current = Disk.inspect("working.ext4");
-const replacement = Disk.growCopy("working.ext4", "working-next.ext4", 2n * 1024n * 1024n * 1024n);
+const created = await Disk.create("working.ext4", 1024n * 1024n * 1024n);
+const current = await Disk.inspect("working.ext4");
+const replacement = await Disk.growCopy("working.ext4", "working-next.ext4", 2n * 1024n * 1024n * 1024n);
 ```
 
 ```python Python
@@ -133,11 +134,11 @@ replacement = Disk.grow_copy("working.ext4", "working-next.ext4", 2 * 1024**3)
 ```
 
 ```go Go
-created, err := m.CreateDisk("working.ext4", 1024*1024*1024)
+created, err := m.Disk.Create("working.ext4", 1024*1024*1024)
 if err != nil { return err }
-current, err := m.InspectDisk("working.ext4")
+current, err := m.Disk.Inspect("working.ext4")
 if err != nil { return err }
-replacement, err := m.GrowDiskCopy("working.ext4", "working-next.ext4", 2*1024*1024*1024)
+replacement, err := m.Disk.GrowCopy("working.ext4", "working-next.ext4", 2*1024*1024*1024)
 if err != nil { return err }
 _ = created
 _ = current
