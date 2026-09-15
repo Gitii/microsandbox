@@ -895,6 +895,8 @@ impl Sandbox {
             ));
         }
         self.stop().await?;
+        // `stop()` already waited on the child; tokio's `Child::wait` caches
+        // the status, so this second wait returns it rather than blocking.
         self.wait().await
     }
 

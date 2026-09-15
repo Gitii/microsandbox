@@ -151,8 +151,8 @@ export class SandboxHandle {
 
   /**
    * Stop gracefully with an explicit deadline in milliseconds. Throws on
-   * expiry or unclean exit. `0` provides no grace period; use `kill()`
-   * explicitly for force termination.
+   * expiry or unclean exit. `0` is rejected — it leaves no window in which a
+   * shutdown could be confirmed; use `kill()` for a forced stop.
    */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));

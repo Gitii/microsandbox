@@ -333,6 +333,11 @@ pub fn is_pid_1() -> bool {
 ///
 /// The path is the image's to choose: a merged-`/usr` distribution puts it in
 /// `/usr/bin`, others in `/bin`, and a minimal image may ship none at all.
+///
+/// A candidate counts only when it is an executable file. A non-executable
+/// `systemctl` — a stub, a leftover, a file mode the image never fixed — would
+/// otherwise be spawned and fail, taking the poweroff with it instead of
+/// falling back to the signal path.
 fn find_systemctl() -> Option<PathBuf> {
     let path_dirs = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
@@ -342,7 +347,18 @@ fn find_systemctl() -> Option<PathBuf> {
         .into_iter()
         .chain(SYSTEMCTL_FALLBACK_DIRS.iter().map(PathBuf::from))
         .map(|dir| dir.join("systemctl"))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `path` is a regular file with at least one execute bit set.
+///
+/// agentd runs as root, so any execute bit is enough for it to spawn.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Ask the image's init to power off without forcing running services down.

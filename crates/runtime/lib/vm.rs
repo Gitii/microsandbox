@@ -2039,6 +2039,12 @@ fn request_guest_shutdown_with_timeout(
 fn has_handoff_init(env: &[String]) -> bool {
     // SDK init selection is an agentd boot parameter, not the VMM executable
     // override that libkrun would take. Match the same last-value-wins env.
+    //
+    // `MSB_HANDOFF_INIT=auto` counts, deliberately: the window is armed by
+    // what the sandbox *asked* for, not by what agentd resolved in the guest.
+    // The host cannot see that resolution, and a request for a guest init is
+    // already a request for the longer, real deadline — an `auto` that finds
+    // no candidate fails the boot rather than quietly becoming a PID-1 agentd.
     env.iter()
         .rev()
         .find_map(|entry| {

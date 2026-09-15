@@ -534,8 +534,19 @@ impl SandboxHandle {
         bound: std::time::Duration,
     ) -> MicrosandboxResult<()> {
         let Some(local) = self.local() else {
-            let result = self.wait_until_stopped().await?;
-            return if result.status == SandboxStatus::Stopped {
+            // A cloud sandbox has no run row or host process to inspect, only
+            // the service's own view of it — which may never reach a terminal
+            // state. The bound is this branch's only deadline.
+            let observed = match tokio::time::timeout(bound, self.wait_until_stopped()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(MicrosandboxError::Runtime(format!(
+                        "sandbox '{}' did not confirm a clean stop within {:?}",
+                        self.name, bound
+                    )));
+                }
+            };
+            return if observed.status == SandboxStatus::Stopped {
                 Ok(())
             } else {
                 Err(MicrosandboxError::Runtime(format!(
@@ -982,26 +993,70 @@ mod tests {
         ));
     }
 
+    /// A cloud sandbox that never leaves `Running`: nothing about it will
+    /// ever satisfy the wait, so what the wait returns is its own bound.
+    #[tokio::test]
+    async fn cloud_clean_stop_wait_gives_up_on_its_own_bound() {
+        let body = serde_json::to_string(&cloud_response(CloudSandboxStatus::Running)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let backend: Arc<dyn Backend> =
+            Arc::new(CloudBackend::new(format!("http://{address}"), "msb_test_connect").unwrap());
+        let handle =
+            SandboxHandle::from_cloud(backend, cloud_response(CloudSandboxStatus::Running))
+                .unwrap();
+
+        let error = handle
+            .wait_for_clean_stop_within(std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        service.abort();
+
+        assert!(
+            error.to_string().contains("did not confirm a clean stop"),
+            "{error}"
+        );
+    }
+
     fn cloud_handle(status: CloudSandboxStatus) -> SandboxHandle {
         let backend: Arc<dyn Backend> =
             Arc::new(CloudBackend::new("https://unused.invalid", "msb_test_connect").unwrap());
-        SandboxHandle::from_cloud(
-            backend,
-            CloudCreateSandboxResponse {
-                id: "sandbox-id".into(),
-                org_id: "org-id".into(),
-                name: "cloud-connect-test".into(),
-                slug: "cloud-connect-test".into(),
-                status,
-                status_reason: None,
-                spec: None,
-                ephemeral: false,
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                stopped_at: None,
-                last_failure_message: None,
-            },
-        )
-        .unwrap()
+        SandboxHandle::from_cloud(backend, cloud_response(status)).unwrap()
+    }
+
+    fn cloud_response(status: CloudSandboxStatus) -> CloudCreateSandboxResponse {
+        CloudCreateSandboxResponse {
+            id: "sandbox-id".into(),
+            org_id: "org-id".into(),
+            name: "cloud-connect-test".into(),
+            slug: "cloud-connect-test".into(),
+            status,
+            status_reason: None,
+            spec: None,
+            ephemeral: false,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            stopped_at: None,
+            last_failure_message: None,
+        }
     }
 }

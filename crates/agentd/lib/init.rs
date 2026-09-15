@@ -220,8 +220,18 @@ mod linux {
                     // created its target, which is ordinary in a snapshot
                     // taken with /run empty. Re-point it at the tmpfs rather
                     // than failing a boot over a link we would have created
-                    // ourselves had it been absent.
+                    // ourselves had it been absent — but only when it already
+                    // aimed at /run. A dangling link aimed anywhere else is
+                    // the same disagreement about where runtime state lives
+                    // that the resolved-elsewhere arm refuses.
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let target = fs::read_link("/var/run")?;
+                        if !matches!(target.to_str(), Some("/run" | "run" | "../run")) {
+                            return Err(AgentdError::Init(format!(
+                                "/var/run must resolve to /run, but links to {}",
+                                target.display()
+                            )));
+                        }
                         fs::remove_file("/var/run")?;
                         unix_fs::symlink("/run", "/var/run")?;
                     }

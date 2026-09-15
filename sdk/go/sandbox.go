@@ -3,6 +3,7 @@ package microsandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -279,6 +280,20 @@ func stopTimeoutMillis(opts []StopOption) uint64 {
 		opt(&o)
 	}
 	return durationMillisCeil(o.timeout)
+}
+
+// errZeroStopTimeout is returned for WithStopTimeout(0) and anything else that
+// rounds to no deadline at all. Rejecting it here keeps the error on this side
+// of the FFI, where the caller can see which option produced it.
+var errZeroStopTimeout = errors.New("a zero stop deadline cannot confirm a shutdown; use Kill for a forced stop")
+
+// checkedStopTimeoutMillis is stopTimeoutMillis with that rejection applied.
+func checkedStopTimeoutMillis(opts []StopOption) (uint64, error) {
+	millis := stopTimeoutMillis(opts)
+	if millis == 0 {
+		return 0, errZeroStopTimeout
+	}
+	return millis, nil
 }
 
 func killTimeoutMillis(opts []KillOption) uint64 {
@@ -731,7 +746,11 @@ func (h *SandboxHandle) StartDetached(ctx context.Context) (*Sandbox, error) {
 
 // Stop gracefully stops the sandbox and waits until stopped state is observed.
 func (h *SandboxHandle) Stop(ctx context.Context, opts ...StopOption) error {
-	return wrapFFI(ffi.StopSandboxByName(ctx, h.name, stopTimeoutMillis(opts)))
+	millis, err := checkedStopTimeoutMillis(opts)
+	if err != nil {
+		return err
+	}
+	return wrapFFI(ffi.StopSandboxByName(ctx, h.name, millis))
 }
 
 // RequestStop requests graceful shutdown and returns once the request is sent.
@@ -784,7 +803,11 @@ func (s *Sandbox) Name() string { return s.inner.Name() }
 
 // Stop gracefully stops the sandbox and waits until stopped state is observed.
 func (s *Sandbox) Stop(ctx context.Context, opts ...StopOption) error {
-	return wrapFFI(s.inner.Stop(ctx, stopTimeoutMillis(opts)))
+	millis, err := checkedStopTimeoutMillis(opts)
+	if err != nil {
+		return err
+	}
+	return wrapFFI(s.inner.Stop(ctx, millis))
 }
 
 // RequestStop requests graceful shutdown and returns once the request is sent.
