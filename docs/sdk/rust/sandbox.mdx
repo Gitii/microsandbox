@@ -656,7 +656,7 @@ sb.stop().await?;
 
 </Accordion>
 
-Gracefully shut down the sandbox. Lets the sandbox finish writing any pending data to disk before it exits, so files written inside the sandbox aren't lost across a later restart. Waits up to ten seconds for a clean exit; if the sandbox is still running after that, it is force-killed.
+Gracefully shut down the sandbox within 150 seconds. Deadline expiry, an unreachable local agent, or unclean VM exit returns an error without automatic force-kill. Use `kill()` explicitly for force termination. A failed stop does not confirm that disks can be safely removed.
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop_with_timeout()</span>
 
@@ -664,7 +664,7 @@ Gracefully shut down the sandbox. Lets the sandbox finish writing any pending da
 async fn stop_with_timeout(&self, timeout: Duration) -> MicrosandboxResult<()>
 ```
 
-Gracefully shut down the sandbox with an explicit timeout before escalation. `Duration::ZERO` skips graceful shutdown and force-kills immediately.
+Gracefully shut down within an explicit deadline covering request delivery and exit observation. Expiry or unclean exit returns an error. `Duration::ZERO` is rejected: it leaves no window in which a shutdown could be confirmed — use `kill()` for a forced stop.
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop_and_wait()</span>
 
@@ -681,7 +681,7 @@ println!("exited: {}", status.success());
 
 </Accordion>
 
-Stop the sandbox and wait for the exit status. This is a local-backend compatibility helper; prefer [`stop()`](#sb-stop) or [`stop_with_timeout()`](#sb-stop_with_timeout) when the caller only needs stopped-state observation.
+Stop the sandbox within the default deadline and return its actual successful process exit status. Requires local lifecycle ownership; a reconnected handle returns an error without requesting shutdown. Use [`stop()`](#sb-stop) or [`stop_with_timeout()`](#sb-stop_with_timeout) for reconnected handles. Deadline expiry or unclean exit returns an error.
 
 <p className="msb-label">Returns</p>
 
@@ -2202,8 +2202,8 @@ A lightweight handle to an existing sandbox (running or stopped). Obtained via [
 | start() | `Result<`[`Sandbox`](#instance-methods)`>` | Start in attached mode |
 | start_detached() | `Result<`[`Sandbox`](#instance-methods)`>` | Start in detached mode |
 | status() | [`SandboxStatus`](#sandboxstatus) | Current status |
-| stop() | `Result<()>` | Gracefully shut down. Waits up to ten seconds for pending writes to flush, then force-kills |
-| stop_with_timeout(timeout) | `Result<()>` | Same as `stop()` with an explicit timeout; `Duration::ZERO` force-kills immediately |
+| stop() | `Result<()>` | Gracefully shut down within 150 seconds; expiry or unclean exit returns an error without automatic force-kill |
+| stop_with_timeout(timeout) | `Result<()>` | Same as `stop()` with an explicit deadline; `Duration::ZERO` is rejected |
 | touch() | `Result<`[`SandboxTouchResult`](#sandboxtouchresult)`>` | Explicitly refresh the sandbox idle timer |
 | updated_at() | `Option<DateTime<Utc>>` | Last update timestamp |
 | wait_until_stopped() | `Result<`[`SandboxStopResult`](#sandboxstopresult)`>` | Block until terminal state is observed |

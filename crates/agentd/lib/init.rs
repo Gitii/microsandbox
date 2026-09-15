@@ -27,6 +27,7 @@ pub fn init(
     if let Some(spec) = &params.block_root {
         linux::mount_block_root(spec)?;
     }
+    linux::mount_run()?;
     before_user_mounts()?;
     if params.security_profile == SecurityProfile::Restricted {
         force_restricted_mount_flags(&mut params);
@@ -181,6 +182,77 @@ mod linux {
                 .map_err(|e| AgentdError::Init(format!("failed to symlink /dev/fd: {e}")))?;
         }
 
+        Ok(())
+    }
+
+    /// Mount boot-ephemeral state after the root pivot and before any agent or
+    /// image service writes into /run. A later systemd handoff reuses this mount.
+    pub fn mount_run() -> AgentdResult<()> {
+        mkdir_ignore_exists("/run")?;
+        mount::mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("mode=755"),
+        )
+        .map_err(|e| AgentdError::Init(format!("mount ephemeral /run: {e}")))?;
+
+        // Images may spell /var/run as a directory rather than a symlink.
+        // Bind it to the same tmpfs without deleting snapshot-owned files.
+        fs::create_dir_all("/var")?;
+        match fs::symlink_metadata("/var/run") {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                match fs::canonicalize("/var/run") {
+                    Ok(target) if target == Path::new("/run") => {}
+                    // A symlink that resolves somewhere else would send
+                    // /var/run writes outside the tmpfs the guest and a later
+                    // systemd handoff share. That is the image disagreeing
+                    // with us about where runtime state lives, so it stops
+                    // the boot.
+                    Ok(target) => {
+                        return Err(AgentdError::Init(format!(
+                            "/var/run must resolve to /run, not {}",
+                            target.display()
+                        )));
+                    }
+                    // Dangling: the image shipped the link before anything
+                    // created its target, which is ordinary in a snapshot
+                    // taken with /run empty. Re-point it at the tmpfs rather
+                    // than failing a boot over a link we would have created
+                    // ourselves had it been absent — but only when it already
+                    // aimed at /run. A dangling link aimed anywhere else is
+                    // the same disagreement about where runtime state lives
+                    // that the resolved-elsewhere arm refuses.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let target = fs::read_link("/var/run")?;
+                        if !matches!(target.to_str(), Some("/run" | "run" | "../run")) {
+                            return Err(AgentdError::Init(format!(
+                                "/var/run must resolve to /run, but links to {}",
+                                target.display()
+                            )));
+                        }
+                        fs::remove_file("/var/run")?;
+                        unix_fs::symlink("/run", "/var/run")?;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(_) => {
+                mount::mount(
+                    Some("/run"),
+                    "/var/run",
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .map_err(|e| AgentdError::Init(format!("bind /run at /var/run: {e}")))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                unix_fs::symlink("/run", "/var/run")?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 

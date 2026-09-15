@@ -2,12 +2,44 @@ package microsandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStopTimeoutMillis(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts []StopOption
+		want uint64
+	}{
+		{"default allows runtime grace and handoff", nil, 150_000},
+		{"explicit deadline", []StopOption{WithStopTimeout(2500 * time.Millisecond)}, 2500},
+		{"zero marshals as zero milliseconds", []StopOption{WithStopTimeout(0)}, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stopTimeoutMillis(test.opts); got != test.want {
+				t.Fatalf("stopTimeoutMillis = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckedStopTimeoutMillisRejectsZero(t *testing.T) {
+	if _, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(0)}); !errors.Is(err, errZeroStopTimeout) {
+		t.Fatalf("checkedStopTimeoutMillis(0) error = %v, want errZeroStopTimeout", err)
+	}
+	if _, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(-1 * time.Second)}); !errors.Is(err, errZeroStopTimeout) {
+		t.Fatalf("a negative deadline must be rejected too, got %v", err)
+	}
+	millis, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(2500 * time.Millisecond)})
+	if err != nil || millis != 2500 {
+		t.Fatalf("checkedStopTimeoutMillis = (%d, %v), want (2500, nil)", millis, err)
+	}
+}
 
 func marshalCreateOptions(t *testing.T, opts ...SandboxOption) map[string]any {
 	t.Helper()

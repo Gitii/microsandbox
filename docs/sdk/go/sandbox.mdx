@@ -864,7 +864,7 @@ err := sb.Stop(ctx, m.WithStopTimeout(30*time.Second))
 
 </Accordion>
 
-Gracefully shut down the sandbox and wait until stopped state is observed. Lets the workload finish writing any pending data to disk before it exits. Defaults to a ten-second graceful window before force-kill; pass [`WithStopTimeout`](#withstoptimeout) to change it.
+Gracefully shut down within 150 seconds by default; pass [`WithStopTimeout`](#withstoptimeout) to change the deadline. Deadline expiry, an unreachable local agent, or unclean VM exit returns an error without automatic force-kill. Use `Kill` explicitly for force termination. A failed stop does not confirm that disks can be safely removed.
 
 <p className="msb-label">Parameters</p>
 
@@ -1746,7 +1746,7 @@ Add volume mount configurations keyed by guest path. Build values via the [`Moun
 func WithStopTimeout(timeout time.Duration) StopOption
 ```
 
-Set how long [`Stop`](#sb-stop) waits for graceful shutdown before force-killing. Default: 10 seconds. This is a `StopOption`, not a `SandboxOption`, pass it to [`Stop`](#sb-stop).
+Set the graceful shutdown deadline for [`Stop`](#sb-stop). Default: 150 seconds. Expiry returns an error without automatic force-kill; zero is rejected — use `Kill` for a forced stop. This is a `StopOption`, not a `SandboxOption`, pass it to [`Stop`](#sb-stop).
 
 <p className="msb-label">Parameters</p>
 

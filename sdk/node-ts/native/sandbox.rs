@@ -519,7 +519,8 @@ impl Sandbox {
         sb.stop().await.map_err(to_napi_error)
     }
 
-    /// Stop and wait for exit, returning the exit status.
+    /// Stop and wait for a clean exit, returning actual process status.
+    /// Requires local lifecycle ownership; reconnected handles must use stop.
     #[napi]
     pub async fn stop_and_wait(&self) -> Result<ExitStatus> {
         let guard = self.inner.lock().await;
@@ -536,7 +537,8 @@ impl Sandbox {
         sb.request_stop().await.map_err(to_napi_error)
     }
 
-    /// Stop gracefully with an explicit timeout before escalating to SIGKILL.
+    /// Stop gracefully within a deadline in milliseconds. Expiry or unclean
+    /// exit throws without automatic force-kill.
     #[napi]
     pub async fn stop_with_timeout(&self, timeout_ms: u32) -> Result<()> {
         let guard = self.inner.lock().await;

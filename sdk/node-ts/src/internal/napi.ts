@@ -23,6 +23,13 @@ export const napi = native;
 // dependency on the generated d.ts.
 
 export interface NativeBindings {
+  readonly diskCreate: (path: string, sizeBytes: bigint) => Promise<import("../disk.js").DiskInfo>;
+  readonly diskInspect: (path: string) => Promise<import("../disk.js").DiskInfo>;
+  readonly diskGrowCopy: (
+    source: string,
+    destination: string,
+    sizeBytes: bigint,
+  ) => Promise<import("../disk.js").DiskInfo>;
   readonly setRuntimeMsbPath?: (path: string) => void;
   readonly setRuntimeLibkrunfwPath?: (path: string) => void;
   readonly setDefaultBackend?: (

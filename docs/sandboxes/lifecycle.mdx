@@ -93,6 +93,28 @@ msb run -d python --name worker
 
 Stopping gracefully terminates guest processes and shuts down the VM. The sandbox moves to `Stopped` and can be restarted later with all its configuration preserved.
 
+The SDK's default graceful-stop deadline is 150 seconds. A deadline expiry,
+unreachable local agent, or unclean VM exit returns an error; stop does not
+automatically escalate to force termination. Rust callers can choose a deadline
+with `stop_with_timeout(Duration)`. Use `kill()` explicitly when force termination
+is intended. A failed stop is not confirmation that disks can be safely removed.
+
+Stopping a sandbox that is already `Stopped` or `Crashed` succeeds without
+requesting anything: stop stays idempotent, and a call that requested no
+shutdown does not judge the previous one. The clean-exit evidence below applies
+only to a shutdown the call itself requested.
+
+Local detached or reconnected handles require recorded clean run termination, an
+exited VM process, and every attached disk image released; a `Stopped` row alone
+is insufficient. The image check takes each attachment's lock the way the next
+boot would, so an image that cannot be opened or no longer exists counts as
+released, and a read-only attachment proves only that no writer holds it.
+A zero deadline is rejected: it leaves no window in which a shutdown could be
+confirmed, and `kill()` is how a forced stop is requested. Cloud stop observes
+the service's stopped state and does not provide local guest-filesystem proof.
+Rust `stop_and_wait()` requires lifecycle ownership and returns an actual process
+exit status; use `stop()` for a reconnected handle.
+
 <CodeGroup>
 ```rust Rust
 sb.stop().await?;

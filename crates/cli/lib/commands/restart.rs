@@ -30,7 +30,8 @@ pub struct RestartArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Seconds to wait for graceful shutdown before force-killing.
+    /// Graceful shutdown deadline in seconds (default: 150). Expiry fails
+    /// without restarting; use --force to kill instead. Zero is rejected.
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
@@ -52,6 +53,9 @@ enum RestartAction {
 
 /// Execute the `msb restart` command.
 pub async fn run(args: RestartArgs) -> anyhow::Result<()> {
+    if !args.force {
+        common::validate_stop_timeout(args.timeout)?;
+    }
     let names = common::resolve_bulk_targets(&args.names, &args.label, args.quiet).await?;
     let mut failed = false;
 

@@ -899,4 +899,15 @@ char *msb_sandbox_attach_shell(uint64_t cancel_id,
                                unsigned char *buf,
                                uintptr_t buf_len);
 
+/**
+ * Run an offline disk operation (create, inspect, grow_copy). The caller holds
+ * the stopped/detached lifecycle lock. Output uses the standard FFI JSON ABI.
+ */
+char *msb_disk_operation(const char *operation,
+                         const char *source,
+                         const char *destination,
+                         uint64_t size_bytes,
+                         unsigned char *buf,
+                         uintptr_t buf_len);
+
 #endif  /* MICROSANDBOX_GO_FFI_H */

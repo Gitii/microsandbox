@@ -60,6 +60,11 @@ const EXIT_REASON_AGENT_UNRESPONSIVE: u8 = 5;
 const EXIT_REASON_SHUTDOWN_REQUESTED: u8 = 6;
 const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
 
+/// `run.termination_detail` recorded when a guest missed its poweroff
+/// deadline and the host tore the VM down instead.
+const FORCED_EXIT_DETAIL: &str =
+    "guest did not power off within the shutdown grace window; host forced the exit";
+
 /// Fixed fd carrying the bulk `msb sandbox` config (argv overflow) as
 /// NUL-terminated argument records. Keeps the network-config blob and the
 /// repeated `--env` flags off the process argv — see issue #997.
@@ -328,9 +333,6 @@ pub struct VmConfig {
     #[cfg(unix)]
     pub backends: Vec<(String, Box<dyn DynFileSystem + Send + Sync>)>,
 
-    /// Path to the init binary in the guest.
-    pub init_path: Option<PathBuf>,
-
     /// Environment variables as `KEY=VALUE` pairs.
     pub env: Vec<String>,
 
@@ -396,9 +398,95 @@ type VmBuildOutput = (
     BindIdentityMapRegistration,
 );
 
+/// How a run ended, as the exit observer determined it.
+pub(crate) struct RunTermination {
+    /// Process exit status recorded on the run row.
+    pub exit_code: i32,
+
+    /// Coarse reason the sandbox stopped.
+    pub reason: run_entity::TerminationReason,
+
+    /// Free-form detail, set when the host had to force the exit.
+    pub detail: Option<String>,
+}
+
+/// Race-free record of a host-forced VM exit.
+///
+/// A grace-window sleeper and libkrun's exit observer can wake at the same
+/// instant — the guest may power off just as the deadline expires — so both
+/// facts live in one atomic. A sleeper marks the exit forced only while the
+/// observer has not started; once the observer starts, the verdict is frozen
+/// at what it read and a late wake changes nothing.
+///
+/// This is deliberately *not* a termination reason. Every reason survives a
+/// forced exit unchanged — the run still records why the sandbox was being
+/// stopped, be it a shutdown request, an idle timeout, a departed parent or a
+/// failed startup command — and the forced exit is carried by a non-zero exit
+/// code and `run.termination_detail` instead.
+///
+/// Only a handoff sandbox arms one. An agentd-as-PID-1 guest gets the short
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`] window, which has always been a hint
+/// rather than a deadline: it is routinely shorter than a clean poweroff and
+/// its expiry is not evidence of anything. A disarmed `ForcedExit` never
+/// records a forced exit, so those sandboxes keep exactly their old
+/// behaviour — exit code 0, no detail, no forced process exit.
+///
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`]: microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
+#[derive(Debug)]
+struct ForcedExit {
+    state: std::sync::atomic::AtomicU8,
+    armed: bool,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl ForcedExit {
+    /// No deadline has expired and the exit observer has not started.
+    const PENDING: u8 = 0;
+
+    /// A grace window expired and the host triggered the exit.
+    const FORCED: u8 = 1;
+
+    /// The exit observer is running; the verdict is frozen.
+    const OBSERVED: u8 = 2;
+
+    /// `armed` is whether this sandbox hands PID 1 to a guest init, the only
+    /// mode whose grace window is a real deadline.
+    fn new(armed: bool) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(Self::PENDING),
+            armed,
+        }
+    }
+
+    /// Record that a grace window expired and the host is forcing the exit.
+    ///
+    /// Returns `false` when this sandbox arms no forced exit, when the
+    /// observer has already started — the guest powered off on its own and
+    /// this wake lost the race — or when another sleeper got there first.
+    fn force(&self) -> bool {
+        self.armed
+            && self
+                .state
+                .compare_exchange(
+                    Self::PENDING,
+                    Self::FORCED,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+    }
+
+    /// Called by the exit observer as its first act. Freezes the state and
+    /// reports whether an expired deadline forced this exit.
+    fn observer_started(&self) -> bool {
+        self.state
+            .swap(Self::OBSERVED, std::sync::atomic::Ordering::SeqCst)
+            == Self::FORCED
+    }
+}
 
 impl BindIdentityMapRegistration {
     fn new() -> Self {
@@ -441,7 +529,6 @@ impl std::fmt::Debug for VmConfig {
         #[cfg(unix)]
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
-            .field("init_path", &self.init_path)
             .field("env", &self.env)
             .field("workdir", &self.workdir)
             .field("exec_path", &self.exec_path)
@@ -505,7 +592,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
+    let handoff_init = has_handoff_init(&config.vm.env);
+    let shutdown_flush_timeout = guest_shutdown_flush_timeout(handoff_init);
 
     // Create console shared state (ring buffers + wake pipes).
     let shared = Arc::new(ConsoleSharedState::new());
@@ -600,6 +688,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_reason: Arc<std::sync::atomic::AtomicU8> =
         Arc::new(std::sync::atomic::AtomicU8::new(EXIT_REASON_COMPLETED));
 
+    // Set when a grace window expires and the host forces the exit. Kept
+    // apart from the reason tag so the original cause (idle, parent exit,
+    // startup command) survives into the persisted run. Armed only for a
+    // handoff guest, whose window is a real deadline.
+    let forced_exit = Arc::new(ForcedExit::new(handoff_init));
+
     // Activate the shared-memory metrics writer if the host reserved a slot.
     // The host always reserves and passes a handoff when sampling is enabled,
     // so a missing handoff means sampling is disabled for this sandbox.
@@ -628,6 +722,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_sandbox_id = config.sandbox_id;
     let exit_run_id = run_db_id;
     let exit_reason_for_observer = Arc::clone(&exit_reason);
+    let forced_exit_for_observer = Arc::clone(&forced_exit);
     let exit_sock_path = config.agent_sock_path.clone();
     let exit_sandboxes_dir = config.sandboxes_dir.clone();
     let exit_log_writer = exec_log_writer.clone();
@@ -656,8 +751,21 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         &config,
         console_backend,
         move |exit_code: i32| {
+            // Claim the verdict before anything else: a sleeper waking on an
+            // expired deadline at this same instant must not retag a shutdown
+            // the guest completed on its own.
+            let forced = forced_exit_for_observer.observer_started();
+
             // Map (exit_code, reason tag) → TerminationReason.
             let reason_tag = exit_reason_for_observer.load(std::sync::atomic::Ordering::SeqCst);
+            // libkrun's host-triggered exit reports status zero. A forced exit
+            // is never clean, so the run must not record success.
+            let exit_code = if forced && exit_code == 0 {
+                1
+            } else {
+                exit_code
+            };
+            let termination_detail = forced.then(|| FORCED_EXIT_DETAIL.to_string());
             let reason = match reason_tag {
                 EXIT_REASON_IDLE_TIMEOUT => run_entity::TerminationReason::IdleTimeout,
                 EXIT_REASON_AGENT_UNRESPONSIVE => run_entity::TerminationReason::AgentUnresponsive,
@@ -687,8 +795,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     &exit_sock_path,
                     exit_sandbox_id,
                     exit_run_id,
-                    exit_code,
-                    reason,
+                    RunTermination {
+                        exit_code,
+                        reason,
+                        detail: termination_detail.clone(),
+                    },
                     now,
                 )
                 .await;
@@ -740,6 +851,14 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             // only place a destination's trailing denials reach the log.
             if let Some(flush) = exit_policy_flush.get() {
                 flush();
+            }
+
+            if forced {
+                // libkrun's host-triggered exit defaults to status zero. Its
+                // device exit observers have already drained block writes;
+                // this is our final user observer. Preserve failure for SDK
+                // lifecycle owners as well as the persisted run record.
+                std::process::exit(1);
             }
         },
         tokio_rt.handle().clone(),
@@ -825,6 +944,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 parent_watchdog,
                 Arc::clone(&shared),
                 Arc::clone(&exit_reason),
+                Arc::clone(&forced_exit),
                 exit_handle.clone(),
                 config.sandbox_name.clone(),
                 shutdown_flush_timeout,
@@ -985,6 +1105,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     {
         let shutdown_exit_handle = exit_handle.clone();
         let shutdown_reason = Arc::clone(&exit_reason);
+        let shutdown_forced_exit = Arc::clone(&forced_exit);
         tokio_rt.spawn(async move {
             if relay_drain_rx.recv().await.is_some() {
                 shutdown_reason.store(
@@ -995,7 +1116,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     "core.shutdown forwarded to agentd, allowing flush window before host fallback"
                 );
                 tokio::time::sleep(shutdown_flush_timeout).await;
-                tracing::info!("flush window elapsed, triggering host exit");
+                if shutdown_forced_exit.force() {
+                    tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
+                }
                 shutdown_exit_handle.trigger();
             }
         });
@@ -1009,6 +1132,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         let startup_shared = Arc::clone(&shared);
         let startup_exit_handle = exit_handle.clone();
         let startup_reason = Arc::clone(&exit_reason);
+        let startup_forced_exit = Arc::clone(&forced_exit);
         let startup_shutdown_flush_timeout = shutdown_flush_timeout;
         tokio_rt.spawn(async move {
             tracing::info!(
@@ -1058,6 +1182,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     );
                 }
             }
+            if startup_forced_exit.force() {
+                tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
+            }
             startup_exit_handle.trigger();
         });
     }
@@ -1071,6 +1198,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         let idle_timeout = config.idle_timeout_secs.map(Duration::from_secs);
         let heartbeat_exit_handle = exit_handle.clone();
         let heartbeat_reason = Arc::clone(&exit_reason);
+        let heartbeat_forced_exit = Arc::clone(&forced_exit);
         let heartbeat_shared = Arc::clone(&shared);
         let heartbeat_shutdown_flush_timeout = shutdown_flush_timeout;
         tokio_rt.spawn(async move {
@@ -1109,6 +1237,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                                     "idle shutdown request failed, triggering host exit"
                                 );
                             }
+                        }
+                        if heartbeat_forced_exit.force() {
+                            tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
                         }
                         heartbeat_exit_handle.trigger();
                         break;
@@ -1283,12 +1414,12 @@ fn build_vm(
             // kernel command line internal avoids exposing a general-purpose
             // boot-argument escape hatch to sandbox users.
             let thp = thp_kernel_cmdline(vm.thp);
-            let k = k.krunfw_path(&vm.libkrunfw_path).cmdline(&thp);
-            if let Some(ref init_path) = vm.init_path {
-                k.init_path(init_path)
-            } else {
-                k
-            }
+            // libkrun's x86 i8042 reset endpoint terminates the VMM. Declare
+            // that platform contract so firmware can register POWER_OFF;
+            // without it Linux demotes systemd poweroff to a non-exiting HALT.
+            #[cfg(target_arch = "x86_64")]
+            let thp = format!("{thp} krun.poweroff=i8042");
+            k.krunfw_path(&vm.libkrunfw_path).cmdline(&thp)
         });
 
     // Root filesystem.
@@ -1905,6 +2036,24 @@ fn request_guest_shutdown_with_timeout(
     relay::push_guest_frame_until(shared, frame, timeout)
 }
 
+fn has_handoff_init(env: &[String]) -> bool {
+    // SDK init selection is an agentd boot parameter, not the VMM executable
+    // override that libkrun would take. Match the same last-value-wins env.
+    //
+    // `MSB_HANDOFF_INIT=auto` counts, deliberately: the window is armed by
+    // what the sandbox *asked* for, not by what agentd resolved in the guest.
+    // The host cannot see that resolution, and a request for a guest init is
+    // already a request for the longer, real deadline — an `auto` that finds
+    // no candidate fails the boot rather than quietly becoming a PID-1 agentd.
+    env.iter()
+        .rev()
+        .find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == microsandbox_protocol::ENV_HANDOFF_INIT).then_some(!value.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 fn guest_shutdown_flush_timeout(has_handoff_init: bool) -> Duration {
     let override_ms = std::env::var("MSB_SHUTDOWN_FLUSH_TIMEOUT_MS").ok();
     guest_shutdown_flush_timeout_with_override(has_handoff_init, override_ms.as_deref())
@@ -1939,6 +2088,7 @@ fn spawn_parent_watchdog(
     parent_watchdog: OwnedFd,
     shared: Arc<ConsoleSharedState>,
     exit_reason: Arc<std::sync::atomic::AtomicU8>,
+    forced_exit: Arc<ForcedExit>,
     exit_handle: msb_krun::ExitHandle,
     sandbox_name: String,
     shutdown_flush_timeout: Duration,
@@ -1956,6 +2106,9 @@ fn spawn_parent_watchdog(
                         tracing::warn!(error = %err, "parent-watch shutdown request failed");
                     } else {
                         std::thread::sleep(shutdown_flush_timeout);
+                    }
+                    if forced_exit.force() {
+                        tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
                     }
                     exit_handle.trigger();
                 }
@@ -2343,10 +2496,14 @@ pub(crate) async fn finish_terminated_run(
     agent_sock_path: &Path,
     sandbox_id: i32,
     run_id: i32,
-    exit_code: i32,
-    reason: run_entity::TerminationReason,
+    termination: RunTermination,
     now: chrono::NaiveDateTime,
 ) {
+    let RunTermination {
+        exit_code,
+        reason,
+        detail,
+    } = termination;
     use microsandbox_db::entity::sandbox as sandbox_entity;
     use sea_orm::QueryFilter;
     use sea_orm::sea_query::Expr;
@@ -2360,6 +2517,7 @@ pub(crate) async fn finish_terminated_run(
             Expr::value(run_entity::RunStatus::Terminated),
         )
         .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
+        .col_expr(run_entity::Column::TerminationDetail, Expr::value(detail))
         .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
         .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
         .filter(run_entity::Column::Id.eq(run_id))
@@ -2647,6 +2805,61 @@ mod tests {
     }
 
     #[test]
+    fn forced_exit_stays_disarmed_without_a_handoff_init() {
+        let forced = super::ForcedExit::new(false);
+        assert!(
+            !forced.force(),
+            "an agentd-as-PID-1 sandbox records no forced exit"
+        );
+        assert!(
+            !forced.observer_started(),
+            "so its exit stays clean, exactly as before"
+        );
+    }
+
+    #[test]
+    fn forced_exit_records_an_expired_deadline() {
+        let forced = super::ForcedExit::new(true);
+        assert!(forced.force(), "the first expired deadline forces the exit");
+        assert!(!forced.force(), "a second sleeper adds nothing");
+        assert!(
+            forced.observer_started(),
+            "the observer sees the forced exit"
+        );
+    }
+
+    #[test]
+    fn forced_exit_ignores_a_sleeper_that_lost_the_race() {
+        let forced = super::ForcedExit::new(true);
+        assert!(
+            !forced.observer_started(),
+            "a guest that powered off on its own is a clean exit"
+        );
+        assert!(
+            !forced.force(),
+            "a sleeper waking after the observer started must change nothing"
+        );
+        assert!(
+            !forced.observer_started(),
+            "the verdict stays clean once the observer has claimed it"
+        );
+    }
+
+    #[test]
+    fn sdk_handoff_env_selects_shutdown_grace() {
+        assert!(!super::has_handoff_init(&[]));
+        assert!(super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/lib/systemd/systemd".into()
+        ]));
+        assert!(super::has_handoff_init(&["MSB_HANDOFF_INIT=auto".into()]));
+        assert!(!super::has_handoff_init(&["MSB_HANDOFF_INIT=".into()]));
+        assert!(!super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/sbin/init".into(),
+            "MSB_HANDOFF_INIT=".into(),
+        ]));
+    }
+
+    #[test]
     fn test_guest_shutdown_flush_timeout_accepts_ms_override() {
         assert_eq!(
             guest_shutdown_flush_timeout_with_override(false, Some("0")),
@@ -2777,7 +2990,7 @@ mod tests {
         };
         use tempfile::TempDir;
 
-        use crate::vm::{finish_terminated_run, remove_agent_endpoint_files};
+        use crate::vm::{RunTermination, finish_terminated_run, remove_agent_endpoint_files};
 
         /// A sandbox row, its running run, and the two endpoint files a live
         /// sandbox process owns.
@@ -2878,8 +3091,11 @@ mod tests {
                 &f.agent_sock,
                 f.sandbox_id,
                 f.run_id,
-                0,
-                run_entity::TerminationReason::ShutdownRequested,
+                RunTermination {
+                    exit_code: 0,
+                    reason: run_entity::TerminationReason::ShutdownRequested,
+                    detail: None,
+                },
                 chrono::Utc::now().naive_utc(),
             )
             .await;
@@ -2938,8 +3154,11 @@ mod tests {
                     &agent_sock,
                     f.sandbox_id,
                     f.run_id,
-                    0,
-                    run_entity::TerminationReason::ShutdownRequested,
+                    RunTermination {
+                        exit_code: 0,
+                        reason: run_entity::TerminationReason::ShutdownRequested,
+                        detail: None,
+                    },
                     chrono::Utc::now().naive_utc(),
                 )
                 .await;

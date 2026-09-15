@@ -81,6 +81,9 @@ pub(crate) fn reserved_label_prefix(key: &str) -> Option<&'static str> {
 
 // `mod patch` and `mod types` are private; re-export the entry points the
 // local backend's lifecycle and create methods under `backend/local/` call.
+// Used by the local backend's stop tests.
+#[cfg(test)]
+pub(crate) use handle::StopRequest;
 pub(crate) use patch::{apply_patches, build_upper_tree};
 #[cfg(windows)]
 pub(crate) use reap::reap_leaked_runtime_process;
@@ -785,7 +788,7 @@ impl Sandbox {
 
     /// Stop the sandbox gracefully and wait until stopped state is observed.
     ///
-    /// Uses [`DEFAULT_STOP_TIMEOUT`] before escalating to force termination.
+    /// Uses [`DEFAULT_STOP_TIMEOUT`]. Timeout or unclean exit returns an error.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
         self.stop_with_timeout(DEFAULT_STOP_TIMEOUT).await
     }
@@ -793,9 +796,7 @@ impl Sandbox {
     /// Request graceful shutdown and return once the request is sent.
     ///
     /// Routes through the backend trait. On local this connects to the agent
-    /// endpoint and sends `core.shutdown` (agentd runs `sync()` +
-    /// `reboot(RB_POWER_OFF)` for a clean ext4 unmount), falling back to
-    /// platform process termination via PID if the endpoint is unreachable. On
+    /// endpoint and sends `core.shutdown`. An unreachable agent returns an error. On
     /// cloud this issues `POST /v1/sandboxes/by-name/:name/stop`.
     pub async fn request_stop(&self) -> MicrosandboxResult<()> {
         tracing::debug!(sandbox = %self.name, "stop: dispatching");
@@ -805,35 +806,81 @@ impl Sandbox {
             .await
     }
 
-    /// Stop the sandbox gracefully with an explicit timeout before escalation.
+    /// Stop gracefully within a deadline, without automatically killing the VM.
+    ///
+    /// A sandbox that was already terminal before the call returns `Ok`,
+    /// whether or not this process owns its lifecycle. Otherwise one deadline
+    /// covers the whole call and the clean-stop wait owns what is left of it,
+    /// so its specific errors reach the caller.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        if timeout.is_zero() {
-            self.kill_with_timeout(DEFAULT_KILL_TIMEOUT).await?;
-            return Ok(());
-        }
+        handle::reject_zero_stop_deadline(timeout)?;
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        self.request_stop().await?;
-        if let Ok(result) = tokio::time::timeout(timeout, self.wait_until_stopped()).await {
-            result?;
-            return Ok(());
-        }
-
-        tracing::warn!(
-            sandbox = %self.name,
-            timeout_secs = timeout.as_secs(),
-            "graceful stop exceeded timeout, escalating to kill"
-        );
-        self.request_kill().await?;
-        match tokio::time::timeout(DEFAULT_KILL_TIMEOUT, self.wait_until_stopped()).await {
-            Ok(result) => {
-                result?;
-                Ok(())
+        if self.owns_lifecycle() {
+            let handle = match self
+                .backend
+                .sandboxes()
+                .get(self.backend.clone(), &self.name)
+                .await
+            {
+                Ok(handle) => Some(handle),
+                // An ephemeral sandbox the runtime already self-cleaned is
+                // terminal by definition.
+                Err(error)
+                    if self.is_local_ephemeral()
+                        && sandbox_not_found_for_name(&error, &self.name) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(ref handle) = handle
+                && handle::sandbox_status_is_terminal(handle.status_snapshot())
+            {
+                return Ok(());
             }
-            Err(_) => Err(crate::MicrosandboxError::Runtime(format!(
-                "timed out observing stopped state for sandbox '{}'",
-                self.name
-            ))),
+
+            self.request_stop().await?;
+            // The process wait is the one step the clean-stop helper cannot
+            // bound for us, so it carries the deadline directly.
+            let status = match tokio::time::timeout_at(deadline, self.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
+                    return Err(crate::MicrosandboxError::Runtime(format!(
+                        "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
+                        self.name
+                    )));
+                }
+            };
+            if !status.success() {
+                return Err(crate::MicrosandboxError::Runtime(format!(
+                    "sandbox '{}' exited uncleanly: {status}",
+                    self.name
+                )));
+            }
+            if !self.is_local_ephemeral()
+                && let Some(handle) = handle
+            {
+                handle
+                    .wait_for_clean_stop_within(handle::remaining_until(deadline))
+                    .await?;
+            }
+            return Ok(());
         }
+
+        let handle = self
+            .backend
+            .sandboxes()
+            .get(self.backend.clone(), &self.name)
+            .await?;
+        if handle.dispatch_stop().await? == handle::StopRequest::AlreadyTerminal {
+            // Already terminal before we asked: nothing was requested here, so
+            // there is no shutdown of ours to confirm.
+            return Ok(());
+        }
+        handle
+            .wait_for_clean_stop_within(handle::remaining_until(deadline))
+            .await
     }
 
     /// Stop the sandbox gracefully and wait for the process to exit.
@@ -842,15 +889,15 @@ impl Sandbox {
     /// on; use [`stop`](Self::stop) and poll [`status`](Self::status) instead.
     pub async fn stop_and_wait(&self) -> MicrosandboxResult<ExitStatus> {
         let local = self.require_local(Operation::SandboxStopAndWait)?;
-        let stop_result = self.request_stop().await;
         if local.handle.is_none() {
-            stop_result?;
-            // No handle to wait on — return a synthetic success status.
-            return Ok(std::process::ExitStatus::default());
+            return Err(crate::MicrosandboxError::Runtime(
+                "cannot stop_and_wait: not the lifecycle owner; use stop instead".into(),
+            ));
         }
-        let wait_result = self.wait().await;
-        stop_result?;
-        wait_result
+        self.stop().await?;
+        // `stop()` already waited on the child; tokio's `Child::wait` caches
+        // the status, so this second wait returns it rather than blocking.
+        self.wait().await
     }
 
     /// Kill the sandbox immediately and wait until stopped state is observed.

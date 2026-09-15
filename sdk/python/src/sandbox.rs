@@ -958,7 +958,8 @@ impl PySandbox {
         })
     }
 
-    /// Stop and wait for exit, returning (code, success).
+    /// Stop and wait for clean exit, returning actual (code, success).
+    /// Requires local lifecycle ownership; use stop on reconnected handles.
     fn stop_and_wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

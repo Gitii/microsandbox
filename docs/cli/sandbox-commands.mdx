@@ -171,28 +171,26 @@ msb start --label app=engine          # start every sandbox labelled app=engine
 ## msb stop
 
 ```bash
-msb stop devbox                # Graceful shutdown (10s grace)
+msb stop devbox                # Graceful shutdown (150s deadline)
 msb stop --force devbox        # Force kill immediately
-msb stop -t 30 devbox          # 30s grace before force kill
+msb stop -t 30 devbox          # Fail if clean shutdown is unconfirmed after 30s
 msb stop --label app=engine    # stop every sandbox labelled app=engine
 ```
 
-Graceful shutdown gives the sandbox a chance to finish writing any
-pending data to disk before it exits, so files written inside the
-sandbox aren't lost across a later `msb start`. If the sandbox is
-still running after the timeout, it is force-killed.
+Graceful shutdown asks the guest to finish shutdown and waits for clean VM
+termination. An expired deadline, unreachable agent, or unclean exit fails the
+command without automatic force-kill. A failed stop does not confirm that disks
+can be safely removed. `--timeout 0` is rejected: no window leaves nothing to
+confirm, and `--force` is how a forced stop is requested.
 
-`--force` and a timeout that elapses both end in a force-kill. Pending
-writes that the workload hasn't `fsync`'d at that point may be lost, with the
-same durability semantics as a sudden power loss on a physical
-machine. For durable writes, workloads should `fsync` important data
-themselves.
+`--force` explicitly kills the VM. Pending writes may be lost, with the same
+durability semantics as a sudden power loss on a physical machine.
 
 | Flag | Description |
 |------|-------------|
 | `--label` | Stop every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
 | `-f`, `--force` | Force terminate immediately. Pending writes may be lost |
-| `-t`, `--timeout` | Seconds to wait for graceful shutdown before force-killing. Defaults to 10 |
+| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without automatic force-kill. Zero is rejected |
 | `-q`, `--quiet` | Suppress progress output |
 
 ## msb restart
@@ -207,13 +205,13 @@ msb restart --force devbox
 msb restart -t 30 devbox
 ```
 
-`msb restart` uses the same stop controls as `msb stop`: `--force` kills immediately, and `--timeout` controls how long graceful shutdown gets before force-kill escalation.
+`msb restart` uses the same stop controls as `msb stop`: `--force` kills immediately, and `--timeout` sets the graceful shutdown deadline. If the stop phase fails, the sandbox is not restarted.
 
 | Flag | Description |
 |------|-------------|
 | `--label` | Restart every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
 | `-f`, `--force` | Force terminate immediately before starting again. Pending writes may be lost |
-| `-t`, `--timeout` | Seconds to wait for graceful shutdown before force-killing. Defaults to 10 |
+| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without restarting. Zero is rejected |
 | `-q`, `--quiet` | Suppress progress output |
 
 ## msb ping

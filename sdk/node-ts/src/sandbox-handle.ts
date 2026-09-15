@@ -138,10 +138,8 @@ export class SandboxHandle {
   }
 
   /**
-   * Gracefully shut down the sandbox. Lets it finish writing any
-   * pending data to disk before it exits, so files written inside the
-   * sandbox aren't lost across a later restart. Force-kills after
-   * 10_000 ms by default; use `stopWithTimeout` to override.
+   * Gracefully shut down within 150_000 ms; use `stopWithTimeout` to override.
+   * Throws on deadline expiry or unclean exit without automatically killing.
    */
   async stop(): Promise<void> {
     await withMappedErrors(() => this.inner.stop());
@@ -152,10 +150,9 @@ export class SandboxHandle {
   }
 
   /**
-   * Stop gracefully with an explicit timeout in milliseconds. If the
-   * sandbox is still running after this window, it is force-killed.
-   * `0` force-kills immediately. Resolves successfully either way —
-   * does not throw on timeout expiry.
+   * Stop gracefully with an explicit deadline in milliseconds. Throws on
+   * expiry or unclean exit. `0` is rejected — it leaves no window in which a
+   * shutdown could be confirmed; use `kill()` for a forced stop.
    */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));

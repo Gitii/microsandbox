@@ -87,9 +87,6 @@ pub struct LaunchConfig {
     /// Disk-image volume mounts as `id:host_path:format[:ro]`.
     pub disks: Vec<String>,
 
-    /// Path to the init binary in the guest.
-    pub init_path: Option<PathBuf>,
-
     /// Environment variables as `KEY=VALUE` (guest env plus `MSB_*` specs).
     pub env: Vec<String>,
 

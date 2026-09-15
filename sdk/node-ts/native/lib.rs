@@ -7,6 +7,7 @@
 
 mod agent;
 mod attach_options_builder;
+mod disk;
 mod dns_builder;
 mod error;
 mod exec;

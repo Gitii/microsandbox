@@ -50,6 +50,11 @@ use crate::error::{AgentdError, AgentdResult};
 /// created in `init::init` (see `create_run_dir`).
 const POST_HANDOFF_STDERR: &str = "/run/microsandbox/agentd.log";
 
+/// Directories searched for `systemctl` when `PATH` does not resolve it.
+/// agentd runs with whatever environment the VMM handed it, which on a
+/// handoff boot may carry no `PATH` at all.
+const SYSTEMCTL_FALLBACK_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -323,28 +328,77 @@ pub fn is_pid_1() -> bool {
     nix::unistd::getpid().as_raw() == 1
 }
 
-/// Sends `SIGRTMIN+4` to PID 1 to request shutdown.
+/// Locate the image's `systemctl`, searching `PATH` first and then the
+/// directories a distribution is most likely to install it in.
 ///
-/// systemd interprets this as "start poweroff.target". Other inits
-/// typically default-handle it as "exit cleanly," which causes the
-/// kernel to panic on PID 1 exit and triggers VMM shutdown.
+/// The path is the image's to choose: a merged-`/usr` distribution puts it in
+/// `/usr/bin`, others in `/bin`, and a minimal image may ship none at all.
 ///
-/// `SIGRTMIN` is a function on Linux (glibc reserves the first few
-/// RT signals for libc internals), so the value is computed at
-/// runtime via `libc::SIGRTMIN()`.
+/// A candidate counts only when it is an executable file. A non-executable
+/// `systemctl` — a stub, a leftover, a file mode the image never fixed — would
+/// otherwise be spawned and fail, taking the poweroff with it instead of
+/// falling back to the signal path.
+fn find_systemctl() -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    path_dirs
+        .into_iter()
+        .chain(SYSTEMCTL_FALLBACK_DIRS.iter().map(PathBuf::from))
+        .map(|dir| dir.join("systemctl"))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `path` is a regular file with at least one execute bit set.
+///
+/// agentd runs as root, so any execute bit is enough for it to spawn.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Ask the image's init to power off without forcing running services down.
+///
+/// systemd's control client belongs to the image: it knows its manager's
+/// shutdown protocol independently of agentd's libc. In particular, musl's
+/// SIGRTMIN+4 is glibc systemd's reboot signal, not its poweroff signal.
+/// Other init implementations retain the existing realtime-signal contract.
 pub fn signal_init_shutdown() -> AgentdResult<()> {
+    let init_name = std::fs::read_to_string("/proc/1/comm")?;
+    if init_name.trim() == "systemd" {
+        match find_systemctl() {
+            Some(systemctl) => {
+                let status = process::Command::new(&systemctl)
+                    .args(["--no-block", "poweroff"])
+                    .status()
+                    .map_err(|e| AgentdError::Init(format!("request systemd poweroff: {e}")))?;
+                if !status.success() {
+                    return Err(AgentdError::Init(format!(
+                        "systemd rejected poweroff request: {status}"
+                    )));
+                }
+                return Ok(());
+            }
+            None => {
+                // The image says systemd is PID 1 but ships no control
+                // client we can find. The realtime signal is the weaker
+                // contract (musl's SIGRTMIN+4 is glibc systemd's reboot,
+                // not its poweroff) but it is the only route left.
+                eprintln!(
+                    "agentd: systemd is PID 1 but no systemctl was found on PATH or in {}; \
+                     falling back to the realtime-signal shutdown",
+                    SYSTEMCTL_FALLBACK_DIRS.join(", ")
+                );
+            }
+        }
+    }
     let sig = libc::SIGRTMIN() + 4;
     // SAFETY: kill(2) is signal-safe and pid=1 is always valid.
     let ret = unsafe { libc::kill(1, sig) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-/// Sends `SIGTERM` to PID 1 as a sysvinit-friendly shutdown fallback.
-pub fn signal_init_term() -> AgentdResult<()> {
-    let ret = unsafe { libc::kill(1, libc::SIGTERM) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error().into());
     }

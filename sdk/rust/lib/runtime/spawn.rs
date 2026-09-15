@@ -666,6 +666,18 @@ pub async fn spawn_sandbox(
         "spawn_sandbox: startup JSON received"
     );
 
+    // The runtime process inherited these descriptors (their close-on-exec
+    // flag is cleared when they are taken), and a flock belongs to the open
+    // file description, so the runtime itself keeps every image locked for
+    // exactly as long as it runs. Keeping our copies as well would hold an
+    // image locked after a clean stop until this handle is dropped, which
+    // refuses the next boot of the same disk.
+    #[cfg(unix)]
+    let disk_locks = {
+        drop(disk_locks);
+        Vec::new()
+    };
+
     #[cfg(unix)]
     let handle = ProcessHandle::new(
         startup.pid,
@@ -1607,6 +1619,42 @@ fn lock_disk_mounts(
     named_volumes: &HashMap<String, ResolvedNamedVolume>,
 ) -> MicrosandboxResult<Vec<File>> {
     let mut locks = Vec::new();
+    let requests = disk_lock_requests(config, named_volumes);
+
+    let mut seen = HashMap::new();
+    for request in requests {
+        let canonical = std::fs::canonicalize(&request.path).map_err(|err| {
+            MicrosandboxError::InvalidConfig(format!(
+                "disk image host path does not exist: {} ({err})",
+                request.path.display()
+            ))
+        })?;
+        if let Some(previous) = seen.insert(canonical.clone(), request.label.clone()) {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "disk images cannot be attached more than once per sandbox: {} ({previous}; {})",
+                canonical.display(),
+                request.label
+            )));
+        }
+        locks.push(lock_disk_image(
+            &canonical,
+            request.readonly,
+            request.volume_name.as_deref(),
+        )?);
+    }
+
+    Ok(locks)
+}
+
+/// Every disk image a sandbox attaches, in attach order.
+///
+/// Shared by the spawn-time locking above and the stop-time release probe in
+/// `SandboxHandle::wait_for_clean_stop_within`, so the two can never disagree
+/// about which images a sandbox holds.
+fn disk_lock_requests(
+    config: &SandboxConfig,
+    named_volumes: &HashMap<String, ResolvedNamedVolume>,
+) -> Vec<DiskLockRequest> {
     let mut requests = Vec::new();
 
     if let RootfsSource::DiskImage { path, .. } = &config.spec.image {
@@ -1647,29 +1695,66 @@ fn lock_disk_mounts(
         }
     }
 
-    let mut seen = HashMap::new();
-    for request in requests {
-        let canonical = std::fs::canonicalize(&request.path).map_err(|err| {
-            MicrosandboxError::InvalidConfig(format!(
-                "disk image host path does not exist: {} ({err})",
-                request.path.display()
-            ))
-        })?;
-        if let Some(previous) = seen.insert(canonical.clone(), request.label.clone()) {
-            return Err(MicrosandboxError::InvalidConfig(format!(
-                "disk images cannot be attached more than once per sandbox: {} ({previous}; {})",
-                canonical.display(),
-                request.label
-            )));
+    requests
+}
+
+/// The disk images `config` attaches, as `(path, readonly)` pairs.
+///
+/// Resolves named disk volumes through the same read-only lookup spawn uses.
+/// A named volume whose row is gone is skipped rather than failing the caller:
+/// a volume that no longer exists cannot be attached.
+pub(crate) async fn attached_disk_images(
+    local: &LocalBackend,
+    config: &SandboxConfig,
+) -> Vec<(PathBuf, bool)> {
+    let named_volumes = match resolve_named_volumes(local, config).await {
+        Ok(named_volumes) => named_volumes,
+        Err(error) => {
+            tracing::debug!(%error, "resolving named volumes for the disk release probe");
+            HashMap::new()
         }
-        locks.push(lock_disk_image(
-            &canonical,
-            request.readonly,
-            request.volume_name.as_deref(),
-        )?);
+    };
+
+    disk_lock_requests(config, &named_volumes)
+        .into_iter()
+        .map(|request| (request.path, request.readonly))
+        .collect()
+}
+
+/// Whether `path` can be locked the way a sandbox attaching it would, i.e.
+/// whether the runtime that had it attached has released it.
+///
+/// Anything other than a lock conflict — a deleted image, a path we cannot
+/// open — reports released: only a live conflicting lock proves an image is
+/// still attached, and a stop must not fail over an image nobody can hold.
+#[cfg(unix)]
+pub(crate) fn disk_image_is_released(path: &Path, readonly: bool) -> bool {
+    let file = if readonly {
+        std::fs::OpenOptions::new().read(true).open(path)
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    };
+    let Ok(file) = file else {
+        return true;
+    };
+
+    let operation = if readonly {
+        libc::LOCK_SH | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    // The lock is released again by dropping `file` at the end of this scope.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        return !matches!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
-    Ok(locks)
+    true
 }
 
 fn lock_disk_image(

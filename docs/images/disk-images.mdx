@@ -91,3 +91,91 @@ sb2, err := m.CreateSandbox(ctx, "custom-vm-2",
 <Note>
   The filesystem type (`ext4`, `xfs`, etc.) must match what's actually on the disk image. The guest kernel mounts it using the specified filesystem driver.
 </Note>
+
+## Offline extra-disk maintenance
+
+Use separate raw ext4 images for working data and the **complete Docker volumes
+store**, independently of the root disk. Root snapshots do
+not snapshot extra disks. Retain and adopt those artifacts separately; restoring
+a root snapshot does not roll their contents back.
+
+All four SDKs provide **local-host** operations for caller-owned images. Rust,
+Python, and Go are synchronous; TypeScript returns promises and runs the copy
+off the JS thread. They do not create named-volume records or update sandbox mounts.
+Before inspecting or growing an image, stop and detach every VM or host mount
+using it. Hold an exclusive application lifecycle lock across maintenance,
+manifest adoption, and attachment so another worker cannot reopen the old image.
+The SDK does not acquire that lock or detect attached images.
+
+<CodeGroup>
+```rust Rust
+use microsandbox::disk;
+
+let created = disk::create("working.ext4", 1024 * 1024 * 1024)?;
+let current = disk::inspect("working.ext4")?;
+let replacement = disk::grow_copy("working.ext4", "working-next.ext4", 2 * 1024 * 1024 * 1024)?;
+assert_eq!(current.uuid, replacement.uuid);
+```
+
+```typescript TypeScript
+import { Disk } from "microsandbox";
+
+const created = await Disk.create("working.ext4", 1024n * 1024n * 1024n);
+const current = await Disk.inspect("working.ext4");
+const replacement = await Disk.growCopy("working.ext4", "working-next.ext4", 2n * 1024n * 1024n * 1024n);
+```
+
+```python Python
+from microsandbox import Disk
+
+created = Disk.create("working.ext4", 1024**3)
+current = Disk.inspect("working.ext4")
+replacement = Disk.grow_copy("working.ext4", "working-next.ext4", 2 * 1024**3)
+```
+
+```go Go
+created, err := m.Disk.Create("working.ext4", 1024*1024*1024)
+if err != nil { return err }
+current, err := m.Disk.Inspect("working.ext4")
+if err != nil { return err }
+replacement, err := m.Disk.GrowCopy("working.ext4", "working-next.ext4", 2*1024*1024*1024)
+if err != nil { return err }
+_ = created
+_ = current
+_ = replacement
+```
+</CodeGroup>
+
+Sizes are bytes, must be aligned to 4096, and must fit the formatter's metadata
+and 64 MiB journal. Use at least 128 MiB for a new image. Growth is strictly
+larger and limited by the image's reserved ext4 metadata capacity; unsupported
+sizes return an error. These operations support microsandbox-formatted ext4
+images, not arbitrary ext4 variants, QCOW2, or VMDK.
+
+Inspection returns `uuid`, `capacity_bytes`, `file_bytes`, `allocated_bytes`, and
+`needs_recovery` (camelCase in TypeScript; `UUID`, `CapacityBytes`, `FileBytes`,
+`AllocatedBytes`, `NeedsRecovery` in Go). Byte fields are `bigint` in TypeScript.
+Allocated bytes describe host allocation, not filesystem used space, and are
+absent where the host cannot report them. Inspection validates ext4 metadata,
+not every file payload. A dirty image reports recovery required; deep metadata
+validation happens after journal replay on the private growth copy. UUID is
+filesystem identity: both retained and replacement artifacts share it.
+
+Creation and growth prepare a private temporary file in the destination
+directory. Growth only reads the source. The replacement's ext4 metadata,
+UUID, capacity, and clean journal state are verified before syncing it,
+publishing without overwriting any destination, and syncing the parent
+directory. A missing or corrupt source is an error; it never causes a blank
+replacement. Hosts/filesystems that cannot sync directories or publish
+exclusively return an error rather than weakening durability.
+
+Only after success should the consumer durably adopt the new path in its
+manifest. Remove the retained old copy later. On interruption, temporary files
+or a complete destination may remain, but the source is unchanged. A directory
+sync failure can report an error after publication; an error never authorizes
+manifest adoption. Inspect and reconcile under the same lifecycle lock before
+retrying with a fresh destination. Never resize the last retained copy in place.
+
+The CLI's `msb volume create --kind disk --size 1G` creates a **named** ext4
+volume; `msb volume inspect` reports that volume's metadata. Offline path-based
+grow-copy is exposed through the SDK APIs above.

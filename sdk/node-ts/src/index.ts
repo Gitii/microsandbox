@@ -1,5 +1,6 @@
 import { mapNapiError } from "./internal/error-mapping.js";
 import { napi } from "./internal/napi.js";
+export { Disk, type DiskInfo } from "./disk.js";
 
 // Low-level agent client (raw transport to agentd).
 export {

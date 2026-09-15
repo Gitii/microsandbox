@@ -70,6 +70,21 @@ async fn graceful_stop_flushes_writes_to_rootfs() {
     sb.detach().await;
 
     let handle = Sandbox::get(name).await.expect("get handle");
+    let connected = handle.connect().await.expect("reconnect before stop");
+    let error = connected
+        .stop_and_wait()
+        .await
+        .expect_err("reconnected handle cannot return process status");
+    assert!(error.to_string().contains("not the lifecycle owner"));
+    assert!(
+        connected
+            .exec("true", std::iter::empty::<&str>())
+            .await
+            .expect("rejected stop_and_wait must not stop the guest")
+            .status()
+            .success
+    );
+    drop(connected);
     handle.stop().await.expect("graceful stop");
 
     let restarted = Sandbox::get(name)
@@ -85,7 +100,11 @@ async fn graceful_stop_flushes_writes_to_rootfs() {
         .expect("exec: read marker");
     let stdout = read.stdout().unwrap_or_default();
 
-    let _ = restarted.stop().await;
+    let status = restarted
+        .stop_and_wait()
+        .await
+        .expect("owner clean stop and actual exit status");
+    assert!(status.success());
     cleanup(name).await;
 
     assert!(

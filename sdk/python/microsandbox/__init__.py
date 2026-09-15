@@ -4,6 +4,8 @@ import os as _os
 
 from microsandbox._microsandbox import (
     BackendInfo,
+    Disk,
+    DiskInfo,
     ExecEvent,
     ExecHandle,
     ExecOutput,
@@ -181,6 +183,8 @@ if "MSB_PATH" not in _os.environ:
         _set_runtime_msb_path(str(_bundled_msb))
 
 __all__ = [
+    "Disk",
+    "DiskInfo",
     # Backend selection
     "BackendInfo",
     "default_backend_info",

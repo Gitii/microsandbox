@@ -203,7 +203,6 @@ pub fn run(args: SandboxArgs) -> ! {
         disks,
         #[cfg(unix)]
         backends: vec![],
-        init_path: launch.init_path,
         env: launch.env,
         workdir: launch.workdir,
         exec_path: launch.exec_path,
