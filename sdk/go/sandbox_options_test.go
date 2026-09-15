@@ -9,6 +9,24 @@ import (
 	"time"
 )
 
+func TestStopTimeoutMillis(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts []StopOption
+		want uint64
+	}{
+		{"default allows runtime grace and handoff", nil, 150_000},
+		{"explicit deadline", []StopOption{WithStopTimeout(2500 * time.Millisecond)}, 2500},
+		{"zero remains an immediate deadline", []StopOption{WithStopTimeout(0)}, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stopTimeoutMillis(test.opts); got != test.want {
+				t.Fatalf("stopTimeoutMillis = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func marshalCreateOptions(t *testing.T, opts ...SandboxOption) map[string]any {
 	t.Helper()
 	cfg := SandboxConfig{}

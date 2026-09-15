@@ -4,9 +4,8 @@
 //! - Reaps zombie children in a `waitpid(-1, ...)` loop, mirroring what
 //!   any sane init does.
 //! - Installs handlers for `SIGRTMIN+4`, `SIGTERM`, and `SIGINT` that
-//!   set a flag; the main loop observes the flag and exits cleanly so
-//!   the kernel panics PID 1 → VMM tears down → host sees clean
-//!   shutdown.
+//!   set a flag; the main loop observes the flag, syncs, and requests
+//!   kernel poweroff. PID 1 exiting is not evidence of a clean shutdown.
 //!
 //! Built as a static Linux binary and patched into a guest rootfs at
 //! `/sbin/init` by the integration test.
@@ -54,9 +53,15 @@ fn main() {
     // handler will interrupt us and set SHUTDOWN.
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) != 0 {
-            // Exiting from PID 1 panics the kernel and triggers
-            // VMM-level shutdown.
-            std::process::exit(0);
+            unsafe {
+                libc::sync();
+                libc::reboot(libc::RB_POWER_OFF);
+            }
+            eprintln!(
+                "test-init poweroff failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
         }
 
         // Reap any pending zombies non-blockingly.

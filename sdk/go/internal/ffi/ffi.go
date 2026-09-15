@@ -200,6 +200,7 @@ typedef char *(*msb_log_close_fn)(uint64_t stream_handle, uint8_t *buf, size_t b
 typedef char *(*msb_volume_create_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_volume_remove_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_volume_list_fn)(uint64_t cancel_id, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_disk_operation_fn)(const char *, const char *, const char *, uint64_t, uint8_t *, size_t);
 typedef char *(*msb_volume_get_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_volume_get_default_fn)(uint64_t cancel_id, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_volume_fs_op_fn)(uint64_t cancel_id, const char *name, const char *op, const char *args_json, uint8_t *buf, size_t buf_len);
@@ -342,6 +343,7 @@ static msb_log_close_fn                 ptr_msb_log_close                 = NULL
 static msb_volume_create_fn       ptr_msb_volume_create       = NULL;
 static msb_volume_remove_fn       ptr_msb_volume_remove       = NULL;
 static msb_volume_list_fn         ptr_msb_volume_list         = NULL;
+static msb_disk_operation_fn ptr_msb_disk_operation = NULL;
 static msb_volume_get_fn          ptr_msb_volume_get          = NULL;
 static msb_volume_get_default_fn  ptr_msb_volume_get_default  = NULL;
 static msb_volume_fs_op_fn        ptr_msb_volume_fs_op        = NULL;
@@ -517,6 +519,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_volume_create);
 	RESOLVE(msb_volume_remove);
 	RESOLVE(msb_volume_list);
+	RESOLVE(msb_disk_operation);
 	RESOLVE(msb_volume_get);
 	RESOLVE(msb_volume_get_default);
 	RESOLVE(msb_volume_fs_op);
@@ -855,6 +858,10 @@ char *call_msb_volume_remove(uint64_t cancel_id, const char *name, uint8_t *buf,
 char *call_msb_volume_list(uint64_t cancel_id, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_volume_list ? ptr_msb_volume_list(cancel_id, buf, buf_len) : NULL;
 }
+
+char *call_msb_disk_operation(const char *op, const char *src, const char *dst, uint64_t size, uint8_t *buf, size_t len) {
+    return ptr_msb_disk_operation(op, src, dst, size, buf, len);
+}
 char *call_msb_volume_get(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_volume_get ? ptr_msb_volume_get(cancel_id, name, buf, buf_len) : NULL;
 }
@@ -976,10 +983,12 @@ char *call_msb_snapshot_import(uint64_t cancel_id, const char *archive, const ch
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -4154,6 +4163,32 @@ func ListVolumes(ctx context.Context) ([]*VolumeHandleInfo, error) {
 		return nil, fmt.Errorf("parse volume list: %w", err)
 	}
 	return infos, nil
+}
+
+// DiskOperation executes synchronously so cancellation cannot race manifest adoption.
+func DiskOperation(operation, source, destination string, sizeBytes uint64) (string, error) {
+	if err := ensureLoaded(); err != nil {
+		return "", err
+	}
+	if strings.ContainsRune(source, '\x00') || strings.ContainsRune(destination, '\x00') {
+		return "", fmt.Errorf("disk path contains NUL")
+	}
+	op, src, dst := C.CString(operation), C.CString(source), C.CString(destination)
+	defer C.free(unsafe.Pointer(op))
+	defer C.free(unsafe.Pointer(src))
+	defer C.free(unsafe.Pointer(dst))
+	buf := make([]byte, defaultBufSize)
+	errPtr := C.call_msb_disk_operation(op, src, dst, C.uint64_t(sizeBytes), (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if errPtr != nil {
+		msg := C.GoString(errPtr)
+		C.call_msb_free_string(errPtr)
+		var err Error
+		if json.Unmarshal([]byte(msg), &err) != nil {
+			return "", fmt.Errorf("disk operation: %s", msg)
+		}
+		return "", &err
+	}
+	return string(bytes.TrimRight(buf, "\x00")), nil
 }
 
 // Version returns the runtime version reported by the loaded library.

@@ -49,6 +49,7 @@ use std::{
 };
 
 use base64::Engine;
+mod disk;
 use microsandbox::{
     AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, UpperVerifyStatus,
     default_backend,

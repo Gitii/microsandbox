@@ -65,6 +65,17 @@ pub struct GrowOutcome {
     pub new_groups: u32,
 }
 
+/// Read-only metadata of a formatter-compatible ext4 image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ext4Inspection {
+    /// Filesystem UUID.
+    pub uuid: [u8; 16],
+    /// Filesystem capacity in bytes.
+    pub capacity_bytes: u64,
+    /// Whether journal recovery is required before deep metadata validation.
+    pub needs_recovery: bool,
+}
+
 /// Superblock and primary GDT state parsed from an image and validated to match exactly what
 /// this crate's formatter writes.
 struct ParsedImage {
@@ -117,6 +128,20 @@ impl ParsedImage {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Validate a formatter-compatible image without modifying it and return its UUID,
+/// capacity in bytes, and whether journal recovery is required. This validates
+/// filesystem metadata, not every file's payload.
+pub fn inspect_image(path: &Path) -> Result<Ext4Inspection, Ext4Error> {
+    let mut file = File::open(path)?;
+    let img = parse_and_validate(&mut file)?;
+    let uuid = img.sb[0x68..0x78].try_into().expect("UUID field length");
+    Ok(Ext4Inspection {
+        uuid,
+        capacity_bytes: img.num_blocks * EXT4_BLOCK_SIZE as u64,
+        needs_recovery: img.needs_recovery,
+    })
+}
 
 /// Grow the formatter-produced ext4 image at `path` to `new_size_bytes`.
 ///

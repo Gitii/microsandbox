@@ -27,6 +27,7 @@ pub fn init(
     if let Some(spec) = &params.block_root {
         linux::mount_block_root(spec)?;
     }
+    linux::mount_run()?;
     before_user_mounts()?;
     if params.security_profile == SecurityProfile::Restricted {
         force_restricted_mount_flags(&mut params);
@@ -181,6 +182,46 @@ mod linux {
                 .map_err(|e| AgentdError::Init(format!("failed to symlink /dev/fd: {e}")))?;
         }
 
+        Ok(())
+    }
+
+    /// Mount boot-ephemeral state after the root pivot and before any agent or
+    /// image service writes into /run. A later systemd handoff reuses this mount.
+    pub fn mount_run() -> AgentdResult<()> {
+        mkdir_ignore_exists("/run")?;
+        mount::mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("mode=755"),
+        )
+        .map_err(|e| AgentdError::Init(format!("mount ephemeral /run: {e}")))?;
+
+        // Images may spell /var/run as a directory rather than a symlink.
+        // Bind it to the same tmpfs without deleting snapshot-owned files.
+        fs::create_dir_all("/var")?;
+        match fs::symlink_metadata("/var/run") {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if fs::canonicalize("/var/run")? != Path::new("/run") {
+                    return Err(AgentdError::Init("/var/run must resolve to /run".into()));
+                }
+            }
+            Ok(_) => {
+                mount::mount(
+                    Some("/run"),
+                    "/var/run",
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .map_err(|e| AgentdError::Init(format!("bind /run at /var/run: {e}")))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                unix_fs::symlink("/run", "/var/run")?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 

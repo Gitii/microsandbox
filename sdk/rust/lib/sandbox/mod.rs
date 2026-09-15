@@ -785,7 +785,7 @@ impl Sandbox {
 
     /// Stop the sandbox gracefully and wait until stopped state is observed.
     ///
-    /// Uses [`DEFAULT_STOP_TIMEOUT`] before escalating to force termination.
+    /// Uses [`DEFAULT_STOP_TIMEOUT`]. Timeout or unclean exit returns an error.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
         self.stop_with_timeout(DEFAULT_STOP_TIMEOUT).await
     }
@@ -793,9 +793,7 @@ impl Sandbox {
     /// Request graceful shutdown and return once the request is sent.
     ///
     /// Routes through the backend trait. On local this connects to the agent
-    /// endpoint and sends `core.shutdown` (agentd runs `sync()` +
-    /// `reboot(RB_POWER_OFF)` for a clean ext4 unmount), falling back to
-    /// platform process termination via PID if the endpoint is unreachable. On
+    /// endpoint and sends `core.shutdown`. An unreachable agent returns an error. On
     /// cloud this issues `POST /v1/sandboxes/by-name/:name/stop`.
     pub async fn request_stop(&self) -> MicrosandboxResult<()> {
         tracing::debug!(sandbox = %self.name, "stop: dispatching");
@@ -805,32 +803,42 @@ impl Sandbox {
             .await
     }
 
-    /// Stop the sandbox gracefully with an explicit timeout before escalation.
+    /// Stop gracefully within a deadline, without automatically killing the VM.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        if timeout.is_zero() {
-            self.kill_with_timeout(DEFAULT_KILL_TIMEOUT).await?;
-            return Ok(());
-        }
-
-        self.request_stop().await?;
-        if let Ok(result) = tokio::time::timeout(timeout, self.wait_until_stopped()).await {
-            result?;
-            return Ok(());
-        }
-
-        tracing::warn!(
-            sandbox = %self.name,
-            timeout_secs = timeout.as_secs(),
-            "graceful stop exceeded timeout, escalating to kill"
-        );
-        self.request_kill().await?;
-        match tokio::time::timeout(DEFAULT_KILL_TIMEOUT, self.wait_until_stopped()).await {
-            Ok(result) => {
-                result?;
+        match tokio::time::timeout(timeout, async {
+            if self.owns_lifecycle() {
+                self.request_stop().await?;
+                let status = self.wait().await?;
+                if !status.success() {
+                    return Err(crate::MicrosandboxError::Runtime(format!(
+                        "sandbox '{}' exited uncleanly: {status}",
+                        self.name
+                    )));
+                }
+                if !self.is_local_ephemeral() {
+                    let handle = self
+                        .backend
+                        .sandboxes()
+                        .get(self.backend.clone(), &self.name)
+                        .await?;
+                    handle.wait_for_clean_stop().await?;
+                }
                 Ok(())
+            } else {
+                let handle = self
+                    .backend
+                    .sandboxes()
+                    .get(self.backend.clone(), &self.name)
+                    .await?;
+                handle.request_stop().await?;
+                handle.wait_for_clean_stop().await
             }
+        })
+        .await
+        {
+            Ok(result) => result,
             Err(_) => Err(crate::MicrosandboxError::Runtime(format!(
-                "timed out observing stopped state for sandbox '{}'",
+                "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
                 self.name
             ))),
         }
@@ -842,15 +850,13 @@ impl Sandbox {
     /// on; use [`stop`](Self::stop) and poll [`status`](Self::status) instead.
     pub async fn stop_and_wait(&self) -> MicrosandboxResult<ExitStatus> {
         let local = self.require_local(Operation::SandboxStopAndWait)?;
-        let stop_result = self.request_stop().await;
         if local.handle.is_none() {
-            stop_result?;
-            // No handle to wait on — return a synthetic success status.
-            return Ok(std::process::ExitStatus::default());
+            return Err(crate::MicrosandboxError::Runtime(
+                "cannot stop_and_wait: not the lifecycle owner; use stop instead".into(),
+            ));
         }
-        let wait_result = self.wait().await;
-        stop_result?;
-        wait_result
+        self.stop().await?;
+        self.wait().await
     }
 
     /// Kill the sandbox immediately and wait until stopped state is observed.

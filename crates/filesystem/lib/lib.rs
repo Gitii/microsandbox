@@ -18,6 +18,7 @@
 pub mod agentd;
 #[cfg(any(unix, windows))]
 pub mod backends;
+pub mod disk;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports

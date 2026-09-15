@@ -721,7 +721,7 @@ await sandbox.stop();
 
 </Accordion>
 
-Gracefully shut down the sandbox and wait until stopped state is observed. Lets the sandbox finish writing any pending data to disk before it exits, so files written inside the sandbox aren't lost across a later restart. Waits up to 10_000 ms for a clean exit; if the sandbox is still running after that, it is force-killed.
+Gracefully shut down within 150_000 ms. Deadline expiry, an unreachable local agent, or unclean VM exit throws without automatic force-kill. Use `kill()` explicitly for force termination. A failed stop does not confirm that disks can be safely removed.
 
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">stopWithTimeout()</span>
 
@@ -737,14 +737,14 @@ await sandbox.stopWithTimeout(5000);
 
 </Accordion>
 
-Gracefully shut down the sandbox with an explicit observation timeout before force-kill escalation. `0` force-kills immediately. Resolves successfully either way - it does not throw on timeout expiry.
+Gracefully shut down within an explicit deadline covering request delivery and exit observation. Expiry or unclean exit throws. `0` provides no grace period and does not force-kill.
 
 <p className="msb-label">Parameters</p>
 
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>timeoutMs</code><span className="msb-type">number</span></div>
-    <div className="msb-param-desc">Milliseconds to wait for a clean exit before force-killing. <code>0</code> skips the grace period.</div>
+    <div className="msb-param-desc">Graceful shutdown deadline in milliseconds. Expiry throws without automatic force-kill; <code>0</code> provides no grace period.</div>
   </div>
 </div>
 
@@ -2234,8 +2234,8 @@ Handles from `Sandbox.get(name)` are **live** - they expose lifecycle methods (`
 | startDetached() | `Promise<`[`Sandbox`](#instance-methods)`>` | Start in detached mode |
 | connect() | `Promise<`[`Sandbox`](#instance-methods)`>` | Connect to a running sandbox without taking ownership. Returns an error if it doesn't respond within 10_000 ms |
 | connectWithTimeout(timeoutMs) | `Promise<`[`Sandbox`](#instance-methods)`>` | Same as `connect()` with an explicit timeout in milliseconds |
-| stop() | `Promise<void>` | Gracefully shut down. Waits up to 10_000 ms for pending writes to flush, then force-kills |
-| stopWithTimeout(timeoutMs) | `Promise<void>` | Same as `stop()` with an explicit timeout in milliseconds; `0` force-kills immediately |
+| stop() | `Promise<void>` | Gracefully shut down within 150_000 ms; expiry or unclean exit throws without automatic force-kill |
+| stopWithTimeout(timeoutMs) | `Promise<void>` | Same as `stop()` with an explicit deadline in milliseconds; `0` provides no grace period |
 | requestStop() | `Promise<void>` | Request graceful shutdown without waiting |
 | kill() | `Promise<void>` | Force terminate and wait until stopped state is observed |
 | killWithTimeout(timeoutMs) | `Promise<void>` | Same as `kill()` with an explicit observation timeout |

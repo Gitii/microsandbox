@@ -13,7 +13,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
 
-use microsandbox_protocol::HANDOFF_POWEROFF_TIMEOUT;
 use microsandbox_protocol::codec::{self, MAX_FRAME_SIZE};
 use microsandbox_protocol::core::{
     ClockSync, CoreError, CoreErrorKind, InitAck, InitResolved, Ping, Pong, Ready,
@@ -1272,24 +1271,10 @@ fn request_guest_poweroff() -> AgentdResult<()> {
         libc::sync();
     }
 
-    // Handoff mode: ask the new init (PID 1) to shut down.
-    // SIGRTMIN+4 is systemd's poweroff signal; sysvinit-derived inits
-    // typically default-handle it as a clean exit. Either way, PID 1
-    // exiting causes the kernel to panic the guest, which the VMM
-    // observes as a clean shutdown.
-    if crate::handoff::signal_init_shutdown().is_ok() {
-        std::thread::sleep(HANDOFF_POWEROFF_TIMEOUT);
-    }
-
-    // Reaching this point means the init ignored the poweroff request, so
-    // the guest is going down hard (SIGTERM fallback, then the host's
-    // VMM-process kill as backstop). Force filesystems toward a clean
-    // terminal state first — without the process sweep, since the foreign
-    // init's services are not ours to kill.
-    crate::teardown::teardown_filesystems(false);
-
-    let _ = crate::handoff::signal_init_term();
-    Ok(())
+    // The image init owns service ordering and filesystem teardown. In
+    // particular, never remount a Docker disk while its service is stopping.
+    // The host records a failed shutdown if init does not power off in time.
+    crate::handoff::signal_init_shutdown()
 }
 
 //--------------------------------------------------------------------------------------------------

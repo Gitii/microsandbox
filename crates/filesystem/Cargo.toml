@@ -12,6 +12,9 @@ path = "lib/lib.rs"
 
 [dependencies]
 libc.workspace = true
+microsandbox-image.workspace = true
+serde.workspace = true
+thiserror.workspace = true
 microsandbox-utils.workspace = true
 msb_krun.workspace = true
 scopeguard.workspace = true

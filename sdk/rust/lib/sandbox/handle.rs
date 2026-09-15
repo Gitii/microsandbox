@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -16,7 +16,7 @@ use crate::{
         Backend, CloudCreateSandboxResponse, SandboxCloudState, SandboxHandleCloudState,
         SandboxHandleInner, SandboxHandleLocalState,
     },
-    db::entity::sandbox as sandbox_entity,
+    db::entity::{run as run_entity, sandbox as sandbox_entity},
     error::Operation,
 };
 
@@ -30,8 +30,8 @@ use super::{Sandbox, SandboxConfig, SandboxModificationBuilder, SandboxStatus, S
 /// [`SandboxHandle::connect`].
 pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Default timeout for [`SandboxHandle::stop`] before escalation.
-pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Default graceful-stop deadline, including guest shutdown and runtime handoff.
+pub const DEFAULT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// Default timeout for observing stopped state after force termination.
 pub const DEFAULT_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -474,47 +474,61 @@ impl SandboxHandle {
         self.stop_with_timeout(DEFAULT_STOP_TIMEOUT).await
     }
 
-    /// Stop the sandbox gracefully with an explicit timeout before escalation.
+    /// Stop gracefully within a deadline. Timeout or unclean exit is an error;
+    /// force termination requires an explicit call to [`kill`](Self::kill).
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
-        if sandbox_status_is_terminal(current.status_snapshot()) {
-            return Ok(());
-        }
-
-        if timeout.is_zero() {
-            current.kill_with_timeout(DEFAULT_KILL_TIMEOUT).await?;
-            return Ok(());
-        }
-
-        current.request_stop().await?;
-        match tokio::time::timeout(timeout, current.wait_until_stopped()).await {
-            Ok(Ok(_)) => {
-                // Windows: the DB can record the guest poweroff while the VM
-                // process never exits; a successful stop must mean "no
-                // process".
-                #[cfg(windows)]
-                current.reap_leaked_local_runtime().await?;
-                return Ok(());
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {}
-        }
-
-        tracing::warn!(
-            sandbox = %current.name,
-            timeout_secs = timeout.as_secs(),
-            "graceful stop exceeded timeout, escalating to kill"
-        );
-        current.request_kill().await?;
-        match tokio::time::timeout(DEFAULT_KILL_TIMEOUT, current.wait_until_stopped()).await {
-            Ok(result) => {
-                result?;
-                Ok(())
-            }
+        match tokio::time::timeout(timeout, async {
+            self.request_stop().await?;
+            self.wait_for_clean_stop().await
+        })
+        .await
+        {
+            Ok(result) => result,
             Err(_) => Err(MicrosandboxError::Runtime(format!(
-                "timed out observing stopped state for sandbox '{}'",
-                current.name
+                "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
+                self.name
             ))),
+        }
+    }
+
+    pub(crate) async fn wait_for_clean_stop(&self) -> MicrosandboxResult<()> {
+        let Some(local) = self.local() else {
+            let result = self.wait_until_stopped().await?;
+            return if result.status == SandboxStatus::Stopped {
+                Ok(())
+            } else {
+                Err(MicrosandboxError::Runtime(format!(
+                    "sandbox '{}' stopped uncleanly",
+                    self.name
+                )))
+            };
+        };
+        let backend = self
+            .backend
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::Runtime("missing local backend".into()))?;
+        loop {
+            let run = run_entity::Entity::find()
+                .filter(run_entity::Column::SandboxId.eq(local.db_id))
+                .order_by_desc(run_entity::Column::Id)
+                .one(backend.db().await?.read())
+                .await?
+                .ok_or_else(|| {
+                    MicrosandboxError::Runtime(format!(
+                        "no run evidence for sandbox '{}'",
+                        self.name
+                    ))
+                })?;
+            if run.status == run_entity::RunStatus::Terminated {
+                ensure_clean_run(&run)?;
+                if !run
+                    .pid
+                    .is_some_and(microsandbox_utils::process::pid_is_alive)
+                {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -665,21 +679,6 @@ impl SandboxHandle {
         }
     }
 
-    /// Kill any leftover VM process still backing this local sandbox after
-    /// its DB row went terminal. No-op for cloud handles.
-    #[cfg(windows)]
-    async fn reap_leaked_local_runtime(&self) -> MicrosandboxResult<()> {
-        let Some(local) = self.local() else {
-            return Ok(());
-        };
-        let Some(local_backend) = self.backend.as_local() else {
-            return Ok(());
-        };
-        super::reap_leaked_runtime_process(local_backend, local.db_id, &self.name)
-            .await
-            .map(|_| ())
-    }
-
     fn is_local_ephemeral(&self) -> bool {
         is_local_ephemeral_handle(&self.inner)
     }
@@ -701,6 +700,27 @@ fn is_local_ephemeral_handle(inner: &SandboxHandleInner) -> bool {
 
 fn sandbox_status_is_terminal(status: SandboxStatus) -> bool {
     matches!(status, SandboxStatus::Stopped | SandboxStatus::Crashed)
+}
+
+fn ensure_clean_run(run: &run_entity::Model) -> MicrosandboxResult<()> {
+    if run.exit_code == Some(0)
+        && run.exit_signal.is_none()
+        && matches!(
+            run.termination_reason,
+            Some(
+                run_entity::TerminationReason::Completed
+                    | run_entity::TerminationReason::ShutdownRequested
+                    | run_entity::TerminationReason::DrainRequested
+            )
+        )
+    {
+        Ok(())
+    } else {
+        Err(MicrosandboxError::Runtime(format!(
+            "sandbox run {} did not confirm clean shutdown: reason {:?}, exit code {:?}, signal {:?}",
+            run.id, run.termination_reason, run.exit_code, run.exit_signal
+        )))
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -725,6 +745,34 @@ impl std::fmt::Debug for SandboxHandle {
 mod tests {
     use super::*;
     use crate::backend::{BackendKind, CloudBackend, CloudSandboxStatus};
+
+    #[test]
+    fn clean_stop_requires_positive_run_evidence() {
+        let mut run = run_entity::Model {
+            id: 1,
+            sandbox_id: 1,
+            pid: None,
+            status: run_entity::RunStatus::Terminated,
+            exit_code: Some(0),
+            exit_signal: None,
+            termination_reason: Some(run_entity::TerminationReason::ShutdownRequested),
+            termination_detail: None,
+            signals_sent: None,
+            started_at: None,
+            terminated_at: None,
+        };
+        assert!(ensure_clean_run(&run).is_ok());
+        run.termination_reason = Some(run_entity::TerminationReason::Failed);
+        assert!(ensure_clean_run(&run).is_err());
+        run.termination_reason = Some(run_entity::TerminationReason::ShutdownRequested);
+        run.exit_code = None;
+        assert!(ensure_clean_run(&run).is_err());
+        run.exit_code = Some(1);
+        assert!(ensure_clean_run(&run).is_err());
+        run.exit_code = Some(0);
+        run.exit_signal = Some(9);
+        assert!(ensure_clean_run(&run).is_err());
+    }
 
     #[tokio::test]
     async fn cloud_connect_rebuilds_live_sandbox_without_http_request() {

@@ -1,4 +1,5 @@
 mod agent;
+mod disk;
 mod error;
 mod exec;
 mod fs;
@@ -47,6 +48,8 @@ struct PyBackendInfo {
 /// The `_microsandbox` native extension module.
 #[pymodule]
 fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<disk::PyDisk>()?;
+    m.add_class::<disk::PyDiskInfo>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(setup::install, m)?)?;
     m.add_function(wrap_pyfunction!(setup::is_installed, m)?)?;

@@ -932,11 +932,17 @@ export declare class Sandbox {
   attachShell(): Promise<number>
   /** Stop the sandbox gracefully and wait for it to exit. */
   stop(): Promise<void>
-  /** Stop and wait for exit, returning the exit status. */
+  /**
+   * Stop and wait for a clean exit, returning actual process status.
+   * Requires local lifecycle ownership; reconnected handles must use stop.
+   */
   stopAndWait(): Promise<ExitStatus>
   /** Request graceful shutdown without waiting for observed exit. */
   requestStop(): Promise<void>
-  /** Stop gracefully with an explicit timeout before escalating to SIGKILL. */
+  /**
+   * Stop gracefully within a deadline in milliseconds. Expiry or unclean
+   * exit throws without automatic force-kill.
+   */
   stopWithTimeout(timeoutMs: number): Promise<void>
   /** Kill the sandbox immediately and wait for observed exit. */
   kill(): Promise<void>
@@ -1286,17 +1292,15 @@ export declare class SandboxHandle {
   /**
    * Stop the sandbox gracefully.
    *
-   * Lets the sandbox finish writing any pending data to disk before
-   * it exits, so files written inside the sandbox aren't lost across
-   * a later restart. Waits 10_000 ms by default before force-kill;
-   * override with `stopWithTimeout(timeoutMs)`.
+   * Waits up to 150_000 ms; override with `stopWithTimeout(timeoutMs)`.
+   * Deadline expiry or unclean exit throws without automatic force-kill.
    */
   stop(): Promise<void>
   /** Request graceful shutdown without waiting. */
   requestStop(): Promise<void>
   /**
-   * Stop the sandbox gracefully with an explicit timeout in
-   * milliseconds before escalation.
+   * Stop gracefully within a deadline in milliseconds. Expiry or unclean
+   * exit throws; force termination requires an explicit `kill()` call.
    */
   stopWithTimeout(timeoutMs: number): Promise<void>
   /** Force-kill the sandbox and wait until stopped state is observed. */
@@ -1585,7 +1589,7 @@ export declare class Volume {
   static remove(name: string): Promise<void>
   get name(): string
   get path(): string
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolume = Volume
@@ -1664,7 +1668,7 @@ export declare class VolumeHandle {
   get labels(): Record<string, string>
   get createdAt(): number | null
   remove(): Promise<void>
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolumeHandle = VolumeHandle
@@ -1693,6 +1697,20 @@ export declare function defaultBackendInfo(): JsBackendInfo
 
 /** Return the active default backend kind (`"local"` or `"cloud"`). */
 export declare function defaultBackendKind(): string
+
+export declare function diskCreate(path: string, sizeBytes: bigint): DiskInfo
+
+export declare function diskGrowCopy(source: string, destination: string, sizeBytes: bigint): DiskInfo
+
+export interface DiskInfo {
+  uuid: string
+  capacityBytes: bigint
+  fileBytes: bigint
+  allocatedBytes?: bigint
+  needsRecovery: boolean
+}
+
+export declare function diskInspect(path: string): DiskInfo
 
 /** DNS interception configuration produced by `DnsBuilder.build()`. */
 export interface DnsConfig {

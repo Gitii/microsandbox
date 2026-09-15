@@ -666,6 +666,18 @@ pub async fn spawn_sandbox(
         "spawn_sandbox: startup JSON received"
     );
 
+    // The runtime process inherited these descriptors (their close-on-exec
+    // flag is cleared when they are taken), and a flock belongs to the open
+    // file description, so the runtime itself keeps every image locked for
+    // exactly as long as it runs. Keeping our copies as well would hold an
+    // image locked after a clean stop until this handle is dropped, which
+    // refuses the next boot of the same disk.
+    #[cfg(unix)]
+    let disk_locks = {
+        drop(disk_locks);
+        Vec::new()
+    };
+
     #[cfg(unix)]
     let handle = ProcessHandle::new(
         startup.pid,

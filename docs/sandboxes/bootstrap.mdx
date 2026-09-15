@@ -408,3 +408,27 @@ msb run ghcr.io/superradcompany/debian-systemd:12 \
 Most slim Docker base images do not include systemd or another full init. Use an image that ships the init you want, or build a small custom image that installs it.
 
 `--init` controls PID 1. `--entrypoint` and the trailing command normally control the workload you run after boot, so the two can be combined. An image-declared init entrypoint such as `/init` is the special case. With `--init auto` and attached `msb run`, microsandbox passes the trailing command to PID 1 as part of the image's own launch contract.
+
+### Runtime state and shutdown
+
+Every boot mounts a fresh tmpfs at `/run` after selecting the root filesystem and
+before preparing agent state. `/var/run` resolves to the same storage. Root
+snapshots therefore cannot revive PID files, sockets, or other previous-boot
+state. The agent's `/run/microsandbox` directory is created on this tmpfs before
+handoff; systemd reuses the existing mount.
+
+The agent and init run as root. SDK exec and PTY sessions retain the configured
+image/session user. Networking and trust-store setup remain the agent's
+responsibility; images must not enable a competing network manager.
+
+For systemd, graceful shutdown invokes the image's `/usr/bin/systemctl --no-block
+poweroff`. This uses the image's own control protocol rather than computing
+systemd realtime signals against the agent's musl libc. The image must provide
+that executable. Init owns service-stop ordering and filesystem teardown; the
+agent does not remount service disks during shutdown or send a fallback signal
+that could reboot or re-execute systemd.
+
+The host allows 120 seconds for handoff shutdown, including service stop jobs.
+If that deadline expires, forced VMM termination is recorded as a failed,
+unclean shutdown. A stopped process alone is not permission to discard or
+publish durable disks. Extra disks are not included in root snapshots.

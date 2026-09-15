@@ -30,7 +30,8 @@ pub struct RestartArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Seconds to wait for graceful shutdown before force-killing.
+    /// Graceful shutdown deadline in seconds (default: 150). Expiry fails
+    /// without restarting; use --force to kill instead. Zero provides no grace period.
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 

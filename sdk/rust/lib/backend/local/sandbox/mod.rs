@@ -128,14 +128,11 @@ impl LocalBackend {
     /// Tries the configured agent relay socket candidates, connects, sends
     /// `MessageType::Shutdown`, and lets agentd run an in-guest `sync()` +
     /// `reboot(RB_POWER_OFF)` so ext4 unmounts cleanly (no journal replay on
-    /// next boot). Falls back to platform process termination via PID if the
-    /// agent endpoint is unreachable (agentd wedged, sandbox just
-    /// transitioning, etc.).
+    /// next boot). Returns an error if the agent endpoint is unreachable.
     ///
     /// No-op when the sandbox isn't in Running/Draining.
     async fn stop_sandbox(&self, name: &str) -> MicrosandboxResult<()> {
-        let (model, run) = self.sandbox_handle_state(name).await?;
-        let pid = Self::pid_from_run(run.as_ref());
+        let (model, _) = self.sandbox_handle_state(name).await?;
         if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
             return Ok(());
         }
@@ -144,25 +141,7 @@ impl LocalBackend {
             Self::mark_sandbox_draining_if_running(self.db().await?.write(), model.id).await?;
         }
 
-        match self.request_agent_shutdown(name).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Graceful degradation: agent endpoint unreachable (socket/pipe
-                // missing, ECONNREFUSED, handshake timeout) or shutdown delivery
-                // failed. Fall back to direct process termination so we still
-                // attempt a stop, at the cost of skipping the in-guest sync().
-                // The reaper updates DB status on PID exit.
-                tracing::warn!(
-                    sandbox = %name,
-                    error = %e,
-                    "stop_local: agent endpoint unreachable; falling back to process termination",
-                );
-                if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
-                    Self::terminate_pid_gracefully(pid)?;
-                }
-                Ok(())
-            }
-        }
+        self.request_agent_shutdown(name).await
     }
 
     /// Local lifecycle: kill a sandbox by name (SIGKILL).
@@ -1070,6 +1049,68 @@ mod tests {
             pid += 1;
         }
         pid
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_rejects_failed_run_and_live_runtime() {
+        let temp = tempdir().unwrap();
+        let backend = std::sync::Arc::new(
+            LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config("stop-evidence"))
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Stopped)
+            .await
+            .unwrap();
+        let run_id = run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(std::process::id() as i32)),
+            status: Set(run_entity::RunStatus::Terminated),
+            exit_code: Set(Some(1)),
+            termination_reason: Set(Some(run_entity::TerminationReason::Failed)),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap()
+        .last_insert_id;
+        let model = sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = crate::sandbox::SandboxHandle::from_local_model(backend.clone(), model, None);
+        let error = handle.stop().await.unwrap_err();
+        assert!(error.to_string().contains("did not confirm clean shutdown"));
+
+        run_entity::Entity::update(run_entity::ActiveModel {
+            id: Set(run_id),
+            exit_code: Set(Some(0)),
+            termination_reason: Set(Some(run_entity::TerminationReason::ShutdownRequested)),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        let error = handle
+            .stop_with_timeout(std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"));
+        assert!(LocalBackend::pid_is_alive(std::process::id() as i32));
+        assert!(
+            sandbox_entity::Entity::find_by_id(id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -323,28 +323,29 @@ pub fn is_pid_1() -> bool {
     nix::unistd::getpid().as_raw() == 1
 }
 
-/// Sends `SIGRTMIN+4` to PID 1 to request shutdown.
+/// Ask the image's init to power off without forcing running services down.
 ///
-/// systemd interprets this as "start poweroff.target". Other inits
-/// typically default-handle it as "exit cleanly," which causes the
-/// kernel to panic on PID 1 exit and triggers VMM shutdown.
-///
-/// `SIGRTMIN` is a function on Linux (glibc reserves the first few
-/// RT signals for libc internals), so the value is computed at
-/// runtime via `libc::SIGRTMIN()`.
+/// systemd's control client belongs to the image: it knows its manager's
+/// shutdown protocol independently of agentd's libc. In particular, musl's
+/// SIGRTMIN+4 is glibc systemd's reboot signal, not its poweroff signal.
+/// Other init implementations retain the existing realtime-signal contract.
 pub fn signal_init_shutdown() -> AgentdResult<()> {
+    let init_name = std::fs::read_to_string("/proc/1/comm")?;
+    if init_name.trim() == "systemd" {
+        let status = process::Command::new("/usr/bin/systemctl")
+            .args(["--no-block", "poweroff"])
+            .status()
+            .map_err(|e| AgentdError::Init(format!("request systemd poweroff: {e}")))?;
+        if !status.success() {
+            return Err(AgentdError::Init(format!(
+                "systemd rejected poweroff request: {status}"
+            )));
+        }
+        return Ok(());
+    }
     let sig = libc::SIGRTMIN() + 4;
     // SAFETY: kill(2) is signal-safe and pid=1 is always valid.
     let ret = unsafe { libc::kill(1, sig) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-/// Sends `SIGTERM` to PID 1 as a sysvinit-friendly shutdown fallback.
-pub fn signal_init_term() -> AgentdResult<()> {
-    let ret = unsafe { libc::kill(1, libc::SIGTERM) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error().into());
     }

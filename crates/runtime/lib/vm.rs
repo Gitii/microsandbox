@@ -59,6 +59,7 @@ const EXIT_REASON_PARENT_EXIT: u8 = 4;
 const EXIT_REASON_AGENT_UNRESPONSIVE: u8 = 5;
 const EXIT_REASON_SHUTDOWN_REQUESTED: u8 = 6;
 const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
+const EXIT_REASON_SHUTDOWN_FAILED: u8 = 8;
 
 /// Fixed fd carrying the bulk `msb sandbox` config (argv overflow) as
 /// NUL-terminated argument records. Keeps the network-config blob and the
@@ -505,7 +506,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
+    let shutdown_flush_timeout = guest_shutdown_flush_timeout(has_handoff_init(&config.vm.env));
 
     // Create console shared state (ring buffers + wake pipes).
     let shared = Arc::new(ConsoleSharedState::new());
@@ -658,10 +659,20 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         move |exit_code: i32| {
             // Map (exit_code, reason tag) → TerminationReason.
             let reason_tag = exit_reason_for_observer.load(std::sync::atomic::Ordering::SeqCst);
+            let exit_code = if reason_tag == EXIT_REASON_SHUTDOWN_FAILED {
+                1
+            } else {
+                exit_code
+            };
             let reason = match reason_tag {
                 EXIT_REASON_IDLE_TIMEOUT => run_entity::TerminationReason::IdleTimeout,
                 EXIT_REASON_AGENT_UNRESPONSIVE => run_entity::TerminationReason::AgentUnresponsive,
-                EXIT_REASON_SHUTDOWN_REQUESTED => run_entity::TerminationReason::ShutdownRequested,
+                EXIT_REASON_SHUTDOWN_REQUESTED if exit_code == 0 => {
+                    run_entity::TerminationReason::ShutdownRequested
+                }
+                EXIT_REASON_SHUTDOWN_REQUESTED | EXIT_REASON_SHUTDOWN_FAILED => {
+                    run_entity::TerminationReason::Failed
+                }
                 EXIT_REASON_STARTUP_COMMAND_FAILED => run_entity::TerminationReason::Failed,
                 EXIT_REASON_MAX_DURATION => run_entity::TerminationReason::MaxDurationExceeded,
                 EXIT_REASON_PARENT_EXIT => run_entity::TerminationReason::Signal,
@@ -740,6 +751,14 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             // only place a destination's trailing denials reach the log.
             if let Some(flush) = exit_policy_flush.get() {
                 flush();
+            }
+
+            if reason_tag == EXIT_REASON_SHUTDOWN_FAILED {
+                // libkrun's host-triggered exit defaults to status zero. Its
+                // device exit observers have already drained block writes;
+                // this is our final user observer. Preserve failure for SDK
+                // lifecycle owners as well as the persisted run record.
+                std::process::exit(1);
             }
         },
         tokio_rt.handle().clone(),
@@ -995,7 +1014,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     "core.shutdown forwarded to agentd, allowing flush window before host fallback"
                 );
                 tokio::time::sleep(shutdown_flush_timeout).await;
-                tracing::info!("flush window elapsed, triggering host exit");
+                shutdown_reason.store(
+                    EXIT_REASON_SHUTDOWN_FAILED,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
                 shutdown_exit_handle.trigger();
             }
         });
@@ -1058,6 +1081,10 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     );
                 }
             }
+            startup_reason.store(
+                EXIT_REASON_SHUTDOWN_FAILED,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             startup_exit_handle.trigger();
         });
     }
@@ -1110,6 +1137,10 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                                 );
                             }
                         }
+                        heartbeat_reason.store(
+                            EXIT_REASON_SHUTDOWN_FAILED,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         heartbeat_exit_handle.trigger();
                         break;
                     }
@@ -1283,6 +1314,11 @@ fn build_vm(
             // kernel command line internal avoids exposing a general-purpose
             // boot-argument escape hatch to sandbox users.
             let thp = thp_kernel_cmdline(vm.thp);
+            // libkrun's x86 i8042 reset endpoint terminates the VMM. Declare
+            // that platform contract so firmware can register POWER_OFF;
+            // without it Linux demotes systemd poweroff to a non-exiting HALT.
+            #[cfg(target_arch = "x86_64")]
+            let thp = format!("{thp} krun.poweroff=i8042");
             let k = k.krunfw_path(&vm.libkrunfw_path).cmdline(&thp);
             if let Some(ref init_path) = vm.init_path {
                 k.init_path(init_path)
@@ -1905,6 +1941,18 @@ fn request_guest_shutdown_with_timeout(
     relay::push_guest_frame_until(shared, frame, timeout)
 }
 
+fn has_handoff_init(env: &[String]) -> bool {
+    // SDK init selection is an agentd boot parameter, not the VMM executable
+    // override (vm.init_path). Match the same last-value-wins environment.
+    env.iter()
+        .rev()
+        .find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == microsandbox_protocol::ENV_HANDOFF_INIT).then_some(!value.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 fn guest_shutdown_flush_timeout(has_handoff_init: bool) -> Duration {
     let override_ms = std::env::var("MSB_SHUTDOWN_FLUSH_TIMEOUT_MS").ok();
     guest_shutdown_flush_timeout_with_override(has_handoff_init, override_ms.as_deref())
@@ -1957,6 +2005,10 @@ fn spawn_parent_watchdog(
                     } else {
                         std::thread::sleep(shutdown_flush_timeout);
                     }
+                    exit_reason.store(
+                        EXIT_REASON_SHUTDOWN_FAILED,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     exit_handle.trigger();
                 }
                 Ok(ParentWatchdogSignal::Detached) => {
@@ -2644,6 +2696,20 @@ mod tests {
             guest_shutdown_flush_timeout(true),
             microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
         );
+    }
+
+    #[test]
+    fn sdk_handoff_env_selects_shutdown_grace() {
+        assert!(!super::has_handoff_init(&[]));
+        assert!(super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/lib/systemd/systemd".into()
+        ]));
+        assert!(super::has_handoff_init(&["MSB_HANDOFF_INIT=auto".into()]));
+        assert!(!super::has_handoff_init(&["MSB_HANDOFF_INIT=".into()]));
+        assert!(!super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/sbin/init".into(),
+            "MSB_HANDOFF_INIT=".into(),
+        ]));
     }
 
     #[test]

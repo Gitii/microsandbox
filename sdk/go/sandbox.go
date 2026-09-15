@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultStopTimeout = 10 * time.Second
+	defaultStopTimeout = 150 * time.Second
 	defaultKillTimeout = 5 * time.Second
 )
 
@@ -521,7 +521,8 @@ type SandboxTouchResult struct {
 	ActivitySeq uint64
 }
 
-// WithStopTimeout sets how long Stop waits for graceful shutdown before force-killing.
+// WithStopTimeout sets the graceful shutdown deadline. Expiry returns an error
+// without force-killing; use Kill explicitly for force termination.
 func WithStopTimeout(timeout time.Duration) StopOption {
 	return func(o *lifecycleOptions) { o.timeout = timeout }
 }

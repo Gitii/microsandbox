@@ -28,7 +28,8 @@ pub struct StopArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Seconds to wait for graceful shutdown before force-killing.
+    /// Graceful shutdown deadline in seconds (default: 150). Expiry fails;
+    /// use --force to kill instead. Zero provides no grace period.
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
@@ -106,6 +107,13 @@ mod tests {
 
     fn parse_stop_args(args: &[&str]) -> StopArgs {
         TestCli::parse_from(std::iter::once("msb").chain(args.iter().copied())).args
+    }
+
+    #[test]
+    fn zero_timeout_does_not_enable_force() {
+        let args = parse_stop_args(&["worker", "--timeout", "0"]);
+        assert_eq!(args.timeout, Some(0));
+        assert!(!args.force);
     }
 
     #[test]

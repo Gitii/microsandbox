@@ -24,6 +24,9 @@ pub mod setup;
 pub mod snapshot;
 pub mod volume;
 
+/// Local, offline maintenance of caller-owned extra ext4 disks.
+pub use microsandbox_filesystem::disk;
+
 pub use agent::{
     AgentBridge, AgentClient, AgentClientError, AgentClientResult, AgentProtocol, BridgeFrame,
     RawFrame, StreamHandle,
