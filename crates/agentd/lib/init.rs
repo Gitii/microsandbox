@@ -70,6 +70,51 @@ fn force_restricted_mount_flags(params: &mut BootParams) {
     }
 }
 
+/// Splits a guest path into its meaningful components, dropping empty and
+/// `.` segments so `/a//b` and `/a/./b` compare equal to `/a/b`.
+fn mount_path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
+}
+
+/// Reports whether `parent` is a strict ancestor of `child`.
+fn is_mount_ancestor(parent: &[&str], child: &[&str]) -> bool {
+    parent.len() < child.len() && child.starts_with(parent)
+}
+
+/// Orders mount targets so a parent path is mounted before any path nested
+/// under it, returning indices into `paths`.
+///
+/// Guards the guest against the host's ordering: the spec list arrives in
+/// whatever order the SDK that built it serialized, which for a map-backed
+/// caller is the map's key order, not a nesting order. Mounting a nested
+/// path first leaves it hidden the moment the parent is mounted over it, and
+/// the guest then sees the nested path as a plain directory on the parent
+/// filesystem. Each round picks the first remaining target that has no
+/// remaining ancestor, so unrelated targets keep their original relative
+/// order while nested ones are pulled behind their parent.
+fn parent_first_order(paths: &[&str]) -> Vec<usize> {
+    let components: Vec<Vec<&str>> = paths.iter().map(|p| mount_path_components(p)).collect();
+    let mut pending: Vec<usize> = (0..paths.len()).collect();
+    let mut order = Vec::with_capacity(paths.len());
+    while !pending.is_empty() {
+        // Nesting is a strict partial order, so some pending target always
+        // has no pending ancestor; `unwrap_or(0)` only keeps the loop
+        // shrinking if that ever failed to hold.
+        let pick = pending
+            .iter()
+            .position(|&i| {
+                !pending
+                    .iter()
+                    .any(|&j| j != i && is_mount_ancestor(&components[j], &components[i]))
+            })
+            .unwrap_or(0);
+        order.push(pending.remove(pick));
+    }
+    order
+}
+
 fn ensure_scripts_profile_block(profile: &str) -> String {
     const START_MARKER: &str = "# >>> microsandbox scripts path >>>";
     const END_MARKER: &str = "# <<< microsandbox scripts path <<<";
@@ -515,8 +560,9 @@ mod linux {
 
     /// Mounts each virtiofs directory volume from the parsed specs.
     pub fn apply_dir_mounts(specs: &[DirMountSpec]) -> AgentdResult<()> {
-        for spec in specs {
-            mount_dir(spec)?;
+        let paths: Vec<&str> = specs.iter().map(|s| s.guest_path.as_str()).collect();
+        for index in super::parent_first_order(&paths) {
+            mount_dir(&specs[index])?;
         }
         Ok(())
     }
@@ -734,8 +780,9 @@ mod linux {
         } else {
             None
         };
-        for spec in specs {
-            mount_disk(spec, fstypes.as_deref())?;
+        let paths: Vec<&str> = specs.iter().map(|s| s.guest_path.as_str()).collect();
+        for index in super::parent_first_order(&paths) {
+            mount_disk(&specs[index], fstypes.as_deref())?;
         }
         Ok(())
     }
@@ -995,6 +1042,39 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parent_first_order_puts_parent_before_nested_child() {
+        let paths = [
+            "/var/lib/distributed-docker/docker/volumes",
+            "/var/lib/distributed-docker",
+        ];
+        assert_eq!(parent_first_order(&paths), vec![1, 0]);
+    }
+
+    #[test]
+    fn test_parent_first_order_keeps_unrelated_paths_in_place() {
+        let paths = ["/z", "/a", "/m/n"];
+        assert_eq!(parent_first_order(&paths), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_parent_first_order_handles_three_levels_reversed() {
+        let paths = ["/a/b/c", "/a/b", "/a"];
+        assert_eq!(parent_first_order(&paths), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn test_parent_first_order_ignores_redundant_separators() {
+        let paths = ["/a/./b", "/a//"];
+        assert_eq!(parent_first_order(&paths), vec![1, 0]);
+    }
+
+    #[test]
+    fn test_parent_first_order_does_not_nest_on_name_prefix() {
+        let paths = ["/data-extra", "/data"];
+        assert_eq!(parent_first_order(&paths), vec![0, 1]);
+    }
 
     #[test]
     fn test_ensure_scripts_profile_block_appends_block() {
