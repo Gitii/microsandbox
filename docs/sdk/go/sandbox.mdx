@@ -1746,7 +1746,7 @@ Add volume mount configurations keyed by guest path. Build values via the [`Moun
 func WithStopTimeout(timeout time.Duration) StopOption
 ```
 
-Set the graceful shutdown deadline for [`Stop`](#sb-stop). Default: 150 seconds. Expiry returns an error without automatic force-kill; zero provides no grace period. This is a `StopOption`, not a `SandboxOption`, pass it to [`Stop`](#sb-stop).
+Set the graceful shutdown deadline for [`Stop`](#sb-stop). Default: 150 seconds. Expiry returns an error without automatic force-kill; zero is rejected — use `Kill` for a forced stop. This is a `StopOption`, not a `SandboxOption`, pass it to [`Stop`](#sb-stop).
 
 <p className="msb-label">Parameters</p>
 

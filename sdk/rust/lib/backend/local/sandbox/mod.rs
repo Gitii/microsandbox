@@ -1173,8 +1173,9 @@ mod tests {
     }
 
     /// A terminal run row is written from inside the runtime's exit observer,
-    /// while it still holds every disk image it attached. The wait must not
-    /// call that a clean stop until the images are provably released.
+    /// while it still holds every disk image it attached. A stop must not call
+    /// that clean until the images are provably released — and the public stop
+    /// path must return that error rather than a generic expiry.
     #[cfg(unix)]
     #[tokio::test]
     async fn clean_stop_waits_for_the_runtime_to_release_its_disk_images() {
@@ -1202,7 +1203,11 @@ mod tests {
         let id = LocalBackend::insert_sandbox_record(pools.write(), &config)
             .await
             .unwrap();
-        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Stopped)
+        // Paused is neither terminal — so `stop()` really dispatches instead
+        // of short-circuiting — nor Running/Draining, so the local backend
+        // accepts the request without an agent round-trip. What the call
+        // returns is therefore the clean-stop wait's own verdict.
+        LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Paused)
             .await
             .unwrap();
         // A clean terminal run whose process is already gone: the image lock
@@ -1239,7 +1244,7 @@ mod tests {
         );
 
         let error = handle
-            .wait_for_clean_stop_within(std::time::Duration::from_millis(300))
+            .stop_with_timeout(std::time::Duration::from_millis(300))
             .await
             .unwrap_err();
         let message = error.to_string();
@@ -1248,9 +1253,37 @@ mod tests {
 
         drop(held);
         handle
-            .wait_for_clean_stop_within(std::time::Duration::from_millis(300))
+            .stop_with_timeout(std::time::Duration::from_millis(300))
             .await
-            .expect("released image completes the wait");
+            .expect("released image completes the stop");
+    }
+
+    #[tokio::test]
+    async fn a_zero_stop_deadline_is_rejected() {
+        let temp = tempdir().unwrap();
+        let backend = std::sync::Arc::new(
+            LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config("stop-zero"))
+            .await
+            .unwrap();
+        let model = sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = crate::sandbox::SandboxHandle::from_local_model(backend.clone(), model, None);
+
+        let error = handle
+            .stop_with_timeout(std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("zero stop deadline"), "{error}");
     }
 
     #[tokio::test]

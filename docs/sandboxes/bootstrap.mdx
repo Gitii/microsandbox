@@ -421,14 +421,31 @@ The agent and init run as root. SDK exec and PTY sessions retain the configured
 image/session user. Networking and trust-store setup remain the agent's
 responsibility; images must not enable a competing network manager.
 
-For systemd, graceful shutdown invokes the image's `/usr/bin/systemctl --no-block
-poweroff`. This uses the image's own control protocol rather than computing
-systemd realtime signals against the agent's musl libc. The image must provide
-that executable. Init owns service-stop ordering and filesystem teardown; the
-agent does not remount service disks during shutdown or send a fallback signal
-that could reboot or re-execute systemd.
+For systemd, graceful shutdown invokes the image's own `systemctl --no-block
+poweroff`. This uses the image's control protocol rather than computing systemd
+realtime signals against the agent's musl libc. The agent looks `systemctl` up
+on `PATH` first, then in `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`, so the
+image decides where it lives. An image whose PID 1 is systemd but which ships no
+`systemctl` in any of those places falls back to the realtime-signal path, with
+the reason logged to the agent log; that signal is the weaker contract, because
+musl's `SIGRTMIN+4` is glibc systemd's reboot rather than its poweroff. Init
+owns service-stop ordering and filesystem teardown; the agent does not remount
+service disks during shutdown.
 
 The host allows 120 seconds for handoff shutdown, including service stop jobs.
-If that deadline expires, forced VMM termination is recorded as a failed,
-unclean shutdown. A stopped process alone is not permission to discard or
-publish durable disks. Extra disks are not included in root snapshots.
+If that deadline expires the host terminates the VMM. The run keeps the reason
+it was being stopped for, and records the forced termination as a non-zero exit
+code with the detail on the run; a stopped process alone is not permission to
+discard or publish durable disks. Extra disks are not included in root
+snapshots. A sandbox that keeps agentd as PID 1 has no such deadline: its short
+flush window is a hint, not a verdict, and its exit stays clean.
+
+A stop is confirmed only once the SDK can take the lock on every disk image the
+sandbox attached, which is what proves the runtime let go of them. Two limits
+are worth knowing. An image that no longer exists, or that the caller cannot
+open, counts as released — nothing can be holding it, and a stop must not fail
+over an image nobody can prove anything about. A read-only attachment gives no
+evidence either: shared locks coexist, so a successful probe there says only
+that no writer holds the image. On Windows the probe is skipped entirely,
+because the parent process holds the sidecar lock for as long as it lives; an
+identity-checked reap of the VM process covers that platform instead.

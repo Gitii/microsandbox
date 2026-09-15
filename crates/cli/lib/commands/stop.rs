@@ -29,7 +29,7 @@ pub struct StopArgs {
     pub force: bool,
 
     /// Graceful shutdown deadline in seconds (default: 150). Expiry fails;
-    /// use --force to kill instead. Zero provides no grace period.
+    /// use --force to kill instead. Zero is rejected.
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
@@ -44,6 +44,9 @@ pub struct StopArgs {
 
 /// Execute the `msb stop` command.
 pub async fn run(args: StopArgs) -> anyhow::Result<()> {
+    if !args.force {
+        common::validate_stop_timeout(args.timeout)?;
+    }
     let names = common::resolve_bulk_targets(&args.names, &args.label, args.quiet).await?;
     let mut failed = false;
 
@@ -114,6 +117,11 @@ mod tests {
         let args = parse_stop_args(&["worker", "--timeout", "0"]);
         assert_eq!(args.timeout, Some(0));
         assert!(!args.force);
+        // It is not a force stop, and it is not a stop at all: no window
+        // leaves nothing to confirm.
+        let error = common::validate_stop_timeout(args.timeout).unwrap_err();
+        assert!(error.to_string().contains("zero stop deadline"), "{error}");
+        assert!(common::validate_stop_timeout(Some(30)).is_ok());
     }
 
     #[test]

@@ -505,20 +505,17 @@ impl SandboxHandle {
     /// requested. Only a shutdown this call dispatched is held to the clean-exit
     /// evidence below.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        match tokio::time::timeout(timeout, async {
-            if self.dispatch_stop().await? == StopRequest::AlreadyTerminal {
-                return Ok(());
-            }
-            self.wait_for_clean_stop_within(timeout).await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(MicrosandboxError::Runtime(format!(
-                "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
-                self.name
-            ))),
+        reject_zero_stop_deadline(timeout)?;
+        // One deadline for the whole call, taken before the request is sent.
+        // The wait owns what is left of it, so its own errors — the image a
+        // runtime has not released, the evidence it never produced — are what
+        // a caller sees instead of a generic expiry.
+        let deadline = tokio::time::Instant::now() + timeout;
+        if self.dispatch_stop().await? == StopRequest::AlreadyTerminal {
+            return Ok(());
         }
+        self.wait_for_clean_stop_within(remaining_until(deadline))
+            .await
     }
 
     /// Wait for positive evidence that the sandbox shut down cleanly, within
@@ -554,8 +551,10 @@ impl SandboxHandle {
         let disk_images = self.attached_disk_images(backend).await;
         let deadline = tokio::time::Instant::now() + bound;
         let mut runtime_exit_deadline = None;
-        let mut locked_image = None;
         loop {
+            // Recomputed every pass: an image released since the last one must
+            // not be named by the deadline error below.
+            let mut locked_image = None;
             let run = run_entity::Entity::find()
                 .filter(run_entity::Column::SandboxId.eq(local.db_id))
                 .order_by_desc(run_entity::Column::Id)
@@ -845,6 +844,21 @@ fn is_local_ephemeral_handle(inner: &SandboxHandleInner) -> bool {
         .unwrap_or(false)
 }
 
+/// Reject a zero stop deadline rather than silently failing to confirm one.
+pub(crate) fn reject_zero_stop_deadline(timeout: std::time::Duration) -> MicrosandboxResult<()> {
+    if timeout.is_zero() {
+        return Err(MicrosandboxError::InvalidConfig(
+            "a zero stop deadline cannot confirm a shutdown; use kill for a forced stop".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// What is left of `deadline`, saturating at zero.
+pub(crate) fn remaining_until(deadline: tokio::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
 /// The first disk image the stopped runtime has not released yet, if any.
 ///
 /// Windows keeps its disk locks in a sidecar file opened by the *parent*, which
@@ -868,7 +882,7 @@ fn first_locked_disk_image(images: &[(std::path::PathBuf, bool)]) -> Option<std:
     }
 }
 
-fn sandbox_status_is_terminal(status: SandboxStatus) -> bool {
+pub(crate) fn sandbox_status_is_terminal(status: SandboxStatus) -> bool {
     matches!(status, SandboxStatus::Stopped | SandboxStatus::Crashed)
 }
 

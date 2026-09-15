@@ -180,8 +180,8 @@ msb stop --label app=engine    # stop every sandbox labelled app=engine
 Graceful shutdown asks the guest to finish shutdown and waits for clean VM
 termination. An expired deadline, unreachable agent, or unclean exit fails the
 command without automatic force-kill. A failed stop does not confirm that disks
-can be safely removed. `--timeout 0` provides no grace period; it is not a force
-stop.
+can be safely removed. `--timeout 0` is rejected: no window leaves nothing to
+confirm, and `--force` is how a forced stop is requested.
 
 `--force` explicitly kills the VM. Pending writes may be lost, with the same
 durability semantics as a sudden power loss on a physical machine.
@@ -190,7 +190,7 @@ durability semantics as a sudden power loss on a physical machine.
 |------|-------------|
 | `--label` | Stop every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
 | `-f`, `--force` | Force terminate immediately. Pending writes may be lost |
-| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without automatic force-kill |
+| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without automatic force-kill. Zero is rejected |
 | `-q`, `--quiet` | Suppress progress output |
 
 ## msb restart
@@ -211,7 +211,7 @@ msb restart -t 30 devbox
 |------|-------------|
 | `--label` | Restart every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
 | `-f`, `--force` | Force terminate immediately before starting again. Pending writes may be lost |
-| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without restarting |
+| `-t`, `--timeout` | Graceful shutdown deadline in seconds. Defaults to 150; expiry fails without restarting. Zero is rejected |
 | `-q`, `--quiet` | Suppress progress output |
 
 ## msb ping

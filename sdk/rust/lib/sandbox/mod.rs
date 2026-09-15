@@ -807,48 +807,80 @@ impl Sandbox {
     }
 
     /// Stop gracefully within a deadline, without automatically killing the VM.
+    ///
+    /// A sandbox that was already terminal before the call returns `Ok`,
+    /// whether or not this process owns its lifecycle. Otherwise one deadline
+    /// covers the whole call and the clean-stop wait owns what is left of it,
+    /// so its specific errors reach the caller.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        match tokio::time::timeout(timeout, async {
-            if self.owns_lifecycle() {
-                self.request_stop().await?;
-                let status = self.wait().await?;
-                if !status.success() {
+        handle::reject_zero_stop_deadline(timeout)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        if self.owns_lifecycle() {
+            let handle = match self
+                .backend
+                .sandboxes()
+                .get(self.backend.clone(), &self.name)
+                .await
+            {
+                Ok(handle) => Some(handle),
+                // An ephemeral sandbox the runtime already self-cleaned is
+                // terminal by definition.
+                Err(error)
+                    if self.is_local_ephemeral()
+                        && sandbox_not_found_for_name(&error, &self.name) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(ref handle) = handle
+                && handle::sandbox_status_is_terminal(handle.status_snapshot())
+            {
+                return Ok(());
+            }
+
+            self.request_stop().await?;
+            // The process wait is the one step the clean-stop helper cannot
+            // bound for us, so it carries the deadline directly.
+            let status = match tokio::time::timeout_at(deadline, self.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
                     return Err(crate::MicrosandboxError::Runtime(format!(
-                        "sandbox '{}' exited uncleanly: {status}",
+                        "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
                         self.name
                     )));
                 }
-                if !self.is_local_ephemeral() {
-                    let handle = self
-                        .backend
-                        .sandboxes()
-                        .get(self.backend.clone(), &self.name)
-                        .await?;
-                    handle.wait_for_clean_stop_within(timeout).await?;
-                }
-                Ok(())
-            } else {
-                let handle = self
-                    .backend
-                    .sandboxes()
-                    .get(self.backend.clone(), &self.name)
-                    .await?;
-                if handle.dispatch_stop().await? == handle::StopRequest::AlreadyTerminal {
-                    // Already terminal before we asked: nothing was requested
-                    // here, so there is no shutdown of ours to confirm.
-                    return Ok(());
-                }
-                handle.wait_for_clean_stop_within(timeout).await
+            };
+            if !status.success() {
+                return Err(crate::MicrosandboxError::Runtime(format!(
+                    "sandbox '{}' exited uncleanly: {status}",
+                    self.name
+                )));
             }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(crate::MicrosandboxError::Runtime(format!(
-                "graceful stop deadline expired for sandbox '{}'; clean shutdown is unconfirmed",
-                self.name
-            ))),
+            if !self.is_local_ephemeral()
+                && let Some(handle) = handle
+            {
+                handle
+                    .wait_for_clean_stop_within(handle::remaining_until(deadline))
+                    .await?;
+            }
+            return Ok(());
         }
+
+        let handle = self
+            .backend
+            .sandboxes()
+            .get(self.backend.clone(), &self.name)
+            .await?;
+        if handle.dispatch_stop().await? == handle::StopRequest::AlreadyTerminal {
+            // Already terminal before we asked: nothing was requested here, so
+            // there is no shutdown of ours to confirm.
+            return Ok(());
+        }
+        handle
+            .wait_for_clean_stop_within(handle::remaining_until(deadline))
+            .await
     }
 
     /// Stop the sandbox gracefully and wait for the process to exit.

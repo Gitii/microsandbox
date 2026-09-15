@@ -1806,6 +1806,20 @@ fn apply_network_opts(
 
 // --- Parsing helpers ---
 
+/// Reject `--timeout 0` on a graceful stop.
+///
+/// Zero leaves no window in which a shutdown could be confirmed, and a stop
+/// that cannot confirm one is not a stop. `--force` is how a caller asks for
+/// termination without grace.
+pub fn validate_stop_timeout(timeout_secs: Option<u64>) -> anyhow::Result<()> {
+    if timeout_secs == Some(0) {
+        anyhow::bail!(
+            "a zero stop deadline cannot confirm a shutdown; use --force for a forced stop"
+        );
+    }
+    Ok(())
+}
+
 /// Parse a duration string (e.g., "30s", "5m", "1h") into seconds.
 pub fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();

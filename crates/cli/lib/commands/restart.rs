@@ -53,6 +53,9 @@ enum RestartAction {
 
 /// Execute the `msb restart` command.
 pub async fn run(args: RestartArgs) -> anyhow::Result<()> {
+    if !args.force {
+        common::validate_stop_timeout(args.timeout)?;
+    }
     let names = common::resolve_bulk_targets(&args.names, &args.label, args.quiet).await?;
     let mut failed = false;
 

@@ -203,8 +203,29 @@ mod linux {
         fs::create_dir_all("/var")?;
         match fs::symlink_metadata("/var/run") {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                if fs::canonicalize("/var/run")? != Path::new("/run") {
-                    return Err(AgentdError::Init("/var/run must resolve to /run".into()));
+                match fs::canonicalize("/var/run") {
+                    Ok(target) if target == Path::new("/run") => {}
+                    // A symlink that resolves somewhere else would send
+                    // /var/run writes outside the tmpfs the guest and a later
+                    // systemd handoff share. That is the image disagreeing
+                    // with us about where runtime state lives, so it stops
+                    // the boot.
+                    Ok(target) => {
+                        return Err(AgentdError::Init(format!(
+                            "/var/run must resolve to /run, not {}",
+                            target.display()
+                        )));
+                    }
+                    // Dangling: the image shipped the link before anything
+                    // created its target, which is ordinary in a snapshot
+                    // taken with /run empty. Re-point it at the tmpfs rather
+                    // than failing a boot over a link we would have created
+                    // ourselves had it been absent.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        fs::remove_file("/var/run")?;
+                        unix_fs::symlink("/run", "/var/run")?;
+                    }
+                    Err(err) => return Err(err.into()),
                 }
             }
             Ok(_) => {

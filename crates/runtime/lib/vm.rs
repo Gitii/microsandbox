@@ -418,11 +418,25 @@ pub(crate) struct RunTermination {
 /// observer has not started; once the observer starts, the verdict is frozen
 /// at what it read and a late wake changes nothing.
 ///
-/// This is deliberately *not* a termination reason: the reason still carries
-/// why the sandbox was being stopped (idle, parent exit, startup command),
-/// and the forced flag only says the guest failed to power off in time.
+/// This is deliberately *not* a termination reason. Every reason survives a
+/// forced exit unchanged — the run still records why the sandbox was being
+/// stopped, be it a shutdown request, an idle timeout, a departed parent or a
+/// failed startup command — and the forced exit is carried by a non-zero exit
+/// code and `run.termination_detail` instead.
+///
+/// Only a handoff sandbox arms one. An agentd-as-PID-1 guest gets the short
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`] window, which has always been a hint
+/// rather than a deadline: it is routinely shorter than a clean poweroff and
+/// its expiry is not evidence of anything. A disarmed `ForcedExit` never
+/// records a forced exit, so those sandboxes keep exactly their old
+/// behaviour — exit code 0, no detail, no forced process exit.
+///
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`]: microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
 #[derive(Debug)]
-struct ForcedExit(std::sync::atomic::AtomicU8);
+struct ForcedExit {
+    state: std::sync::atomic::AtomicU8,
+    armed: bool,
+}
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -438,30 +452,37 @@ impl ForcedExit {
     /// The exit observer is running; the verdict is frozen.
     const OBSERVED: u8 = 2;
 
-    fn new() -> Self {
-        Self(std::sync::atomic::AtomicU8::new(Self::PENDING))
+    /// `armed` is whether this sandbox hands PID 1 to a guest init, the only
+    /// mode whose grace window is a real deadline.
+    fn new(armed: bool) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(Self::PENDING),
+            armed,
+        }
     }
 
     /// Record that a grace window expired and the host is forcing the exit.
     ///
-    /// Returns `false` when the observer has already started — the guest
-    /// powered off on its own and this wake lost the race — or when another
-    /// sleeper already recorded the forced exit.
+    /// Returns `false` when this sandbox arms no forced exit, when the
+    /// observer has already started — the guest powered off on its own and
+    /// this wake lost the race — or when another sleeper got there first.
     fn force(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::PENDING,
-                Self::FORCED,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
+        self.armed
+            && self
+                .state
+                .compare_exchange(
+                    Self::PENDING,
+                    Self::FORCED,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
     }
 
     /// Called by the exit observer as its first act. Freezes the state and
     /// reports whether an expired deadline forced this exit.
     fn observer_started(&self) -> bool {
-        self.0
+        self.state
             .swap(Self::OBSERVED, std::sync::atomic::Ordering::SeqCst)
             == Self::FORCED
     }
@@ -571,7 +592,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    let shutdown_flush_timeout = guest_shutdown_flush_timeout(has_handoff_init(&config.vm.env));
+    let handoff_init = has_handoff_init(&config.vm.env);
+    let shutdown_flush_timeout = guest_shutdown_flush_timeout(handoff_init);
 
     // Create console shared state (ring buffers + wake pipes).
     let shared = Arc::new(ConsoleSharedState::new());
@@ -668,8 +690,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     // Set when a grace window expires and the host forces the exit. Kept
     // apart from the reason tag so the original cause (idle, parent exit,
-    // startup command) survives into the persisted run.
-    let forced_exit = Arc::new(ForcedExit::new());
+    // startup command) survives into the persisted run. Armed only for a
+    // handoff guest, whose window is a real deadline.
+    let forced_exit = Arc::new(ForcedExit::new(handoff_init));
 
     // Activate the shared-memory metrics writer if the host reserved a slot.
     // The host always reserves and passes a handoff when sampling is enabled,
@@ -746,10 +769,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             let reason = match reason_tag {
                 EXIT_REASON_IDLE_TIMEOUT => run_entity::TerminationReason::IdleTimeout,
                 EXIT_REASON_AGENT_UNRESPONSIVE => run_entity::TerminationReason::AgentUnresponsive,
-                EXIT_REASON_SHUTDOWN_REQUESTED if exit_code == 0 => {
-                    run_entity::TerminationReason::ShutdownRequested
-                }
-                EXIT_REASON_SHUTDOWN_REQUESTED => run_entity::TerminationReason::Failed,
+                EXIT_REASON_SHUTDOWN_REQUESTED => run_entity::TerminationReason::ShutdownRequested,
                 EXIT_REASON_STARTUP_COMMAND_FAILED => run_entity::TerminationReason::Failed,
                 EXIT_REASON_MAX_DURATION => run_entity::TerminationReason::MaxDurationExceeded,
                 EXIT_REASON_PARENT_EXIT => run_entity::TerminationReason::Signal,
@@ -2779,8 +2799,21 @@ mod tests {
     }
 
     #[test]
+    fn forced_exit_stays_disarmed_without_a_handoff_init() {
+        let forced = super::ForcedExit::new(false);
+        assert!(
+            !forced.force(),
+            "an agentd-as-PID-1 sandbox records no forced exit"
+        );
+        assert!(
+            !forced.observer_started(),
+            "so its exit stays clean, exactly as before"
+        );
+    }
+
+    #[test]
     fn forced_exit_records_an_expired_deadline() {
-        let forced = super::ForcedExit::new();
+        let forced = super::ForcedExit::new(true);
         assert!(forced.force(), "the first expired deadline forces the exit");
         assert!(!forced.force(), "a second sleeper adds nothing");
         assert!(
@@ -2791,7 +2824,7 @@ mod tests {
 
     #[test]
     fn forced_exit_ignores_a_sleeper_that_lost_the_race() {
-        let forced = super::ForcedExit::new();
+        let forced = super::ForcedExit::new(true);
         assert!(
             !forced.observer_started(),
             "a guest that powered off on its own is a clean exit"

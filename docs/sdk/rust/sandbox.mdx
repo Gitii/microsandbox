@@ -664,7 +664,7 @@ Gracefully shut down the sandbox within 150 seconds. Deadline expiry, an unreach
 async fn stop_with_timeout(&self, timeout: Duration) -> MicrosandboxResult<()>
 ```
 
-Gracefully shut down within an explicit deadline covering request delivery and exit observation. Expiry or unclean exit returns an error. `Duration::ZERO` provides no grace period and does not force-kill.
+Gracefully shut down within an explicit deadline covering request delivery and exit observation. Expiry or unclean exit returns an error. `Duration::ZERO` is rejected: it leaves no window in which a shutdown could be confirmed — use `kill()` for a forced stop.
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop_and_wait()</span>
 
@@ -2203,7 +2203,7 @@ A lightweight handle to an existing sandbox (running or stopped). Obtained via [
 | start_detached() | `Result<`[`Sandbox`](#instance-methods)`>` | Start in detached mode |
 | status() | [`SandboxStatus`](#sandboxstatus) | Current status |
 | stop() | `Result<()>` | Gracefully shut down within 150 seconds; expiry or unclean exit returns an error without automatic force-kill |
-| stop_with_timeout(timeout) | `Result<()>` | Same as `stop()` with an explicit deadline; `Duration::ZERO` provides no grace period |
+| stop_with_timeout(timeout) | `Result<()>` | Same as `stop()` with an explicit deadline; `Duration::ZERO` is rejected |
 | touch() | `Result<`[`SandboxTouchResult`](#sandboxtouchresult)`>` | Explicitly refresh the sandbox idle timer |
 | updated_at() | `Option<DateTime<Utc>>` | Last update timestamp |
 | wait_until_stopped() | `Result<`[`SandboxStopResult`](#sandboxstopresult)`>` | Block until terminal state is observed |

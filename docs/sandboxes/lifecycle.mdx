@@ -104,8 +104,13 @@ requesting anything: stop stays idempotent, and a call that requested no
 shutdown does not judge the previous one. The clean-exit evidence below applies
 only to a shutdown the call itself requested.
 
-Local detached or reconnected handles require recorded clean run termination and
-an exited VM process; a `Stopped` row alone is insufficient. Cloud stop observes
+Local detached or reconnected handles require recorded clean run termination, an
+exited VM process, and every attached disk image released; a `Stopped` row alone
+is insufficient. The image check takes each attachment's lock the way the next
+boot would, so an image that cannot be opened or no longer exists counts as
+released, and a read-only attachment proves only that no writer holds it.
+A zero deadline is rejected: it leaves no window in which a shutdown could be
+confirmed, and `kill()` is how a forced stop is requested. Cloud stop observes
 the service's stopped state and does not provide local guest-filesystem proof.
 Rust `stop_and_wait()` requires lifecycle ownership and returns an actual process
 exit status; use `stop()` for a reconnected handle.

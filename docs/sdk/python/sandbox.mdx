@@ -866,7 +866,7 @@ Gracefully shut down within 150 seconds by default; pass `timeout` to override t
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>timeout</code><span className="msb-type">float | None</span></div>
-    <div className="msb-param-desc">Graceful shutdown deadline in seconds. <code>None</code> uses the 150-second default. Expiry raises an error; <code>0</code> provides no grace period and does not force-kill.</div>
+    <div className="msb-param-desc">Graceful shutdown deadline in seconds. <code>None</code> uses the 150-second default. Expiry raises an error; <code>0</code> is rejected.</div>
   </div>
 </div>
 
