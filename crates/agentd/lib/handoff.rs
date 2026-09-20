@@ -58,7 +58,21 @@ const SYSTEMCTL_FALLBACK_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sb
 /// systemd's private control socket. `systemctl` connects to this (or to the
 /// system bus, which appears later still), so until it exists no shutdown
 /// request can be delivered to the manager.
+///
+/// It cannot be stale: `init::mount_run` mounts /run as a fresh tmpfs before
+/// the handoff, so nothing an earlier boot wrote survives into this one.
 const SYSTEMD_CONTROL_SOCKET: &str = "/run/systemd/private";
+
+/// The signal number systemd reads as "power off", named rather than computed.
+///
+/// systemd documents this as `SIGRTMIN+4` (systemd(1), SIGNALS) and resolves it
+/// against its own libc, which is glibc in every image we boot: glibc reserves
+/// two realtime signals and starts at 34, so poweroff is 38 and reboot is 39.
+/// agentd is a static musl binary and musl reserves three, starting at 35, so
+/// `libc::SIGRTMIN() + 4` here is 39 — systemd's *reboot*, which brings the
+/// guest back up instead of letting the VM exit. The raw number is the only
+/// thing both sides agree on.
+const SYSTEMD_POWEROFF_SIGNAL: i32 = 38;
 
 /// How long a shutdown request waits for systemd to be able to take it.
 ///
@@ -70,8 +84,9 @@ const SYSTEMD_CONTROL_SOCKET: &str = "/run/systemd/private";
 /// not opened its control socket in 30 seconds is broken, not slow.
 const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How often the wait above looks for the socket. systemd offers nothing to
-/// wait on before the socket exists, so the wait polls.
+/// How often the wait above looks for the socket. Polling rather than an
+/// inotify watch on /run and then /run/systemd: the wait is a few hundred
+/// milliseconds once and a two-level watch is more moving parts than it saves.
 const SYSTEMD_CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 //--------------------------------------------------------------------------------------------------
@@ -383,59 +398,104 @@ fn is_executable_file(path: &Path) -> bool {
 /// Ask the image's init to power off without forcing running services down.
 ///
 /// systemd's control client belongs to the image: it knows its manager's
-/// shutdown protocol independently of agentd's libc. In particular, musl's
-/// SIGRTMIN+4 is glibc systemd's reboot signal, not its poweroff signal.
-/// Other init implementations retain the existing realtime-signal contract.
-pub fn signal_init_shutdown() -> AgentdResult<()> {
+/// shutdown protocol independently of agentd's libc, so `systemctl` is the
+/// route taken whenever the manager can be reached. Every other init keeps the
+/// realtime-signal contract agentd defines in its own terms.
+///
+/// PID 1 is read from `/proc/1/comm` rather than from the configured handoff
+/// spec: `auto` and `/sbin/init` both resolve to systemd without naming it, and
+/// what PID 1 turned out to be is the only thing that decides how it is asked.
+pub async fn signal_init_shutdown() -> AgentdResult<()> {
     let init_name = std::fs::read_to_string("/proc/1/comm")?;
     if init_name.trim() == "systemd" {
-        // Delivery, not politeness: systemctl exits non-zero when the manager
-        // is not listening yet, which used to lose the request entirely and
-        // leave the host to kill the VM two minutes later.
-        if !wait_for_control_socket(Path::new(SYSTEMD_CONTROL_SOCKET), SYSTEMD_CONTROL_WAIT) {
-            eprintln!(
-                "agentd: systemd is PID 1 but opened no control socket at {} within {}s; \
-                 falling back to the realtime-signal shutdown",
-                SYSTEMD_CONTROL_SOCKET,
-                SYSTEMD_CONTROL_WAIT.as_secs()
-            );
-            return signal_pid_1_shutdown();
-        }
-        match find_systemctl() {
-            Some(systemctl) => {
-                let status = process::Command::new(&systemctl)
-                    .args(["--no-block", "poweroff"])
-                    .status()
-                    .map_err(|e| AgentdError::Init(format!("request systemd poweroff: {e}")))?;
-                if !status.success() {
-                    return Err(AgentdError::Init(format!(
-                        "systemd rejected poweroff request: {status}"
-                    )));
-                }
-                return Ok(());
-            }
-            None => {
-                // The image says systemd is PID 1 but ships no control
-                // client we can find. The realtime signal is the weaker
-                // contract (musl's SIGRTMIN+4 is glibc systemd's reboot,
-                // not its poweroff) but it is the only route left.
-                eprintln!(
-                    "agentd: systemd is PID 1 but no systemctl was found on PATH or in {}; \
-                     falling back to the realtime-signal shutdown",
-                    SYSTEMCTL_FALLBACK_DIRS.join(", ")
-                );
-            }
-        }
+        return request_systemd_poweroff().await;
     }
-    signal_pid_1_shutdown()
+    signal_pid_1(generic_init_poweroff_signal())
 }
 
-/// The realtime-signal shutdown contract every other init keeps, and the only
-/// route left when systemd's control client cannot be reached.
-fn signal_pid_1_shutdown() -> AgentdResult<()> {
-    let sig = libc::SIGRTMIN() + 4;
+/// Asks systemd to power off, and never returns without having asked.
+///
+/// Every route out of here either delivered the request to the manager or sent
+/// it [`SYSTEMD_POWEROFF_SIGNAL`]: a request that is merely reported as failed
+/// leaves the host to kill the VM when its flush window runs out, which is a
+/// forced exit the caller records as an unclean shutdown.
+async fn request_systemd_poweroff() -> AgentdResult<()> {
+    if !wait_for_control_socket(Path::new(SYSTEMD_CONTROL_SOCKET), SYSTEMD_CONTROL_WAIT).await {
+        eprintln!(
+            "agentd: systemd is PID 1 but opened no control socket at {} within {}s; \
+             falling back to the poweroff signal",
+            SYSTEMD_CONTROL_SOCKET,
+            SYSTEMD_CONTROL_WAIT.as_secs()
+        );
+        return signal_pid_1(SYSTEMD_POWEROFF_SIGNAL);
+    }
+    let Some(systemctl) = find_systemctl() else {
+        // The image says systemd is PID 1 but ships no control client we can
+        // find. The signal carries less than `systemctl` does — no job mode,
+        // no reply — but it is the only route left.
+        eprintln!(
+            "agentd: systemd is PID 1 but no systemctl was found on PATH or in {}; \
+             falling back to the poweroff signal",
+            SYSTEMCTL_FALLBACK_DIRS.join(", ")
+        );
+        return signal_pid_1(SYSTEMD_POWEROFF_SIGNAL);
+    };
+    match run_systemctl_poweroff(&systemctl).await {
+        Ok(0) => Ok(()),
+        Ok(code) => {
+            eprintln!(
+                "agentd: {} --no-block poweroff exited {code}; \
+                 falling back to the poweroff signal",
+                systemctl.display()
+            );
+            signal_pid_1(SYSTEMD_POWEROFF_SIGNAL)
+        }
+        Err(error) => {
+            eprintln!(
+                "agentd: could not run {} --no-block poweroff: {error}; \
+                 falling back to the poweroff signal",
+                systemctl.display()
+            );
+            signal_pid_1(SYSTEMD_POWEROFF_SIGNAL)
+        }
+    }
+}
+
+/// Runs `systemctl --no-block poweroff` and answers with its exit code.
+///
+/// Spawned through the process manager, which owns `waitpid(-1, ...)` for this
+/// process: waiting on the child here would race its reaper for the status and
+/// usually lose. The call is off the agent's thread for the same reason it is
+/// bounded at all — `systemctl` talks to systemd over sd-bus, which can sit on
+/// a method call for its own timeout, and the agent loop must keep serving the
+/// host meanwhile.
+async fn run_systemctl_poweroff(systemctl: &Path) -> AgentdResult<i32> {
+    let manager = crate::process::ProcessManager::get()?;
+    let watcher = {
+        let guard = manager.spawn_guard()?;
+        let child = process::Command::new(systemctl)
+            .args(["--no-block", "poweroff"])
+            .spawn()
+            .map_err(|e| AgentdError::Init(format!("spawn systemd poweroff: {e}")))?;
+        guard.track(child.id() as i32)?
+    };
+    Ok(watcher.await)
+}
+
+/// The realtime signal a non-systemd handoff init is asked to power off with.
+///
+/// Computed with agentd's own libc on purpose: this contract is agentd's, and
+/// the init on the other side of it — `crates/test-init` — is built from this
+/// workspace against the same musl. systemd is the init that does not share
+/// agentd's libc, and it is asked by number above instead.
+fn generic_init_poweroff_signal() -> i32 {
+    libc::SIGRTMIN() + 4
+}
+
+/// Sends `signum` to PID 1.
+fn signal_pid_1(signum: i32) -> AgentdResult<()> {
     // SAFETY: kill(2) is signal-safe and pid=1 is always valid.
-    let ret = unsafe { libc::kill(1, sig) };
+    let ret = unsafe { libc::kill(1, signum) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -446,10 +506,10 @@ fn signal_pid_1_shutdown() -> AgentdResult<()> {
 ///
 /// Returns as soon as the socket is there; a path that exists as something
 /// else is not one, so a leftover file cannot pass for a listening manager.
-fn wait_for_control_socket(path: &Path, timeout: std::time::Duration) -> bool {
+async fn wait_for_control_socket(path: &Path, timeout: std::time::Duration) -> bool {
     use std::os::unix::fs::FileTypeExt;
 
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if std::fs::metadata(path)
             .map(|metadata| metadata.file_type().is_socket())
@@ -457,11 +517,11 @@ fn wait_for_control_socket(path: &Path, timeout: std::time::Duration) -> bool {
         {
             return true;
         }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             return false;
         }
-        std::thread::sleep(SYSTEMD_CONTROL_POLL.min(left));
+        tokio::time::sleep(SYSTEMD_CONTROL_POLL.min(left)).await;
     }
 }
 
@@ -552,24 +612,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn control_socket_wait_returns_when_the_socket_is_already_there() {
+    #[tokio::test]
+    async fn control_socket_wait_returns_when_the_socket_is_already_there() {
         let dir = unique_test_dir("control-present");
         let socket = dir.join("private");
         let listener =
             std::os::unix::net::UnixListener::bind(&socket).expect("bind control socket");
 
-        assert!(wait_for_control_socket(
-            &socket,
-            std::time::Duration::from_secs(5)
-        ));
+        assert!(wait_for_control_socket(&socket, std::time::Duration::from_secs(5)).await);
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn control_socket_wait_returns_when_the_socket_appears() {
+    #[tokio::test]
+    async fn control_socket_wait_returns_when_the_socket_appears() {
         let dir = unique_test_dir("control-late");
         let socket = dir.join("private");
         let late = socket.clone();
@@ -578,33 +635,47 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&late).expect("bind control socket")
         });
 
-        assert!(wait_for_control_socket(
-            &socket,
-            std::time::Duration::from_secs(5)
-        ));
+        assert!(wait_for_control_socket(&socket, std::time::Duration::from_secs(5)).await);
 
         drop(manager.join().expect("manager thread"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn control_socket_wait_gives_up_and_never_takes_a_file_for_a_manager() {
+    #[tokio::test]
+    async fn control_socket_wait_gives_up_after_its_timeout() {
         let dir = unique_test_dir("control-absent");
         let missing = dir.join("private");
+
+        let started = std::time::Instant::now();
+        assert!(!wait_for_control_socket(&missing, std::time::Duration::from_millis(200)).await);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn control_socket_wait_never_takes_a_regular_file_for_a_manager() {
+        let dir = unique_test_dir("control-regular");
         let regular = dir.join("not-a-socket");
         std::fs::write(&regular, b"leftover").expect("write regular file");
 
-        let started = std::time::Instant::now();
-        assert!(!wait_for_control_socket(
-            &missing,
-            std::time::Duration::from_millis(200)
-        ));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
-        assert!(!wait_for_control_socket(
-            &regular,
-            std::time::Duration::from_millis(100)
-        ));
+        assert!(!wait_for_control_socket(&regular, std::time::Duration::from_millis(100)).await);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The number systemd reads as poweroff, and the one agentd's own libc
+    /// would have computed for it. They differ, which is the whole point of
+    /// naming the systemd signal outright: musl starts its realtime range one
+    /// signal above glibc, so the computed value is systemd's reboot.
+    #[test]
+    fn systemd_poweroff_signal_is_not_what_agentds_libc_computes() {
+        assert_eq!(SYSTEMD_POWEROFF_SIGNAL, 38);
+        if cfg!(target_env = "musl") {
+            assert_eq!(generic_init_poweroff_signal(), 39);
+            assert_ne!(generic_init_poweroff_signal(), SYSTEMD_POWEROFF_SIGNAL);
+        } else {
+            assert_eq!(generic_init_poweroff_signal(), SYSTEMD_POWEROFF_SIGNAL);
+        }
     }
 }
