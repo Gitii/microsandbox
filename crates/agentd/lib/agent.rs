@@ -1274,7 +1274,7 @@ async fn request_guest_poweroff(config: &AgentdConfig) -> AgentdResult<()> {
     // The image init owns service ordering and filesystem teardown. In
     // particular, never remount a Docker disk while its service is stopping.
     // The host records a failed shutdown if init does not power off in time.
-    crate::handoff::signal_init_shutdown(config.handoff_init.as_deref()).await
+    crate::handoff::signal_init_shutdown(config.handoff_init_path.as_deref()).await
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1329,7 +1329,7 @@ mod tests {
         let config = AgentdConfig {
             user: None,
             security_profile: Default::default(),
-            handoff_init: None,
+            handoff_init_path: None,
         };
         let mut activity = ActivityTracker::new();
         let mut out = Vec::new();

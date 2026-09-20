@@ -83,11 +83,12 @@ const SYSTEMD_POWEROFF_SIGNAL: i32 = 38;
 /// Spent out of the same budget as the stop jobs. The host allows a handoff
 /// guest `HANDOFF_SHUTDOWN_FLUSH_TIMEOUT` — 120 seconds, documented as room for
 /// systemd's 90-second default service stop deadline — and the host may be told
-/// to allow less (`MSB_SHUTDOWN_FLUSH_TIMEOUT_MS`), which agentd cannot see. So
-/// this and [`SYSTEMD_POWEROFF_CALL_TIMEOUT`] together stay well under the 30
-/// seconds that budget has to spare, and a guest whose systemd has not opened
-/// its control socket in 10 seconds is broken rather than slow: the measured
-/// wait on a real boot is about 300 milliseconds.
+/// to allow less (`MSB_SHUTDOWN_FLUSH_TIMEOUT_MS`), which agentd cannot see.
+/// The whole systemd route is [`INIT_EXEC_WAIT`] plus this plus
+/// [`SYSTEMD_POWEROFF_CALL_TIMEOUT`] — 3 + 10 + 10 — which leaves systemd's 90
+/// its own and seven seconds of the host's window spare. A guest whose systemd
+/// has not opened its control socket in 10 seconds is broken rather than slow:
+/// the measured wait on a real boot is about 300 milliseconds.
 const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long `systemctl` is given to hand the request over.
@@ -113,12 +114,15 @@ const SYSTEMD_CONTROL_POLL: std::time::Duration = std::time::Duration::from_mill
 /// under its own name for the first tens of milliseconds, and a shutdown
 /// decided there asks the wrong thing of the wrong process.
 ///
-/// Only a script init waits, because only a script init is going to change
-/// into something else; a compiled init is the answer already and pays
-/// nothing. Three seconds against a measured forty milliseconds, and it comes
-/// out of the same budget as everything else on this path: three here, ten
-/// waiting for systemd's socket, ten for the `systemctl` call and systemd's
-/// own ninety-second stop deadline still leave the host's 120 with room.
+/// Only a script init waits, because only a script init is on its way to being
+/// something else; an init that is a binary does not wait. Three seconds
+/// against a measured forty milliseconds, and it comes out of the same budget
+/// as everything else on this path: three here, ten waiting for systemd's
+/// socket, ten for the `systemctl` call, and systemd's own ninety-second stop
+/// deadline, inside the host's 120 — which
+/// `MSB_SHUTDOWN_FLUSH_TIMEOUT_MS` can shorten without agentd knowing. The
+/// generic route is not additive with the two below: it is the other branch,
+/// and costs this wait plus [`GENERIC_SIGNAL_WINDOW`].
 const INIT_EXEC_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often that wait looks at PID 1. An exec is not something a process can
@@ -138,13 +142,107 @@ const GENERIC_SIGNAL_WINDOW: std::time::Duration = std::time::Duration::from_sec
 /// How often that route repeats itself, within the window above.
 const GENERIC_SIGNAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Where PID 1's current program name is read from.
+/// Where PID 1's current program name is read from. A name is what the wait
+/// below watches; it is never what the route is decided on.
 const PID_1_COMM: &str = "/proc/1/comm";
+
+/// Where the program PID 1 is actually running is read from. A symlink to the
+/// binary itself: `/sbin/init` resolves through it, and it is right from the
+/// instant of the `execve` rather than from whenever the program gets around
+/// to naming itself.
+const PID_1_EXE: &str = "/proc/1/exe";
+
+/// The file name systemd's own binary has, wherever an image keeps it —
+/// `/usr/lib/systemd/systemd`, `/lib/systemd/systemd`. What
+/// [`InitPaths::route`] compares the resolved `/proc/1/exe` against.
+const SYSTEMD_PROGRAM: &str = "systemd";
+
+/// What the kernel appends to `/proc/<pid>/exe` when the binary has been
+/// replaced or removed under the running process, as a package upgrade does.
+const DELETED_SUFFIX: &str = " (deleted)";
 
 /// What the kernel keeps of a program's name: 16 bytes including the NUL, so
 /// `distributed-init` is `distributed-ini` in `/proc/1/comm`. Compared against
 /// the same truncation of the init agentd exec'd, never the whole name.
 const COMM_LEN: usize = 15;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Which of the two shutdown contracts this guest's PID 1 keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownRoute {
+    /// systemd, asked through its own control client.
+    Systemd,
+
+    /// Anything else, asked with the realtime signal agentd defines.
+    Generic,
+}
+
+/// Where PID 1's identity is read from: `/proc/1` in a guest, and files a test
+/// writes somewhere else.
+#[derive(Debug, Clone)]
+pub(crate) struct InitPaths {
+    /// The program name PID 1 currently carries.
+    comm: PathBuf,
+
+    /// The symlink to the program PID 1 is running.
+    exe: PathBuf,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl InitPaths {
+    /// The real ones.
+    pub(crate) fn pid_1() -> Self {
+        Self {
+            comm: PathBuf::from(PID_1_COMM),
+            exe: PathBuf::from(PID_1_EXE),
+        }
+    }
+
+    /// The route PID 1 keeps, read from the program it is running.
+    ///
+    /// The program, not the name: between `execve` and systemd naming itself,
+    /// `/proc/1/comm` reads `init` — the file name of the `/sbin/init` symlink
+    /// the image exec'd — while `/proc/1/exe` already resolves to systemd's own
+    /// binary. A route decided on the name in that window is decided wrong, and
+    /// the wrong answer is the realtime signal, which systemd reads as reboot.
+    ///
+    /// A name is still the last resort: an unreadable `/proc/1/exe` is said
+    /// out loud rather than quietly taken for "not systemd".
+    pub(crate) fn route(&self) -> ShutdownRoute {
+        match std::fs::read_link(&self.exe) {
+            Ok(program) => {
+                let name =
+                    program
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| match name.strip_suffix(DELETED_SUFFIX) {
+                            Some(replaced) => replaced,
+                            None => name,
+                        });
+                match name {
+                    Some(SYSTEMD_PROGRAM) => ShutdownRoute::Systemd,
+                    _ => ShutdownRoute::Generic,
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "agentd: cannot read {}: {error}; falling back to PID 1's name",
+                    self.exe.display()
+                );
+                match read_comm(&self.comm).as_deref() {
+                    Ok(SYSTEMD_PROGRAM) => ShutdownRoute::Systemd,
+                    _ => ShutdownRoute::Generic,
+                }
+            }
+        }
+    }
+}
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -454,26 +552,24 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Which of the two shutdown contracts this guest's PID 1 keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShutdownRoute {
-    /// systemd, asked through its own control client.
-    Systemd,
-
-    /// Anything else, asked with the realtime signal agentd defines.
-    Generic,
-}
-
 /// Ask the image's init to power off without forcing running services down.
 ///
 /// systemd's control client belongs to the image: it knows its manager's
 /// shutdown protocol independently of agentd's libc, so `systemctl` is the
 /// route taken whenever the manager can be reached. Every other init keeps the
-/// realtime-signal contract agentd defines in its own terms.
+/// realtime-signal contract agentd defines in its own terms — which today is
+/// `crates/test-init`'s contract, not a universal one: busybox init, for
+/// instance, reads SIGUSR2 as poweroff and would need its own arm.
 pub async fn signal_init_shutdown(handoff_init: Option<&Path>) -> AgentdResult<()> {
-    match shutdown_route(handoff_init, Path::new(PID_1_COMM), INIT_EXEC_WAIT).await? {
+    let pid_1 = InitPaths::pid_1();
+    let route = shutdown_route(handoff_init, &pid_1, INIT_EXEC_WAIT).await;
+    // The one line the host keeps: agentd's stderr goes to a file inside a
+    // guest that is about to stop existing, and which route a shutdown took is
+    // the first thing anybody asks when a VM had to be killed instead.
+    log_to_console(&format!("agentd: shutdown route: {route:?}"));
+    match route {
         ShutdownRoute::Systemd => request_systemd_poweroff().await,
-        ShutdownRoute::Generic => signal_generic_init().await,
+        ShutdownRoute::Generic => signal_generic_init(&pid_1).await,
     }
 }
 
@@ -483,25 +579,34 @@ pub async fn signal_init_shutdown(handoff_init: Option<&Path>) -> AgentdResult<(
 /// question: is the process in `/proc/1` still that one? A shutdown can arrive
 /// while an image's script init is between masking its units and `exec`ing
 /// systemd — our own image's does exactly that — and a route chosen then is
-/// chosen on a name that is about to change. So a script init is given a
-/// moment to become what it execs.
+/// chosen on a process that is about to be replaced. So a script init is given
+/// a moment to become what it execs.
 ///
-/// Only a script waits. An init that is a binary is the init this guest has,
-/// and making every stop of a busybox or a test init wait for a change that is
-/// never coming would charge the guests that need it least. Bounded either
-/// way: a script still in `/proc/1` when the bound runs out is this guest's
-/// init after all, and is read as one.
+/// Only a script waits, and it waits on the name, which is the only thing that
+/// tells the script apart from its own interpreter: a script runs as the
+/// interpreter its shebang names, so `/proc/1/exe` reads `/bin/bash` through
+/// the whole script phase and would read the same afterwards for an image
+/// whose final init is that same interpreter. The name is what changes. An
+/// init that is a binary does not wait at all — a compiled init may still
+/// `exec` something else, as an s6 `/init` does, and the moment it has, the
+/// route below reads the program that replaced it.
+///
+/// Bounded either way: a script still in `/proc/1` when the bound runs out is
+/// this guest's init after all, and the route is read off it as it stands.
 pub(crate) async fn shutdown_route(
     handoff_init: Option<&Path>,
-    comm_path: &Path,
+    pid_1: &InitPaths,
     timeout: std::time::Duration,
-) -> AgentdResult<ShutdownRoute> {
+) -> ShutdownRoute {
     if let Some(init) = handoff_init
         && is_shebang_script(init)
         && let Some(name) = comm_of(init)
     {
         let deadline = tokio::time::Instant::now() + timeout;
-        while read_comm(comm_path)? == name {
+        while read_comm(&pid_1.comm)
+            .map(|comm| comm == name)
+            .unwrap_or(false)
+        {
             if tokio::time::Instant::now() >= deadline {
                 eprintln!(
                     "agentd: {} is still PID 1 after {:?}; taking it for this guest's init",
@@ -513,10 +618,7 @@ pub(crate) async fn shutdown_route(
             tokio::time::sleep(INIT_EXEC_POLL.min(timeout)).await;
         }
     }
-    if read_comm(comm_path)? == "systemd" {
-        return Ok(ShutdownRoute::Systemd);
-    }
-    Ok(ShutdownRoute::Generic)
+    pid_1.route()
 }
 
 /// The realtime-signal route, repeated inside its window.
@@ -527,19 +629,44 @@ pub(crate) async fn shutdown_route(
 /// accident. Repeating covers the second case without costing the first
 /// anything: the guest that took the first signal is powering off, and this
 /// process goes down with it part way through the loop.
-async fn signal_generic_init() -> AgentdResult<()> {
+///
+/// Every repeat asks again who PID 1 is. An init that turns out to have been
+/// on its way to systemd after all must never be sent this number: systemd
+/// reads it as reboot, and a rebooting guest is one the host ends up killing.
+async fn signal_generic_init(pid_1: &InitPaths) -> AgentdResult<()> {
     let signal = generic_init_poweroff_signal();
     signal_pid_1(signal)?;
     let deadline = tokio::time::Instant::now() + GENERIC_SIGNAL_WINDOW;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(GENERIC_SIGNAL_INTERVAL).await;
+        if pid_1.route() == ShutdownRoute::Systemd {
+            log_to_console("agentd: PID 1 became systemd mid-shutdown; asking it instead");
+            return request_systemd_poweroff().await;
+        }
         // A PID 1 that can no longer be signalled is not a failure here: the
         // guest is on its way down, which is what was asked of it.
         if signal_pid_1(signal).is_err() {
             return Ok(());
         }
     }
+    log_to_console(&format!(
+        "agentd: PID 1 is still running {:?} after the poweroff signal",
+        GENERIC_SIGNAL_WINDOW
+    ));
     Ok(())
+}
+
+/// Writes one line where the host can read it after the guest is gone.
+///
+/// Post-handoff agentd's stderr is a file in the guest's own tmpfs; the
+/// console is what the VMM records. Best effort by design — a guest whose
+/// console cannot be opened still has a shutdown to get on with.
+fn log_to_console(line: &str) {
+    use std::io::Write;
+
+    if let Ok(mut console) = OpenOptions::new().write(true).open("/dev/console") {
+        let _ = writeln!(console, "{line}");
+    }
 }
 
 /// A program name as the kernel keeps it, with the newline `/proc` adds
@@ -554,14 +681,26 @@ fn comm_of(path: &Path) -> Option<String> {
     Some(name.chars().take(COMM_LEN).collect())
 }
 
-/// Whether `path` starts with a shebang, and so cannot be the last word on
-/// what PID 1 is: the kernel runs the interpreter the line names, and the
-/// script is free to `exec` something else once it has run.
+/// Whether `path` starts with a shebang, and so is a step on the way to
+/// whatever it `exec`s: the kernel runs the interpreter the line names, and
+/// the script is free to replace itself once it has run.
+///
+/// An init that cannot be read is not a script as far as this can tell, and
+/// says so: reading it wrong costs the wait that a script phase needs, and a
+/// shutdown that waits for nothing is how this defect started.
 fn is_shebang_script(path: &Path) -> bool {
     use std::io::Read;
 
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "agentd: cannot read the init at {}: {error}; \
+                 not waiting for it to exec anything",
+                path.display()
+            );
+            return false;
+        }
     };
     let mut start = [0u8; 2];
     match file.read_exact(&mut start) {
@@ -950,49 +1089,90 @@ mod tests {
         false
     }
 
-    /// The image's own shape: a script init that masks units and then execs
-    /// systemd. The route has to be the one PID 1 ends up keeping, not the one
-    /// it was on its way through.
+    /// Writes `contents` where a reader can only ever see all of it or none:
+    /// the wait below reads these files in a loop, and a half-written one
+    /// would read as a name that never existed.
+    fn write_atomically(path: &Path, contents: &str) {
+        let staging = path.with_extension("staging");
+        std::fs::write(&staging, contents).expect("write staging file");
+        std::fs::rename(&staging, path).expect("rename into place");
+    }
+
+    /// Points `link` at a program of `name`, the way `/proc/1/exe` points at
+    /// the binary PID 1 is running.
+    fn point_exe_at(link: &Path, program: &Path) {
+        let staging = link.with_extension("staging");
+        let _ = std::fs::remove_file(&staging);
+        std::os::unix::fs::symlink(program, &staging).expect("symlink staging");
+        std::fs::rename(&staging, link).expect("rename symlink into place");
+    }
+
+    fn init_paths(dir: &Path) -> InitPaths {
+        InitPaths {
+            comm: dir.join("comm"),
+            exe: dir.join("exe"),
+        }
+    }
+
+    /// The image's own shape, all three states of it: the script is PID 1,
+    /// then systemd is, exec'd through `/sbin/init` and still carrying that
+    /// name, and only then does it name itself.
+    ///
+    /// The middle state is the one that matters. A route read off the name
+    /// there says "not systemd", and the generic route's number is systemd's
+    /// reboot.
     #[tokio::test]
-    async fn a_script_init_is_given_time_to_exec_what_it_runs() {
-        let dir = unique_test_dir("script-execs");
+    async fn a_script_init_that_execs_systemd_takes_the_systemd_route() {
+        let dir = unique_test_dir("script-execs-systemd");
         let init = dir.join("distributed-init");
         std::fs::write(&init, b"#!/bin/bash\nexec /sbin/init\n").expect("write script init");
-        let comm = dir.join("comm");
-        // Truncated the way the kernel truncates it: sixteen bytes with the NUL.
-        std::fs::write(&comm, b"distributed-ini\n").expect("write comm");
+        let bash = dir.join("bash");
+        std::fs::write(&bash, b"\x7fELF").expect("write interpreter");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let pid_1 = init_paths(&dir);
+        // State one: the script runs as its interpreter, under its own name.
+        write_atomically(&pid_1.comm, "distributed-ini\n");
+        point_exe_at(&pid_1.exe, &bash);
 
-        let handoff = init.clone();
-        let becomes_systemd = comm.clone();
-        let init_execs = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            std::fs::write(&becomes_systemd, b"systemd\n").expect("rewrite comm");
+        let states = pid_1.clone();
+        let systemd_program = systemd.clone();
+        let boot = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            // State two: systemd is running, exec'd through /sbin/init, and
+            // has not renamed itself yet.
+            point_exe_at(&states.exe, &systemd_program);
+            write_atomically(&states.comm, "init\n");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // State three: it gets around to it.
+            write_atomically(&states.comm, "systemd\n");
         });
 
-        let route = shutdown_route(Some(&handoff), &comm, std::time::Duration::from_secs(5))
-            .await
-            .expect("decide a route");
+        let route = shutdown_route(Some(&init), &pid_1, std::time::Duration::from_secs(5)).await;
 
-        init_execs.await.expect("init exec task");
-        assert_eq!(route, ShutdownRoute::Systemd);
+        boot.await.expect("boot task");
+        assert_eq!(
+            route,
+            ShutdownRoute::Systemd,
+            "the route was decided while systemd was still called init"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A guest whose init is a binary has the init it is going to have. It must
-    /// not pay for the wait above on every stop.
+    /// A guest whose init is a binary has nothing to wait for, and must not
+    /// pay for the wait above on every stop.
     #[tokio::test]
     async fn a_binary_init_waits_for_nothing() {
         let dir = unique_test_dir("binary-init");
         let init = dir.join("init");
         std::fs::write(&init, b"\x7fELF not really, but not a shebang either")
             .expect("write binary init");
-        let comm = dir.join("comm");
-        std::fs::write(&comm, b"init\n").expect("write comm");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "init\n");
+        point_exe_at(&pid_1.exe, &init);
 
         let started = std::time::Instant::now();
-        let route = shutdown_route(Some(&init), &comm, std::time::Duration::from_secs(30))
-            .await
-            .expect("decide a route");
+        let route = shutdown_route(Some(&init), &pid_1, std::time::Duration::from_secs(30)).await;
         let waited = started.elapsed();
 
         assert_eq!(route, ShutdownRoute::Generic);
@@ -1011,13 +1191,15 @@ mod tests {
         let init = dir.join("rc.init");
         std::fs::write(&init, b"#!/bin/sh\nwhile true; do sleep 1; done\n")
             .expect("write script init");
-        let comm = dir.join("comm");
-        std::fs::write(&comm, b"rc.init\n").expect("write comm");
+        let shell = dir.join("sh");
+        std::fs::write(&shell, b"\x7fELF").expect("write interpreter");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "rc.init\n");
+        point_exe_at(&pid_1.exe, &shell);
 
         let started = std::time::Instant::now();
-        let route = shutdown_route(Some(&init), &comm, std::time::Duration::from_millis(200))
-            .await
-            .expect("decide a route");
+        let route =
+            shutdown_route(Some(&init), &pid_1, std::time::Duration::from_millis(200)).await;
         let waited = started.elapsed();
 
         assert_eq!(route, ShutdownRoute::Generic);
@@ -1032,20 +1214,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A script init that has already exec'd systemd by the time the shutdown
-    /// arrives, which is every stop after the first moments of a boot.
+    /// Every stop after the first moments of a boot: the script is long gone
+    /// and systemd is named for itself.
     #[tokio::test]
     async fn a_script_init_already_gone_decides_at_once() {
         let dir = unique_test_dir("script-gone");
         let init = dir.join("distributed-init");
         std::fs::write(&init, b"#!/bin/bash\nexec /sbin/init\n").expect("write script init");
-        let comm = dir.join("comm");
-        std::fs::write(&comm, b"systemd\n").expect("write comm");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "systemd\n");
+        point_exe_at(&pid_1.exe, &systemd);
 
         let started = std::time::Instant::now();
-        let route = shutdown_route(Some(&init), &comm, std::time::Duration::from_secs(30))
-            .await
-            .expect("decide a route");
+        let route = shutdown_route(Some(&init), &pid_1, std::time::Duration::from_secs(30)).await;
 
         assert_eq!(route, ShutdownRoute::Systemd);
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
@@ -1056,14 +1239,47 @@ mod tests {
     #[tokio::test]
     async fn no_handoff_decides_on_pid_1_alone() {
         let dir = unique_test_dir("no-handoff");
-        let comm = dir.join("comm");
-        std::fs::write(&comm, b"systemd\n").expect("write comm");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "agentd\n");
+        point_exe_at(&pid_1.exe, &systemd);
 
-        let route = shutdown_route(None, &comm, std::time::Duration::from_secs(30))
-            .await
-            .expect("decide a route");
+        let route = shutdown_route(None, &pid_1, std::time::Duration::from_secs(30)).await;
 
         assert_eq!(route, ShutdownRoute::Systemd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The program is what the route is read from, whatever PID 1 is called
+    /// and whether or not the binary is still on disk.
+    #[test]
+    fn the_route_is_read_from_the_program_not_the_name() {
+        let dir = unique_test_dir("route-of");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let busybox = dir.join("busybox");
+        std::fs::write(&busybox, b"\x7fELF").expect("write busybox");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "init\n");
+
+        point_exe_at(&pid_1.exe, &systemd);
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+        point_exe_at(&pid_1.exe, &busybox);
+        assert_eq!(pid_1.route(), ShutdownRoute::Generic);
+
+        // An upgraded-away binary still names itself.
+        let replaced = dir.join("systemd (deleted)");
+        point_exe_at(&pid_1.exe, &replaced);
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+
+        // With no program to read, the name is the last resort.
+        let absent = init_paths(&dir.join("absent"));
+        std::fs::create_dir_all(dir.join("absent")).expect("create dir");
+        write_atomically(&absent.comm, "systemd\n");
+        assert_eq!(absent.route(), ShutdownRoute::Systemd);
+        write_atomically(&absent.comm, "busybox\n");
+        assert_eq!(absent.route(), ShutdownRoute::Generic);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

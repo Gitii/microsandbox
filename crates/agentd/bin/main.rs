@@ -66,7 +66,7 @@ fn main() {
         match handoff::do_handoff(spec) {
             // Only the child returns, and it is the one that has to know which
             // init it is waiting to see in /proc/1 when a shutdown arrives.
-            Ok(cmd) => config.set_handoff_init(cmd),
+            Ok(cmd) => config.set_handoff_init_path(cmd),
             Err(e) => {
                 eprintln!("agentd: handoff failed: {e}");
                 process::exit(1);

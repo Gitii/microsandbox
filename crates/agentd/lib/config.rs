@@ -125,14 +125,15 @@ pub struct AgentdConfig {
     /// In-guest security profile for exec sessions.
     pub(crate) security_profile: SecurityProfile,
 
-    /// The init binary PID 1 was handed to, as `do_handoff` resolved it, or
+    /// The path of the init binary PID 1 was handed to, as `do_handoff` resolved
+    /// it, or
     /// `None` when agentd kept PID 1 itself.
     ///
     /// Carried rather than re-derived: the shutdown path has to know whether
     /// the process it is looking at in `/proc/1` is still the one agentd
     /// exec'd, and the only place that fact exists without guessing is the
     /// handoff that exec'd it.
-    pub(crate) handoff_init: Option<std::path::PathBuf>,
+    pub(crate) handoff_init_path: Option<std::path::PathBuf>,
 }
 
 /// In-guest security profile.
@@ -359,8 +360,8 @@ impl AgentdConfig {
     }
 
     /// Records the init binary PID 1 was handed to.
-    pub fn set_handoff_init(&mut self, cmd: std::path::PathBuf) {
-        self.handoff_init = Some(cmd);
+    pub fn set_handoff_init_path(&mut self, cmd: std::path::PathBuf) {
+        self.handoff_init_path = Some(cmd);
     }
 
     /// Reads the runtime-config `MSB_*` environment variables.
@@ -374,7 +375,7 @@ impl AgentdConfig {
                 .transpose()?
                 .unwrap_or_default(),
             // Filled in after the handoff, which happens later in boot.
-            handoff_init: None,
+            handoff_init_path: None,
         })
     }
 }
