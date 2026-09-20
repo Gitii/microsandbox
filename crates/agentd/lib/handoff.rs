@@ -55,6 +55,25 @@ const POST_HANDOFF_STDERR: &str = "/run/microsandbox/agentd.log";
 /// handoff boot may carry no `PATH` at all.
 const SYSTEMCTL_FALLBACK_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
+/// systemd's private control socket. `systemctl` connects to this (or to the
+/// system bus, which appears later still), so until it exists no shutdown
+/// request can be delivered to the manager.
+const SYSTEMD_CONTROL_SOCKET: &str = "/run/systemd/private";
+
+/// How long a shutdown request waits for systemd to be able to take it.
+///
+/// A handoff boot answers agentd's exec channel as soon as agentd is up, which
+/// is before it has even executed the image's init: a shutdown asked for in
+/// that gap reaches a manager that is not listening. The host gives a handoff
+/// guest `HANDOFF_SHUTDOWN_FLUSH_TIMEOUT` (120s) to power off before it kills
+/// the VM, so this waits well inside that window — a guest whose systemd has
+/// not opened its control socket in 30 seconds is broken, not slow.
+const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the wait above looks for the socket. systemd offers nothing to
+/// wait on before the socket exists, so the wait polls.
+const SYSTEMD_CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -370,6 +389,18 @@ fn is_executable_file(path: &Path) -> bool {
 pub fn signal_init_shutdown() -> AgentdResult<()> {
     let init_name = std::fs::read_to_string("/proc/1/comm")?;
     if init_name.trim() == "systemd" {
+        // Delivery, not politeness: systemctl exits non-zero when the manager
+        // is not listening yet, which used to lose the request entirely and
+        // leave the host to kill the VM two minutes later.
+        if !wait_for_control_socket(Path::new(SYSTEMD_CONTROL_SOCKET), SYSTEMD_CONTROL_WAIT) {
+            eprintln!(
+                "agentd: systemd is PID 1 but opened no control socket at {} within {}s; \
+                 falling back to the realtime-signal shutdown",
+                SYSTEMD_CONTROL_SOCKET,
+                SYSTEMD_CONTROL_WAIT.as_secs()
+            );
+            return signal_pid_1_shutdown();
+        }
         match find_systemctl() {
             Some(systemctl) => {
                 let status = process::Command::new(&systemctl)
@@ -396,6 +427,12 @@ pub fn signal_init_shutdown() -> AgentdResult<()> {
             }
         }
     }
+    signal_pid_1_shutdown()
+}
+
+/// The realtime-signal shutdown contract every other init keeps, and the only
+/// route left when systemd's control client cannot be reached.
+fn signal_pid_1_shutdown() -> AgentdResult<()> {
     let sig = libc::SIGRTMIN() + 4;
     // SAFETY: kill(2) is signal-safe and pid=1 is always valid.
     let ret = unsafe { libc::kill(1, sig) };
@@ -403,6 +440,29 @@ pub fn signal_init_shutdown() -> AgentdResult<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+/// Waits for `path` to be a socket, up to `timeout`, and says whether it is.
+///
+/// Returns as soon as the socket is there; a path that exists as something
+/// else is not one, so a leftover file cannot pass for a listening manager.
+fn wait_for_control_socket(path: &Path, timeout: std::time::Duration) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(SYSTEMD_CONTROL_POLL.min(left));
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -489,6 +549,62 @@ mod tests {
         let resolved = resolve_auto_cmd(&candidates).expect("resolve executable candidate");
 
         assert_eq!(resolved, executable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_socket_wait_returns_when_the_socket_is_already_there() {
+        let dir = unique_test_dir("control-present");
+        let socket = dir.join("private");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind control socket");
+
+        assert!(wait_for_control_socket(
+            &socket,
+            std::time::Duration::from_secs(5)
+        ));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_socket_wait_returns_when_the_socket_appears() {
+        let dir = unique_test_dir("control-late");
+        let socket = dir.join("private");
+        let late = socket.clone();
+        let manager = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::os::unix::net::UnixListener::bind(&late).expect("bind control socket")
+        });
+
+        assert!(wait_for_control_socket(
+            &socket,
+            std::time::Duration::from_secs(5)
+        ));
+
+        drop(manager.join().expect("manager thread"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_socket_wait_gives_up_and_never_takes_a_file_for_a_manager() {
+        let dir = unique_test_dir("control-absent");
+        let missing = dir.join("private");
+        let regular = dir.join("not-a-socket");
+        std::fs::write(&regular, b"leftover").expect("write regular file");
+
+        let started = std::time::Instant::now();
+        assert!(!wait_for_control_socket(
+            &missing,
+            std::time::Duration::from_millis(200)
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert!(!wait_for_control_socket(
+            &regular,
+            std::time::Duration::from_millis(100)
+        ));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
