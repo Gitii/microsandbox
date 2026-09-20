@@ -78,11 +78,26 @@ const SYSTEMD_POWEROFF_SIGNAL: i32 = 38;
 ///
 /// A handoff boot answers agentd's exec channel as soon as agentd is up, which
 /// is before it has even executed the image's init: a shutdown asked for in
-/// that gap reaches a manager that is not listening. The host gives a handoff
-/// guest `HANDOFF_SHUTDOWN_FLUSH_TIMEOUT` (120s) to power off before it kills
-/// the VM, so this waits well inside that window — a guest whose systemd has
-/// not opened its control socket in 30 seconds is broken, not slow.
-const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// that gap reaches a manager that is not listening.
+///
+/// Spent out of the same budget as the stop jobs. The host allows a handoff
+/// guest `HANDOFF_SHUTDOWN_FLUSH_TIMEOUT` — 120 seconds, documented as room for
+/// systemd's 90-second default service stop deadline — and the host may be told
+/// to allow less (`MSB_SHUTDOWN_FLUSH_TIMEOUT_MS`), which agentd cannot see. So
+/// this and [`SYSTEMD_POWEROFF_CALL_TIMEOUT`] together stay well under the 30
+/// seconds that budget has to spare, and a guest whose systemd has not opened
+/// its control socket in 10 seconds is broken rather than slow: the measured
+/// wait on a real boot is about 300 milliseconds.
+const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `systemctl` is given to hand the request over.
+///
+/// `--no-block` returns as soon as the job is queued, in milliseconds. What
+/// this bounds is a manager that accepts the connection and then does not
+/// answer: sd-bus would wait out its own 25-second method timeout, and a
+/// `systemctl` that never returns would hold the shutdown until the host's
+/// backstop killed the VM — the failure this whole path exists to remove.
+const SYSTEMD_POWEROFF_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the wait above looks for the socket. Polling rather than an
 /// inotify watch on /run and then /run/systemd: the wait is a few hundred
@@ -421,6 +436,11 @@ pub async fn signal_init_shutdown() -> AgentdResult<()> {
 /// forced exit the caller records as an unclean shutdown.
 async fn request_systemd_poweroff() -> AgentdResult<()> {
     if !wait_for_control_socket(Path::new(SYSTEMD_CONTROL_SOCKET), SYSTEMD_CONTROL_WAIT).await {
+        // The weakest route of the three. A systemd this far from ready may not
+        // have installed its signal handlers either, and the kernel discards a
+        // realtime signal that PID 1 does not handle — so "sent" here can be a
+        // no-op, and the host's backstop is what is left. It still beats
+        // returning an error, which asks nothing of anybody.
         eprintln!(
             "agentd: systemd is PID 1 but opened no control socket at {} within {}s; \
              falling back to the poweroff signal",
@@ -462,24 +482,51 @@ async fn request_systemd_poweroff() -> AgentdResult<()> {
 }
 
 /// Runs `systemctl --no-block poweroff` and answers with its exit code.
+async fn run_systemctl_poweroff(systemctl: &Path) -> AgentdResult<i32> {
+    run_tracked_child(
+        systemctl,
+        &["--no-block", "poweroff"],
+        SYSTEMD_POWEROFF_CALL_TIMEOUT,
+    )
+    .await
+}
+
+/// Spawns `cmd` with `args`, answers with its exit code, and kills it and fails
+/// if it has not finished within `timeout`.
 ///
 /// Spawned through the process manager, which owns `waitpid(-1, ...)` for this
 /// process: waiting on the child here would race its reaper for the status and
-/// usually lose. The call is off the agent's thread for the same reason it is
-/// bounded at all — `systemctl` talks to systemd over sd-bus, which can sit on
-/// a method call for its own timeout, and the agent loop must keep serving the
-/// host meanwhile.
-async fn run_systemctl_poweroff(systemctl: &Path) -> AgentdResult<i32> {
+/// usually lose. Awaiting it does not free the agent loop — the shutdown
+/// message is handled inline — but it does leave the runtime's other tasks, the
+/// session readers and the relay's output among them, running meanwhile.
+///
+/// Dropping the watcher on expiry leaks nothing: the reaper drops a
+/// registration whose exit notification can no longer be delivered.
+async fn run_tracked_child(
+    cmd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> AgentdResult<i32> {
     let manager = crate::process::ProcessManager::get()?;
     let watcher = {
         let guard = manager.spawn_guard()?;
-        let child = process::Command::new(systemctl)
-            .args(["--no-block", "poweroff"])
+        let child = process::Command::new(cmd)
+            .args(args)
             .spawn()
-            .map_err(|e| AgentdError::Init(format!("spawn systemd poweroff: {e}")))?;
+            .map_err(|e| AgentdError::Init(format!("spawn {}: {e}", cmd.display())))?;
         guard.track(child.id() as i32)?
     };
-    Ok(watcher.await)
+    let identity = watcher.identity();
+    match tokio::time::timeout(timeout, watcher).await {
+        Ok(code) => Ok(code),
+        Err(_) => {
+            let _ = manager.signal_process_group(identity, libc::SIGKILL);
+            Err(AgentdError::Init(format!(
+                "{} did not finish within {timeout:?}",
+                cmd.display()
+            )))
+        }
+    }
 }
 
 /// The realtime signal a non-systemd handoff init is asked to power off with.
@@ -648,7 +695,17 @@ mod tests {
 
         let started = std::time::Instant::now();
         assert!(!wait_for_control_socket(&missing, std::time::Duration::from_millis(200)).await);
-        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "returned early after {waited:?}"
+        );
+        // A wait that ignored its argument would sit here for the 10 seconds
+        // the real one is given, so the upper bound is the assertion.
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -670,12 +727,84 @@ mod tests {
     /// signal above glibc, so the computed value is systemd's reboot.
     #[test]
     fn systemd_poweroff_signal_is_not_what_agentds_libc_computes() {
-        assert_eq!(SYSTEMD_POWEROFF_SIGNAL, 38);
         if cfg!(target_env = "musl") {
             assert_eq!(generic_init_poweroff_signal(), 39);
             assert_ne!(generic_init_poweroff_signal(), SYSTEMD_POWEROFF_SIGNAL);
         } else {
             assert_eq!(generic_init_poweroff_signal(), SYSTEMD_POWEROFF_SIGNAL);
         }
+    }
+
+    /// The status this path reads is the process manager's to hand over, and
+    /// the child runs under the manager's real reaper here, not beside it.
+    #[tokio::test]
+    async fn systemctl_poweroff_answers_with_the_child_exit_code() {
+        // Both ignore the poweroff arguments, so the real call shape is kept.
+        let ok = run_systemctl_poweroff(Path::new("/bin/true"))
+            .await
+            .expect("run a child that succeeds");
+        assert_eq!(ok, 0);
+        let failed = run_systemctl_poweroff(Path::new("/bin/false"))
+            .await
+            .expect("run a child that fails");
+        assert_eq!(failed, 1);
+    }
+
+    /// A child that never finishes is killed rather than awaited forever: an
+    /// unbounded wait here is the host's forced exit by another route.
+    #[tokio::test]
+    async fn a_child_that_does_not_finish_is_killed_and_reported() {
+        // Distinctive enough to find this test's own sleep among any others.
+        const MARKER: &str = "987654";
+
+        let started = std::time::Instant::now();
+        let error = run_tracked_child(
+            Path::new("/bin/sleep"),
+            &[MARKER],
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a sleep outliving its timeout must not report an exit code");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?}"
+        );
+        assert!(
+            error.to_string().contains("did not finish"),
+            "unexpected error: {error}"
+        );
+
+        // The kill is asynchronous in the reaper; an unkilled sleep would still
+        // be there in eleven days, so a bounded look is enough to tell them apart.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while running_with_argument(MARKER) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child outlived its timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Whether any live process was started with `argument`. A killed child
+    /// awaiting its reaper is a zombie and reads as an empty command line.
+    fn running_with_argument(argument: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            panic!("/proc is required to observe the child");
+        };
+        for entry in entries.flatten() {
+            let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if command
+                .split(|byte| *byte == 0)
+                .any(|word| word == argument.as_bytes())
+            {
+                return true;
+            }
+        }
+        false
     }
 }
