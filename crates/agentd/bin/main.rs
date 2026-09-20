@@ -33,7 +33,7 @@ fn main() {
             process::exit(1);
         }
     };
-    let config = match AgentdConfig::from_env() {
+    let mut config = match AgentdConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("agentd: config parse failed: {e}");
@@ -62,11 +62,16 @@ fn main() {
 
     // Phase 1.5: Optional PID 1 handoff. Returns only in the child;
     // the parent execve's into the new init and never returns here.
-    if let Some(spec) = handoff_spec
-        && let Err(e) = handoff::do_handoff(spec)
-    {
-        eprintln!("agentd: handoff failed: {e}");
-        process::exit(1);
+    if let Some(spec) = handoff_spec {
+        match handoff::do_handoff(spec) {
+            // Only the child returns, and it is the one that has to know which
+            // init it is waiting to see in /proc/1 when a shutdown arrives.
+            Ok(cmd) => config.set_handoff_init(cmd),
+            Err(e) => {
+                eprintln!("agentd: handoff failed: {e}");
+                process::exit(1);
+            }
+        }
     }
 
     // Phase 2: Build a single-threaded tokio runtime and run the agent loop.

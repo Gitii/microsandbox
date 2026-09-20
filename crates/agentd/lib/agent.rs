@@ -712,7 +712,7 @@ async fn handle_message(
             }
             state.fs.clear();
 
-            request_guest_poweroff().await?;
+            request_guest_poweroff(config).await?;
             return Err(AgentdError::Shutdown);
         }
 
@@ -1255,7 +1255,7 @@ fn write_to_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     }
 }
 
-async fn request_guest_poweroff() -> AgentdResult<()> {
+async fn request_guest_poweroff(config: &AgentdConfig) -> AgentdResult<()> {
     if crate::handoff::is_pid_1() {
         // PID 1 mode (no handoff): tear down filesystems so block-backed
         // mounts reach a clean terminal state, then power the kernel off.
@@ -1274,7 +1274,7 @@ async fn request_guest_poweroff() -> AgentdResult<()> {
     // The image init owns service ordering and filesystem teardown. In
     // particular, never remount a Docker disk while its service is stopping.
     // The host records a failed shutdown if init does not power off in time.
-    crate::handoff::signal_init_shutdown().await
+    crate::handoff::signal_init_shutdown(config.handoff_init.as_deref()).await
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1329,6 +1329,7 @@ mod tests {
         let config = AgentdConfig {
             user: None,
             security_profile: Default::default(),
+            handoff_init: None,
         };
         let mut activity = ActivityTracker::new();
         let mut out = Vec::new();
