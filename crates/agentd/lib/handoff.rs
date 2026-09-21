@@ -84,11 +84,9 @@ const SYSTEMD_POWEROFF_SIGNAL: i32 = 38;
 /// guest `HANDOFF_SHUTDOWN_FLUSH_TIMEOUT` — 120 seconds, documented as room for
 /// systemd's 90-second default service stop deadline — and the host may be told
 /// to allow less (`MSB_SHUTDOWN_FLUSH_TIMEOUT_MS`), which agentd cannot see.
-/// The whole systemd route is [`INIT_EXEC_WAIT`] plus this plus
-/// [`SYSTEMD_POWEROFF_CALL_TIMEOUT`] — 3 + 10 + 10 — which leaves systemd's 90
-/// its own and seven seconds of the host's window spare. A guest whose systemd
-/// has not opened its control socket in 10 seconds is broken rather than slow:
-/// the measured wait on a real boot is about 300 milliseconds.
+/// [`INIT_EXEC_WAIT`] counts the whole worst case, this included. A guest whose
+/// systemd has not opened its control socket in 10 seconds is broken rather
+/// than slow: the measured wait on a real boot is about 300 milliseconds.
 const SYSTEMD_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long `systemctl` is given to hand the request over.
@@ -116,13 +114,16 @@ const SYSTEMD_CONTROL_POLL: std::time::Duration = std::time::Duration::from_mill
 ///
 /// Only a script init waits, because only a script init is on its way to being
 /// something else; an init that is a binary does not wait. Three seconds
-/// against a measured forty milliseconds, and it comes out of the same budget
-/// as everything else on this path: three here, ten waiting for systemd's
-/// socket, ten for the `systemctl` call, and systemd's own ninety-second stop
-/// deadline, inside the host's 120 — which
-/// `MSB_SHUTDOWN_FLUSH_TIMEOUT_MS` can shorten without agentd knowing. The
-/// generic route is not additive with the two below: it is the other branch,
-/// and costs this wait plus [`GENERIC_SIGNAL_WINDOW`].
+/// against a measured twenty-five milliseconds — `distributed-ini` at 268ms of
+/// one boot, systemd at 293ms.
+///
+/// The worst case on this path is every step of it, because the generic route
+/// hands over to the systemd one when PID 1 turns out to have been on its way
+/// there: three seconds here, then [`GENERIC_SIGNAL_WINDOW`], then
+/// [`SYSTEMD_CONTROL_WAIT`] and [`SYSTEMD_POWEROFF_CALL_TIMEOUT`]: 3 + 2 + 10 +
+/// 10 is 25, and systemd's own ninety-second stop deadline after it makes 115
+/// of the host's 120 — which `MSB_SHUTDOWN_FLUSH_TIMEOUT_MS` can shorten
+/// without agentd knowing.
 const INIT_EXEC_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often that wait looks at PID 1. An exec is not something a process can
@@ -157,6 +158,16 @@ const PID_1_EXE: &str = "/proc/1/exe";
 /// [`InitPaths::route`] compares the resolved `/proc/1/exe` against.
 const SYSTEMD_PROGRAM: &str = "systemd";
 
+/// The name a process exec'd through `/sbin/init` carries until systemd
+/// renames itself. Evidence of systemd, never proof of it: it is only read
+/// when the program behind the name cannot be.
+const INIT_PROGRAM: &str = "init";
+
+/// systemd's own runtime directory, created by the manager before anything in
+/// the guest could ask it for anything. Read for the same reason as the name
+/// above, and better evidence: nothing else makes it.
+const SYSTEMD_RUNTIME_DIR: &str = "/run/systemd";
+
 /// What the kernel appends to `/proc/<pid>/exe` when the binary has been
 /// replaced or removed under the running process, as a package upgrade does.
 const DELETED_SUFFIX: &str = " (deleted)";
@@ -189,6 +200,20 @@ pub(crate) struct InitPaths {
 
     /// The symlink to the program PID 1 is running.
     exe: PathBuf,
+
+    /// systemd's runtime directory, read only when the program cannot be.
+    runtime_dir: PathBuf,
+}
+
+/// How the realtime-signal route ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenericOutcome {
+    /// PID 1 was asked, as many times as the window allowed.
+    Asked,
+
+    /// PID 1 turned out to be systemd, and must be asked systemd's way
+    /// instead. Nothing was signalled after that was seen.
+    BecameSystemd,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -201,6 +226,7 @@ impl InitPaths {
         Self {
             comm: PathBuf::from(PID_1_COMM),
             exe: PathBuf::from(PID_1_EXE),
+            runtime_dir: PathBuf::from(SYSTEMD_RUNTIME_DIR),
         }
     }
 
@@ -211,34 +237,64 @@ impl InitPaths {
     /// the image exec'd — while `/proc/1/exe` already resolves to systemd's own
     /// binary. A route decided on the name in that window is decided wrong, and
     /// the wrong answer is the realtime signal, which systemd reads as reboot.
-    ///
-    /// A name is still the last resort: an unreadable `/proc/1/exe` is said
-    /// out loud rather than quietly taken for "not systemd".
     pub(crate) fn route(&self) -> ShutdownRoute {
-        match std::fs::read_link(&self.exe) {
-            Ok(program) => {
-                let name =
-                    program
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| match name.strip_suffix(DELETED_SUFFIX) {
-                            Some(replaced) => replaced,
-                            None => name,
-                        });
-                match name {
-                    Some(SYSTEMD_PROGRAM) => ShutdownRoute::Systemd,
-                    _ => ShutdownRoute::Generic,
-                }
+        let program = match std::fs::read_link(&self.exe) {
+            Ok(program) => program,
+            Err(error) => {
+                eprintln!(
+                    "agentd: cannot read {}: {error}; \
+                     deciding the shutdown route on what else this guest shows",
+                    self.exe.display()
+                );
+                return self.route_without_a_program();
+            }
+        };
+        let name = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.strip_suffix(DELETED_SUFFIX).unwrap_or(name));
+        match name {
+            Some(SYSTEMD_PROGRAM) => ShutdownRoute::Systemd,
+            Some(other) if !other.is_empty() => ShutdownRoute::Generic,
+            _ => {
+                eprintln!(
+                    "agentd: {} points at {}, which names no program; \
+                     deciding the shutdown route on what else this guest shows",
+                    self.exe.display(),
+                    program.display()
+                );
+                self.route_without_a_program()
+            }
+        }
+    }
+
+    /// The route to take when the program behind PID 1 cannot be read.
+    ///
+    /// Weighted, because the two mistakes do not cost the same. Sending the
+    /// generic signal to systemd is systemd's reboot: the guest comes back up,
+    /// the VMM exits, and the host records a clean stop for a guest that never
+    /// stopped. Sending systemd's poweroff to an init that is not systemd
+    /// fails loudly instead — the guest stays up and the host records the
+    /// unclean shutdown it was. So anything that looks like systemd is treated
+    /// as systemd, and only a name that is positively something else, with no
+    /// systemd runtime directory beside it, goes the generic way.
+    fn route_without_a_program(&self) -> ShutdownRoute {
+        if self.runtime_dir.exists() {
+            return ShutdownRoute::Systemd;
+        }
+        match read_comm(&self.comm) {
+            Ok(name) if name == SYSTEMD_PROGRAM || name == INIT_PROGRAM => ShutdownRoute::Systemd,
+            Ok(name) => {
+                eprintln!("agentd: PID 1 is called {name} and is not systemd");
+                ShutdownRoute::Generic
             }
             Err(error) => {
                 eprintln!(
-                    "agentd: cannot read {}: {error}; falling back to PID 1's name",
-                    self.exe.display()
+                    "agentd: cannot read {} either: {error}; \
+                     asking PID 1 the way that fails loudly rather than the way that reboots",
+                    self.comm.display()
                 );
-                match read_comm(&self.comm).as_deref() {
-                    Ok(SYSTEMD_PROGRAM) => ShutdownRoute::Systemd,
-                    _ => ShutdownRoute::Generic,
-                }
+                ShutdownRoute::Systemd
             }
         }
     }
@@ -565,11 +621,20 @@ pub async fn signal_init_shutdown(handoff_init: Option<&Path>) -> AgentdResult<(
     let route = shutdown_route(handoff_init, &pid_1, INIT_EXEC_WAIT).await;
     // The one line the host keeps: agentd's stderr goes to a file inside a
     // guest that is about to stop existing, and which route a shutdown took is
-    // the first thing anybody asks when a VM had to be killed instead.
+    // the first thing anybody asks when a VM had to be killed. Written before
+    // anything is asked of PID 1 — and never relied on as the decision, which
+    // the generic route makes again for itself: opening the console is a write
+    // to a virtio device, and PID 1 can exec into systemd while it happens.
     log_to_console(&format!("agentd: shutdown route: {route:?}"));
     match route {
         ShutdownRoute::Systemd => request_systemd_poweroff().await,
-        ShutdownRoute::Generic => signal_generic_init(&pid_1).await,
+        ShutdownRoute::Generic => match signal_generic_init(&pid_1, signal_pid_1).await? {
+            GenericOutcome::Asked => Ok(()),
+            GenericOutcome::BecameSystemd => {
+                log_to_console("agentd: PID 1 became systemd mid-shutdown; asking it instead");
+                request_systemd_poweroff().await
+            }
+        },
     }
 }
 
@@ -630,30 +695,44 @@ pub(crate) async fn shutdown_route(
 /// anything: the guest that took the first signal is powering off, and this
 /// process goes down with it part way through the loop.
 ///
-/// Every repeat asks again who PID 1 is. An init that turns out to have been
-/// on its way to systemd after all must never be sent this number: systemd
-/// reads it as reboot, and a rebooting guest is one the host ends up killing.
-async fn signal_generic_init(pid_1: &InitPaths) -> AgentdResult<()> {
+/// Who PID 1 is, is asked again before every signal, the first one included:
+/// this number is systemd's reboot, and the milliseconds between deciding a
+/// route and acting on it are long enough for a wrapper init to exec into
+/// systemd. What is left after that is the instant between the `readlink` and
+/// the `kill`, which nothing on this side can close.
+///
+/// `send` is how a signal reaches PID 1, so a test can watch what this asks
+/// for without asking the machine it runs on for anything.
+pub(crate) async fn signal_generic_init(
+    pid_1: &InitPaths,
+    send: impl Fn(i32) -> AgentdResult<()>,
+) -> AgentdResult<GenericOutcome> {
     let signal = generic_init_poweroff_signal();
-    signal_pid_1(signal)?;
     let deadline = tokio::time::Instant::now() + GENERIC_SIGNAL_WINDOW;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(GENERIC_SIGNAL_INTERVAL).await;
+    let mut asked = false;
+    loop {
         if pid_1.route() == ShutdownRoute::Systemd {
-            log_to_console("agentd: PID 1 became systemd mid-shutdown; asking it instead");
-            return request_systemd_poweroff().await;
+            return Ok(GenericOutcome::BecameSystemd);
         }
-        // A PID 1 that can no longer be signalled is not a failure here: the
-        // guest is on its way down, which is what was asked of it.
-        if signal_pid_1(signal).is_err() {
-            return Ok(());
+        match send(signal) {
+            Ok(()) => asked = true,
+            // The first failure is the caller's to hear: nothing has been asked
+            // of PID 1 yet, and an agentd that cannot signal it at all has
+            // nothing else to offer. A later one is PID 1 going away, which is
+            // what the signal before it asked for.
+            Err(error) if !asked => return Err(error),
+            Err(_) => return Ok(GenericOutcome::Asked),
         }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(GENERIC_SIGNAL_INTERVAL).await;
     }
     log_to_console(&format!(
         "agentd: PID 1 is still running {:?} after the poweroff signal",
         GENERIC_SIGNAL_WINDOW
     ));
-    Ok(())
+    Ok(GenericOutcome::Asked)
 }
 
 /// Writes one line where the host can read it after the guest is gone.
@@ -671,14 +750,24 @@ fn log_to_console(line: &str) {
 
 /// A program name as the kernel keeps it, with the newline `/proc` adds
 /// stripped.
+///
+/// Read as bytes and converted lossily, because the kernel truncates a name at
+/// fifteen bytes wherever that lands: a name cut through a multi-byte
+/// character is what `/proc/1/comm` holds, and refusing to read it would end
+/// the wait below on an error rather than on an answer.
 fn read_comm(path: &Path) -> AgentdResult<String> {
-    Ok(std::fs::read_to_string(path)?.trim_end().to_string())
+    let raw = std::fs::read(path)?;
+    Ok(String::from_utf8_lossy(&raw).trim_end().to_string())
 }
 
-/// What `/proc/1/comm` reads for a process exec'd from `path`.
+/// What `/proc/1/comm` reads for a process exec'd from `path`, truncated the
+/// same way — fifteen bytes, not fifteen characters.
 fn comm_of(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
-    Some(name.chars().take(COMM_LEN).collect())
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path.file_name()?.as_bytes();
+    let kept = &name[..name.len().min(COMM_LEN)];
+    Some(String::from_utf8_lossy(kept).into_owned())
 }
 
 /// Whether `path` starts with a shebang, and so is a step on the way to
@@ -1111,6 +1200,8 @@ mod tests {
         InitPaths {
             comm: dir.join("comm"),
             exe: dir.join("exe"),
+            // Absent unless a test makes it, like a guest with no systemd.
+            runtime_dir: dir.join("run-systemd"),
         }
     }
 
@@ -1283,6 +1374,185 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With no program to read, a name that looks like systemd is taken for
+    /// systemd: the generic number is systemd's reboot, and a reboot is
+    /// recorded as a clean stop for a guest that never stopped.
+    #[test]
+    fn an_unreadable_program_is_weighed_towards_systemd() {
+        let dir = unique_test_dir("no-program");
+        let pid_1 = init_paths(&dir);
+
+        // The window this branch exists for, with the exe unreadable.
+        write_atomically(&pid_1.comm, "init\n");
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+        write_atomically(&pid_1.comm, "systemd\n");
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+
+        // A name that is positively something else, with nothing of systemd's
+        // beside it, is the one case that goes the generic way.
+        write_atomically(&pid_1.comm, "test-init\n");
+        assert_eq!(pid_1.route(), ShutdownRoute::Generic);
+
+        // Unless systemd's own runtime directory is there.
+        std::fs::create_dir_all(&pid_1.runtime_dir).expect("create runtime dir");
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+        std::fs::remove_dir_all(&pid_1.runtime_dir).expect("remove runtime dir");
+
+        // Nothing readable at all: the answer that fails loudly, not the one
+        // that reboots.
+        std::fs::remove_file(&pid_1.comm).expect("remove comm");
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An exe symlink that names no program at all is read the same way.
+    #[test]
+    fn a_program_with_no_name_is_weighed_the_same() {
+        let dir = unique_test_dir("nameless-program");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "test-init\n");
+        point_exe_at(&pid_1.exe, Path::new("/"));
+
+        assert_eq!(pid_1.route(), ShutdownRoute::Generic);
+
+        write_atomically(&pid_1.comm, "init\n");
+        assert_eq!(pid_1.route(), ShutdownRoute::Systemd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generic route keeps asking until its window closes.
+    #[tokio::test]
+    async fn the_generic_route_repeats_within_its_window() {
+        let dir = unique_test_dir("generic-repeats");
+        let init = dir.join("test-init");
+        std::fs::write(&init, b"\x7fELF").expect("write init");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "test-init\n");
+        point_exe_at(&pid_1.exe, &init);
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&sent);
+        let outcome = signal_generic_init(&pid_1, move |signal| {
+            assert_eq!(signal, generic_init_poweroff_signal());
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect("ask PID 1");
+
+        assert_eq!(outcome, GenericOutcome::Asked);
+        let asked = sent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(asked > 1, "asked {asked} times, so it never repeated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PID 1 that turns out to be systemd part way through is handed over,
+    /// and never sent the number systemd reads as reboot.
+    #[tokio::test]
+    async fn the_generic_route_hands_over_when_pid_1_becomes_systemd() {
+        let dir = unique_test_dir("generic-hands-over");
+        let init = dir.join("wrapper");
+        std::fs::write(&init, b"\x7fELF").expect("write init");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "wrapper\n");
+        point_exe_at(&pid_1.exe, &init);
+
+        let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let becomes_systemd = std::sync::Arc::clone(&flipped);
+        let exe = pid_1.exe.clone();
+        let program = systemd.clone();
+        let exec = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            point_exe_at(&exe, &program);
+            becomes_systemd.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let after_flip = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&after_flip);
+        let seen = std::sync::Arc::clone(&flipped);
+        let outcome = signal_generic_init(&pid_1, move |_| {
+            if seen.load(std::sync::atomic::Ordering::SeqCst) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        })
+        .await
+        .expect("ask PID 1");
+
+        exec.await.expect("exec task");
+        assert_eq!(outcome, GenericOutcome::BecameSystemd);
+        assert_eq!(
+            after_flip.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the reboot number was sent to systemd"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first signal is asked for after the route is confirmed, not before
+    /// it: a route decided milliseconds ago is not a route.
+    #[tokio::test]
+    async fn the_first_signal_waits_for_its_own_look_at_pid_1() {
+        let dir = unique_test_dir("generic-first-look");
+        let systemd = dir.join("systemd");
+        std::fs::write(&systemd, b"\x7fELF").expect("write systemd");
+        let pid_1 = init_paths(&dir);
+        // Whatever the caller decided, PID 1 is systemd now.
+        write_atomically(&pid_1.comm, "systemd\n");
+        point_exe_at(&pid_1.exe, &systemd);
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&sent);
+        let outcome = signal_generic_init(&pid_1, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect("ask PID 1");
+
+        assert_eq!(outcome, GenericOutcome::BecameSystemd);
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a signal went out before this route looked at PID 1 itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first signal that cannot be sent is the caller's to hear; a later one
+    /// failing is PID 1 going away, which is what was asked of it.
+    #[tokio::test]
+    async fn a_first_failure_is_reported_and_a_later_one_is_the_answer() {
+        let dir = unique_test_dir("generic-failures");
+        let init = dir.join("test-init");
+        std::fs::write(&init, b"\x7fELF").expect("write init");
+        let pid_1 = init_paths(&dir);
+        write_atomically(&pid_1.comm, "test-init\n");
+        point_exe_at(&pid_1.exe, &init);
+
+        let refused = signal_generic_init(&pid_1, |_| {
+            Err(AgentdError::Init("no such process".to_string()))
+        })
+        .await;
+        assert!(refused.is_err(), "a first failure was swallowed");
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&sent);
+        let outcome = signal_generic_init(&pid_1, move |_| {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(AgentdError::Init("no such process".to_string()))
+            }
+        })
+        .await
+        .expect("a later failure is PID 1 going away");
+        assert_eq!(outcome, GenericOutcome::Asked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The kernel keeps fifteen characters of a name, and the comparison has to
     /// use the same fifteen or a long-named init never matches itself.
     #[test]
@@ -1293,6 +1563,13 @@ mod tests {
         );
         assert_eq!(comm_of(Path::new("/sbin/init")).as_deref(), Some("init"));
         assert_eq!(comm_of(Path::new("/")), None);
+
+        // Fifteen bytes, not fifteen characters: the kernel cuts wherever
+        // fifteen lands, and a name of five three-byte characters keeps five
+        // of them exactly.
+        let wide = comm_of(Path::new("/sbin/ⅠⅡⅢⅣⅤⅥ")).expect("a name");
+        assert_eq!(wide.len(), COMM_LEN);
+        assert!(wide.starts_with("ⅠⅡⅢⅣⅤ"), "{wide:?}");
     }
 
     /// What tells a step on the way from a destination.
